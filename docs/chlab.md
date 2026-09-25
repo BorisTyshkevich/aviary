@@ -1,6 +1,17 @@
 # ClickHouse runtime labs
 
-The `chlab_*` MCP tools use the local root service at `/run/aviary-chlab.sock`. The Aviary server does not need Docker socket access. For development, run `sudo env PATH="$PATH" go run ./cmd/aviary chlab-service` from this checkout. For a persistent deployment on this host, copy `deploy/aviary-chlab.service` into `/etc/systemd/system/` and enable the service. The sample unit runs this checkout under the local `ubuntu` group for the socket; adjust its paths and `Group=` on another host.
+The `chlab_*` MCP tools use the local root service at `/run/aviary-chlab.sock`. The Aviary server does not need Docker socket access. Build the service as an ordinary user, then install the finished binary and unit as root:
+
+```sh
+build_dir=$(mktemp -d)
+go build -o "$build_dir/aviary-chlab" ./cmd/aviary
+sudo install -o root -g root -m 0755 "$build_dir/aviary-chlab" /usr/local/bin/aviary-chlab
+sudo install -o root -g root -m 0644 deploy/aviary-chlab.service /etc/systemd/system/aviary-chlab.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now aviary-chlab.service
+```
+
+The unit executes only the root-owned binary in `/usr/local/bin`; it never compiles or reads the user checkout at startup. The unit uses the local `ubuntu` group for socket access; set `Group=` to the Aviary server's group on another host. Rebuild and reinstall the binary before restarting the service for future updates.
 
 The service discards labeled lab containers and networks when it starts. It limits each lab to a fixed shape, permits two labs, and expires them after 15 minutes idle or 60 minutes total. A failed image pull leaves an error status until the session calls `chlab_stop` or the lab expires.
 

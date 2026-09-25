@@ -2,9 +2,11 @@ package chlab
 
 import (
 	"context"
+	"encoding/json"
 	"encoding/xml"
 	"io"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -101,4 +103,36 @@ func TestExpiry(t *testing.T) {
 	if len(s.labs) != 1 || s.labs["active"] == nil {
 		t.Fatal("active lab was not preserved")
 	}
+}
+
+func TestStatusNodesSnapshotDuringTransitions(t *testing.T) {
+	s := NewService()
+	l := &lab{Status: Status{State: "starting", Session: "session", Nodes: map[string]string{"ch1": "starting"}}}
+	s.labs[key(Request{Agent: "agent", Session: "session"})] = l
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1000; i++ {
+			l.mu.Lock()
+			l.Nodes["ch1"] = "running"
+			l.Nodes["ch2"] = "running"
+			delete(l.Nodes, "ch2")
+			l.mu.Unlock()
+		}
+	}()
+	for i := 0; i < 1000; i++ {
+		status, err := s.Call(context.Background(), Request{Action: "status", Agent: "agent", Session: "session"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := json.Marshal(status); err != nil {
+			t.Fatal(err)
+		}
+		if status.Nodes["ch1"] == "" {
+			t.Fatal("status lost ch1")
+		}
+	}
+	wg.Wait()
 }

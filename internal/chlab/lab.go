@@ -80,6 +80,18 @@ type lab struct {
 	cancel context.CancelFunc
 }
 
+// snapshotLocked returns a status that remains safe after l.mu is released.
+func (l *lab) snapshotLocked() Status {
+	status := l.Status
+	if l.Nodes != nil {
+		status.Nodes = make(map[string]string, len(l.Nodes))
+		for name, state := range l.Nodes {
+			status.Nodes[name] = state
+		}
+	}
+	return status
+}
+
 // Service owns active labs and is the only component that invokes Docker.
 type Service struct {
 	mu   sync.Mutex
@@ -308,10 +320,10 @@ func (s *Service) Call(ctx context.Context, r Request) (Status, error) {
 				}
 			}
 		}
-		return l.Status, nil
+		return l.snapshotLocked(), nil
 	}
 	if l.State != "ready" {
-		return l.Status, fmt.Errorf("lab is %s: %s", l.State, l.Error)
+		return l.snapshotLocked(), fmt.Errorf("lab is %s: %s", l.State, l.Error)
 	}
 	if r.Node == "" {
 		r.Node = "ch1"
@@ -321,7 +333,7 @@ func (s *Service) Call(ctx context.Context, r Request) (Status, error) {
 		return Status{}, fmt.Errorf("unknown node %q", r.Node)
 	}
 	l.LastUsedAt = time.Now()
-	result := l.Status
+	result := l.snapshotLocked()
 	switch r.Action {
 	case "query":
 		if r.SQL == "" || len(r.SQL) > 32<<10 {
@@ -349,7 +361,7 @@ func (s *Service) Call(ctx context.Context, r Request) (Status, error) {
 			}
 			l.Nodes[r.Node] = "running"
 		}
-		result.Nodes = l.Nodes
+		result = l.snapshotLocked()
 		return result, nil
 	default:
 		return Status{}, fmt.Errorf("unknown action %q", r.Action)
