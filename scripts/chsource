@@ -14,8 +14,66 @@ fail() {
 }
 
 usage() {
-    printf 'Usage: chsource search QUERY [PATH] | read RELATIVE_PATH [START [COUNT]] | revision\n' >&2
+    printf 'Usage: chsource search QUERY [PATH] | read RELATIVE_PATH [START [COUNT]] | search-at REF QUERY [PATH] | read-at REF PATH [START [COUNT]] | revision | log [COUNT [REF [PATH]]] | commits QUERY [REF [COUNT [PATH]]] | commit REF | diff REF [PATH]\n' >&2
     exit 2
+}
+
+positive_count() {
+    [[ "$1" =~ ^[0-9]{1,2}$ ]] || fail 'count must be an integer from 1 to 20'
+    parsed_count=$((10#$1))
+    (( parsed_count >= 1 && parsed_count <= 20 )) || fail 'count must be an integer from 1 to 20'
+}
+
+commit_ref() {
+    local raw=$1
+    [[ ${#raw} -le 128 && "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail 'invalid Git ref'
+    [[ "$raw" != *..* && "$raw" != *//* ]] || fail 'invalid Git ref'
+    case "$raw" in
+        26.8|26.3|25.8|25.3|24.8)
+            raw=$(git -C "$root" tag -l "v${raw}.*" | sort -V | tail -1)
+            [[ -n "$raw" ]] || fail 'release series has no local tag'
+            ;;
+    esac
+    ref_name=$raw
+    resolved_ref=$(git -C "$root" rev-parse --verify --end-of-options "${raw}^{commit}" 2>/dev/null) || fail 'Git ref does not resolve to a commit'
+}
+
+history_path() {
+    local raw=$1 component
+    [[ -n "$raw" && "$raw" != /* && ${#raw} -le 300 && "$raw" != *$'\n'* && "$raw" != *$'\r'* ]] || fail 'invalid history path'
+    [[ "$raw" != */ && "$raw" != *//* ]] || fail 'invalid history path'
+    IFS=/ read -ra components <<< "$raw"
+    for component in "${components[@]}"; do
+        [[ "$component" != . && "$component" != .. && "$component" != .git ]] || fail 'invalid history path'
+    done
+    history_pathspec=":(literal)$raw"
+}
+
+bounded_git() {
+    local statuses
+    set +e
+    timeout 20s git -C "$root" "$@" | awk -v limit="$max_bytes" '
+        {
+            seen = 1
+            if (NR > 160 || used >= limit) {
+                if (!truncated++) print "[output limit reached; narrow the query]"
+                next
+            }
+            line = substr($0, 1, 500)
+            if (used + length(line) + 1 > limit) {
+                if (!truncated++) print "[output limit reached; narrow the query]"
+                next
+            }
+            print line
+            used += length(line) + 1
+        }
+        END { if (!seen) print "No results." }
+    '
+    statuses=("${PIPESTATUS[@]}")
+    set -e
+    if (( statuses[1] != 0 )) || { (( statuses[0] != 0 )) && ! { [[ "$1" == grep ]] && (( statuses[0] == 1 )); }; }; then
+        fail 'Git history command failed or timed out'
+    fi
 }
 
 tracked_path() {
@@ -87,6 +145,44 @@ case "$command" in
             }
         ' "$resolved_path"
         ;;
+    search-at)
+        [[ $# -ge 2 && $# -le 3 && -n "$2" && ${#2} -le 200 ]] || usage
+        [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || fail 'query cannot contain newlines'
+        commit_ref "$1"
+        printf 'Source matches at %s (%s):\n' "$ref_name" "$resolved_ref"
+        if [[ $# -eq 3 ]]; then
+            history_path "$3"
+            bounded_git grep --line-number --full-name --fixed-strings -I -e "$2" "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git grep --line-number --full-name --fixed-strings -I -e "$2" "$resolved_ref"
+        fi
+        ;;
+    read-at)
+        [[ $# -ge 2 && $# -le 4 ]] || usage
+        commit_ref "$1"
+        history_path "$2"
+        start=${3:-1}
+        count=${4:-80}
+        [[ "$start" =~ ^[0-9]{1,9}$ && "$count" =~ ^[0-9]{1,9}$ ]] || fail 'start and count must be positive integers'
+        start=$((10#$start))
+        count=$((10#$count))
+        (( start >= 1 && count >= 1 && count <= max_lines )) || fail "start must be positive and count must be 1 to $max_lines"
+        object="$resolved_ref:$2"
+        [[ $(git -C "$root" cat-file -t "$object" 2>/dev/null) == blob ]] || fail 'path is not a file at that revision'
+        printf '%s at %s (%s), lines %s-%s:\n' "$2" "$ref_name" "$resolved_ref" "$start" "$((start + count - 1))"
+        if ! git -C "$root" cat-file -p "$object" | awk -v start="$start" -v count="$count" -v limit="$max_bytes" '
+            NR < start { next }
+            NR >= start + count { next }
+            {
+                line = NR ": " substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { if (!truncated++) print "[output limit reached]"; next }
+                print line
+                used += length(line) + 1
+            }
+        '; then
+            fail 'could not read file at that revision'
+        fi
+        ;;
     revision)
         [[ $# -eq 0 ]] || usage
         printf 'HEAD: '
@@ -100,6 +196,55 @@ case "$command" in
                 used += length(line) + 1
             }
         ' || :
+        ;;
+    log)
+        [[ $# -le 3 ]] || usage
+        positive_count "${1:-5}"
+        count=$parsed_count
+        commit_ref "${2:-HEAD}"
+        printf 'Recent commits at %s (%s):\n' "$ref_name" "$resolved_ref"
+        if [[ $# -eq 3 ]]; then
+            history_path "$3"
+            bounded_git log --no-patch -n "$count" --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git log --no-patch -n "$count" --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref"
+        fi
+        ;;
+    commits)
+        [[ $# -ge 1 && $# -le 4 && -n "$1" && ${#1} -le 200 ]] || usage
+        [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || fail 'query cannot contain newlines'
+        query=$1
+        commit_ref "${2:-HEAD}"
+        positive_count "${3:-10}"
+        printf 'Commit messages containing %q at %s (%s):\n' "$query" "$ref_name" "$resolved_ref"
+        if [[ $# -eq 4 ]]; then
+            history_path "$4"
+            bounded_git log --no-patch -n "$parsed_count" --fixed-strings --regexp-ignore-case --grep="$query" \
+                --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git log --no-patch -n "$parsed_count" --fixed-strings --regexp-ignore-case --grep="$query" \
+                --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref"
+        fi
+        ;;
+    commit)
+        [[ $# -eq 1 ]] || usage
+        commit_ref "$1"
+        bounded_git show --stat --no-ext-diff --no-textconv --no-renames \
+            --format='%H%nAuthor: %an <%ae>%nAuthor date: %aI%nCommit date: %cI%nParents: %P%n%n%B' \
+            --end-of-options "$resolved_ref"
+        ;;
+    diff)
+        [[ $# -ge 1 && $# -le 2 ]] || usage
+        commit_ref "$1"
+        printf 'Patch for %s (against first parent):\n' "$resolved_ref"
+        if [[ $# -eq 2 ]]; then
+            history_path "$2"
+            bounded_git show --first-parent --patch --no-ext-diff --no-textconv --no-renames \
+                --unified=3 --format= --end-of-options "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git show --first-parent --patch --no-ext-diff --no-textconv --no-renames \
+                --unified=3 --format= --end-of-options "$resolved_ref"
+        fi
         ;;
     *) usage ;;
 esac
