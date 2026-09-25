@@ -309,6 +309,16 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 		}
 		event = normalized
 	}
+	if event.SubType == "message_changed" && event.Message != nil {
+		// Slack also emits message_changed when a thread's reply count changes.
+		// Only a content edit should start another agent run.
+		if event.PreviousMessage != nil && event.PreviousMessage.Text == event.Message.Text {
+			return
+		}
+		if event.PreviousMessage == nil && event.Message.Edited == nil {
+			return
+		}
+	}
 
 	channelID := event.Channel
 	from := event.User
