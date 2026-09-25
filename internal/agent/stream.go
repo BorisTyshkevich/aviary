@@ -28,6 +28,7 @@ type StreamEvent struct {
 	Type     StreamEventType
 	AgentID  string
 	Text     string // set for StreamEventText
+	Model    string // model that completed the run; set for StreamEventDone
 	Tool     *ToolEvent
 	MediaURL string // set for StreamEventMedia (image data URL or remote URL)
 	Err      error  // set for StreamEventError

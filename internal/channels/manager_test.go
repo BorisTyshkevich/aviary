@@ -885,6 +885,60 @@ func TestSlackChannel_SendThreadMessageAndGetIDDoesNotBroadcast(t *testing.T) {
 	assert.True(t, sawPost)
 }
 
+func TestSlackChannel_SendThreadMarkdownFileSharesCompleteAnswer(t *testing.T) {
+	answer := "# Result\n\n| Name | Value |\n| --- | --- |\n| a | b |"
+	var api *httptest.Server
+	var uploadBody string
+	var completed bool
+	api = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/files.getUploadURLExternal":
+			assert.NoError(t, r.ParseForm())
+			assert.Equal(t, fmt.Sprint(len(answer)), r.FormValue("length"))
+			assert.True(t, strings.HasSuffix(r.FormValue("filename"), ".md"))
+			_, _ = fmt.Fprintf(w, `{"ok":true,"file_id":"F123","upload_url":%q}`, api.URL+"/upload")
+		case "/upload":
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			uploadBody = string(body)
+			_, _ = w.Write([]byte("OK"))
+		case "/files.completeUploadExternal":
+			assert.NoError(t, r.ParseForm())
+			assert.Equal(t, "C123", r.FormValue("channel_id"))
+			assert.Equal(t, "1710000000.123456", r.FormValue("thread_ts"))
+			assert.Equal(t, "Short summary.", r.FormValue("initial_comment"))
+			assert.Contains(t, r.FormValue("files"), "F123")
+			completed = true
+			_, _ = w.Write([]byte(`{"ok":true,"files":[{"id":"F123","title":"answer.md"}]}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer api.Close()
+
+	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
+	ch.client = slack.New("xoxb-token", slack.OptionAPIURL(api.URL+"/"))
+	err := ch.SendThreadMarkdownFile(context.Background(), "C123", "1710000000.123456", "Short summary.", answer)
+	assert.NoError(t, err)
+	assert.Contains(t, uploadBody, answer)
+	assert.True(t, completed)
+}
+
+func TestSlackChannel_SendThreadPlainTextDisablesMarkdown(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/chat.postMessage", r.URL.Path)
+		assert.NoError(t, r.ParseForm())
+		assert.Equal(t, "false", r.FormValue("mrkdwn"))
+		assert.Equal(t, "**literal**", r.FormValue("text"))
+		assert.Equal(t, "1710000000.123456", r.FormValue("thread_ts"))
+		_, _ = w.Write([]byte(`{"ok":true,"channel":"C123","ts":"1710000001.000001"}`))
+	}))
+	defer api.Close()
+	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
+	ch.client = slack.New("xoxb-token", slack.OptionAPIURL(api.URL+"/"))
+	assert.NoError(t, ch.SendThreadPlainText("C123", "1710000000.123456", "**literal**"))
+}
+
 func TestParseSlackMessageURL(t *testing.T) {
 	ref, ok := parseSlackMessageURL("https://aviary.slack.com/archives/C123/p1710000000123456?thread_ts=1710000000.000100&cid=C999")
 

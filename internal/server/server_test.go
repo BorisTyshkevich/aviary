@@ -68,6 +68,28 @@ type recordingThreadChannel struct {
 	lines []string
 }
 
+type recordingAnswerChannel struct {
+	recordingThreadChannel
+	plain     []string
+	summary   string
+	answer    string
+	uploadErr error
+}
+
+func (c *recordingAnswerChannel) SendThreadPlainText(_, _, text string) error {
+	c.plain = append(c.plain, text)
+	return nil
+}
+
+func (c *recordingAnswerChannel) SendThreadMarkdownFile(_ context.Context, _, _, summary, answer string) error {
+	if c.uploadErr != nil {
+		return c.uploadErr
+	}
+	c.summary = summary
+	c.answer = answer
+	return nil
+}
+
 func (c *recordingThreadChannel) SendThreadMessageAndGetID(_, _, text string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1608,11 +1630,59 @@ func TestSlackThreadStreamer_SendsOneCompletedAnswer(t *testing.T) {
 	ch := &recordingThreadChannel{}
 	streamer := &slackThreadStreamer{thread: ch}
 
-	streamer.Append("first")
-	streamer.Append(" line\n  second line\nthird")
-	streamer.Flush()
+	streamer.SendAnswer(context.Background(), "test/model", "first line\n  second line\nthird")
 
 	assert.Equal(t, []string{"first line\n  second line\nthird"}, ch.snapshot())
+}
+
+func TestSlackThreadStreamer_AttachesStructuredAnswerWithModelSummary(t *testing.T) {
+	ch := &recordingAnswerChannel{}
+	streamer := &slackThreadStreamer{
+		thread: ch,
+		answer: ch,
+		summarize: func(_ context.Context, model, answer string) (string, error) {
+			assert.Equal(t, "test/model", model)
+			assert.Equal(t, "# Result\nFull details", answer)
+			return "Here is the result.", nil
+		},
+	}
+	streamer.SendAnswer(context.Background(), "test/model", "# Result\nFull details")
+	assert.Equal(t, "Here is the result.", ch.summary)
+	assert.Equal(t, "# Result\nFull details", ch.answer)
+	assert.Empty(t, ch.plain)
+}
+
+func TestSlackThreadStreamer_UsesIntroductionWhenSummaryFails(t *testing.T) {
+	ch := &recordingAnswerChannel{}
+	streamer := &slackThreadStreamer{
+		thread: ch,
+		answer: ch,
+		summarize: func(context.Context, string, string) (string, error) {
+			return "", fmt.Errorf("model unavailable")
+		},
+	}
+	streamer.SendAnswer(context.Background(), "test/model", "# Result\nFull details")
+	assert.Equal(t, "Full answer attached.", ch.summary)
+	assert.Equal(t, "# Result\nFull details", ch.answer)
+}
+
+func TestSlackThreadStreamer_UsesPlainFallbackWhenUploadFails(t *testing.T) {
+	ch := &recordingAnswerChannel{uploadErr: fmt.Errorf("missing_scope")}
+	streamer := &slackThreadStreamer{thread: ch, answer: ch}
+	answer := "# Result\n" + strings.Repeat("x", 8000)
+	streamer.SendAnswer(context.Background(), "test/model", answer)
+	assert.Equal(t, answer, strings.Join(ch.plain, ""))
+	for _, part := range ch.plain {
+		assert.LessOrEqual(t, len([]rune(part)), 3900)
+	}
+}
+
+func TestSlackThreadStreamer_SendsShortPlainAnswerWithoutFile(t *testing.T) {
+	ch := &recordingAnswerChannel{}
+	streamer := &slackThreadStreamer{thread: ch, answer: ch}
+	streamer.SendAnswer(context.Background(), "test/model", "Looks good.")
+	assert.Equal(t, []string{"Looks good."}, ch.plain)
+	assert.Empty(t, ch.answer)
 }
 
 func TestSlackToolStatusText_FileRead(t *testing.T) {

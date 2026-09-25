@@ -141,6 +141,51 @@ func (c *SlackChannel) SendThreadMessageAndGetID(channel, threadTS, text string)
 	return timestamp, err
 }
 
+// SendThreadPlainText posts an unformatted reply to a Slack thread.
+func (c *SlackChannel) SendThreadPlainText(channel, threadTS, text string) error {
+	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
+	if err != nil {
+		return err
+	}
+	threadTS = strings.TrimSpace(threadTS)
+	if threadTS == "" {
+		return fmt.Errorf("slack thread timestamp is required")
+	}
+	_, _, err = c.client.PostMessage(resolvedChannel,
+		slack.MsgOptionText(text, false),
+		slack.MsgOptionDisableMarkdown(),
+		slack.MsgOptionTS(threadTS),
+	)
+	return err
+}
+
+// SendThreadMarkdownFile shares the complete answer and its short introduction
+// in one file-share message in the original Slack thread.
+func (c *SlackChannel) SendThreadMarkdownFile(ctx context.Context, channel, threadTS, introduction, answer string) error {
+	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
+	if err != nil {
+		return err
+	}
+	threadTS = strings.TrimSpace(threadTS)
+	if threadTS == "" {
+		return fmt.Errorf("slack thread timestamp is required")
+	}
+	if answer == "" {
+		return fmt.Errorf("slack answer file cannot be empty")
+	}
+	filename := "aviary-answer-" + time.Now().UTC().Format("20060102T150405.000000000Z") + ".md"
+	_, err = c.client.UploadFileContext(ctx, slack.UploadFileParameters{
+		Content:         answer,
+		FileSize:        len(answer),
+		Filename:        filename,
+		Title:           filename,
+		InitialComment:  introduction,
+		Channel:         resolvedChannel,
+		ThreadTimestamp: threadTS,
+	})
+	return err
+}
+
 // SendThreadBlocksAndGetID posts a reply with Block Kit content to a Slack
 // thread and returns the message timestamp.
 func (c *SlackChannel) SendThreadBlocksAndGetID(channel, threadTS, fallbackText string, blocks ...slack.Block) (string, error) {

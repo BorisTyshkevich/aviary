@@ -313,7 +313,7 @@ func (r *AgentRunner) promptCore(
 			r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, msg, "", effectiveModel)
 			emit(StreamEvent{Type: StreamEventText, Text: msg})
 			deliver(msg)
-			emit(StreamEvent{Type: StreamEventDone})
+			emit(StreamEvent{Type: StreamEventDone, Text: msg, Model: effectiveModel})
 			return
 		}
 
@@ -606,7 +606,7 @@ func (r *AgentRunner) promptCore(
 				}
 			}
 			deliver(answer)
-			emit(StreamEvent{Type: StreamEventDone})
+			emit(StreamEvent{Type: StreamEventDone, Text: answer, Model: effectiveModel})
 			return
 		}
 
