@@ -69,7 +69,7 @@ You usually need to be a workspace admin, app manager, or someone allowed to ins
 3. Choose **From scratch**.
 4. Give the app a name like `Aviary` and choose the Slack workspace where you want the bot to live.
 5. Open **OAuth & Permissions**.
-6. Under **Bot Token Scopes**, add the permissions Aviary needs. A practical starting set is `chat:write`, `channels:history`, `groups:history`, `channels:read`, `groups:read`, `users:read`, and `app_mentions:read`.
+6. Under **Bot Token Scopes**, add the permissions Aviary needs. A practical starting set is `chat:write`, `files:write`, `channels:history`, `groups:history`, `channels:read`, `groups:read`, `users:read`, and `app_mentions:read`. Aviary uses `files:write` to attach complete Markdown answers to longer conversational replies.
 7. Still on **OAuth & Permissions**, click **Install to Workspace** or **Reinstall to Workspace**.
 8. After installation, copy the **Bot User OAuth Token**. This is the value that starts with `xoxb-`. Put that into Aviary's `token` field.
 9. Open **Socket Mode** in the Slack app settings and turn on **Enable Socket Mode**.
@@ -90,6 +90,8 @@ Your Slack app should also have:
 - The bot invited to any channels you want it to read or answer in
 
 If the bot should respond when you type something like `@Aviary hi` in a channel, Slack must be configured to deliver `app_mention` events to the app.
+
+If you add `files:write` to an existing Slack app, reinstall the app to the workspace so the bot token receives the new scope.
 
 If you want the bot to work in a channel like `#alerts`, invite it there in Slack the same way you would invite a teammate.
 

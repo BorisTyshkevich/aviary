@@ -44,6 +44,7 @@ type Server struct {
 	httpSrv           *http.Server
 	runCtx            context.Context
 	agents            *agent.Manager
+	llmFactory        *llm.Factory
 	sched             *scheduler.Scheduler
 	channels          *channels.Manager
 	brw               *browser.Manager
@@ -88,6 +89,7 @@ func New(cfg *config.Config, token string) *Server {
 		factory.WithTokenSetter(authStore.Set)
 	}
 	s.agents = agent.NewManager(factory)
+	s.llmFactory = factory
 
 	// Initial reconcile from loaded config.
 	s.agents.Reconcile(cfg)
@@ -426,15 +428,16 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	}
 	slackStreamer := newSlackThreadStreamer(channelType, ch, msg)
 	if slackStreamer != nil {
+		slackStreamer.summarize = func(ctx context.Context, model, answer string) (string, error) {
+			return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+		}
+	}
+	if slackStreamer != nil {
 		rOpts.SuppressDelivery = true
 	}
 
 	runner.PromptMediaWithOverrides(msgCtx, msg.Text, msg.MediaURL, rOpts, func(e agent.StreamEvent) {
 		switch e.Type {
-		case agent.StreamEventText:
-			if slackStreamer != nil {
-				slackStreamer.Append(e.Text)
-			}
 		case agent.StreamEventTool:
 			if slackStreamer != nil && e.Tool != nil {
 				if status := slackToolStatusText(e.Tool); status != "" {
@@ -459,8 +462,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 		case agent.StreamEventError:
 			if slackStreamer != nil && e.Err != nil {
-				slackStreamer.Append("\nError: " + e.Err.Error())
-				slackStreamer.Flush()
+				slackStreamer.SendPlain("Error: " + e.Err.Error())
 			}
 			if stopTyping != nil {
 				stopTyping()
@@ -471,8 +473,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 		case agent.StreamEventStop:
 			if slackStreamer != nil {
-				slackStreamer.Append("\nStopped.")
-				slackStreamer.Flush()
+				slackStreamer.SendPlain("Stopped.")
 			}
 			if stopTyping != nil {
 				stopTyping()
@@ -483,7 +484,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 		case agent.StreamEventDone:
 			if slackStreamer != nil {
-				slackStreamer.Flush()
+				slackStreamer.SendAnswer(msgCtx, e.Model, e.Text)
 			}
 			if stopTyping != nil {
 				stopTyping()
@@ -547,11 +548,17 @@ type slackThreadStreamer struct {
 	thread    channels.ThreadMessageSender
 	editor    channels.MessageEditor
 	blocks    slackBlockMessageSender
+	answer    slackAnswerSender
+	summarize func(context.Context, string, string) (string, error)
 	channel   string
 	threadTS  string
-	pending   strings.Builder
 	toolMsgID string
 	tools     []slackToolDisclosure
+}
+
+type slackAnswerSender interface {
+	SendThreadPlainText(channel, threadTS, text string) error
+	SendThreadMarkdownFile(ctx context.Context, channel, threadTS, introduction, answer string) error
 }
 
 type slackBlockMessageSender interface {
@@ -585,14 +592,10 @@ func newSlackThreadStreamer(channelType string, ch channels.Channel, msg channel
 	if editor, ok := ch.(channels.MessageEditor); ok {
 		streamer.editor = editor
 	}
-	return streamer
-}
-
-func (s *slackThreadStreamer) Append(text string) {
-	if s == nil || text == "" {
-		return
+	if answer, ok := ch.(slackAnswerSender); ok {
+		streamer.answer = answer
 	}
-	s.pending.WriteString(text)
+	return streamer
 }
 
 func (s *slackThreadStreamer) UpsertToolOutput(tool *agent.ToolEvent) {
@@ -619,18 +622,44 @@ func (s *slackThreadStreamer) UpsertToolOutput(tool *agent.ToolEvent) {
 	s.FlushTools()
 }
 
-func (s *slackThreadStreamer) Flush() {
-	if s == nil {
+func (s *slackThreadStreamer) SendAnswer(ctx context.Context, model, answer string) {
+	if s == nil || strings.TrimSpace(answer) == "" {
 		return
 	}
-	if answer := strings.TrimSpace(s.pending.String()); answer != "" {
-		_, err := s.thread.SendThreadMessageAndGetID(s.channel, s.threadTS, answer)
-		if err != nil {
-			slog.Debug("server: failed to send Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
+	if !shouldAttachSlackAnswer(answer) || s.answer == nil {
+		s.SendPlain(answer)
+		return
+	}
+	introduction := "Full answer attached."
+	if s.summarize != nil {
+		if summary, err := s.summarize(ctx, model, answer); err == nil && summary != "" {
+			introduction = summary
+		} else if err != nil {
+			slog.Warn("server: failed to summarize Slack answer", "err", err)
 		}
 	}
-	s.pending.Reset()
-	s.FlushTools()
+	if err := s.answer.SendThreadMarkdownFile(ctx, s.channel, s.threadTS, introduction, answer); err != nil {
+		slog.Warn("server: failed to upload Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
+		s.SendPlain(answer)
+	}
+}
+
+func (s *slackThreadStreamer) SendPlain(answer string) {
+	if s == nil || answer == "" {
+		return
+	}
+	for _, part := range splitSlackPlainText(answer, 3900) {
+		var err error
+		if s.answer != nil {
+			err = s.answer.SendThreadPlainText(s.channel, s.threadTS, part)
+		} else {
+			_, err = s.thread.SendThreadMessageAndGetID(s.channel, s.threadTS, part)
+		}
+		if err != nil {
+			slog.Warn("server: failed to send Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
+			return
+		}
+	}
 }
 
 func (s *slackThreadStreamer) FlushTools() {
