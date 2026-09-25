@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Bounded, read-only access to tracked files in the current ClickHouse checkout.
+set -euo pipefail
+export GIT_OPTIONAL_LOCKS=0
+
+root=/home/ubuntu/work/ClickHouse
+rg_bin=/home/ubuntu/.local/bin/rg
+max_lines=160
+max_bytes=24000
+
+fail() {
+    printf 'chsource: %s\n' "$1" >&2
+    exit 2
+}
+
+usage() {
+    printf 'Usage: chsource search QUERY [PATH] | read RELATIVE_PATH [START [COUNT]] | revision\n' >&2
+    exit 2
+}
+
+tracked_path() {
+    local raw=$1 resolved
+    [[ -n "$raw" && "$raw" != /* ]] || fail 'path must be relative to the ClickHouse checkout'
+    resolved=$(realpath -- "$root/$raw") || fail 'path does not exist'
+    [[ "$resolved" == "$root/"* && -f "$resolved" ]] || fail 'path is outside the ClickHouse checkout or is not a file'
+    relative_path=${resolved#"$root/"}
+    git -C "$root" ls-files --error-unmatch -- ":(literal)$relative_path" >/dev/null 2>&1 || fail 'path is not tracked by the ClickHouse checkout'
+    resolved_path=$resolved
+}
+
+[[ $# -ge 1 ]] || usage
+command=$1
+shift
+
+case "$command" in
+    search)
+        [[ -x "$rg_bin" ]] || fail "rg is not installed at $rg_bin"
+        [[ $# -ge 1 && $# -le 2 && -n "$1" && ${#1} -le 200 ]] || fail 'search needs one query of 1 to 200 characters and an optional path'
+        [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || fail 'query cannot contain newlines'
+        scope=.
+        if [[ $# -eq 2 ]]; then
+            [[ -n "$2" && "$2" != /* ]] || fail 'search path must be relative to the ClickHouse checkout'
+            resolved_scope=$(realpath -- "$root/$2") || fail 'search path does not exist'
+            [[ "$resolved_scope" == "$root" || "$resolved_scope" == "$root/"* ]] || fail 'search path is outside the ClickHouse checkout'
+            [[ -d "$resolved_scope" || -f "$resolved_scope" ]] || fail 'search path must be a file or directory'
+            scope=${resolved_scope#"$root/"}
+            [[ "$resolved_scope" == "$root" ]] && scope=.
+        fi
+        # git supplies tracked paths; rg reads current working-tree contents.
+        # xargs batches this large checkout without building a huge argument list.
+        (
+            cd "$root"
+            git ls-files -z -- ":(literal)$scope" | xargs -0 -r -n 1000 -P 4 "$rg_bin" --no-config --no-messages --color never \
+                --with-filename --no-heading --line-number --fixed-strings \
+                --max-columns 300 --max-columns-preview -e "$1" --
+        ) | awk -v limit="$max_bytes" '
+            NR > 80 { print "[match limit reached; narrow the query]"; exit }
+            {
+                line = substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { print "[output limit reached; narrow the query]"; exit }
+                print line
+                used += length(line) + 1
+                found = 1
+            }
+            END { if (!found) print "No matches in tracked files." }
+        ' || :
+        ;;
+    read)
+        [[ $# -ge 1 && $# -le 3 ]] || usage
+        raw=$1
+        start=${2:-1}
+        count=${3:-80}
+        [[ "$start" =~ ^[0-9]{1,9}$ && "$count" =~ ^[0-9]{1,9}$ ]] || fail 'start and count must be positive integers'
+        start=$((10#$start))
+        count=$((10#$count))
+        (( start >= 1 && count >= 1 && count <= max_lines )) || fail "start must be positive and count must be 1 to $max_lines"
+        tracked_path "$raw"
+        printf '%s (lines %s-%s, working tree)\n' "$relative_path" "$start" "$((start + count - 1))"
+        awk -v start="$start" -v count="$count" -v limit="$max_bytes" '
+            NR < start { next }
+            NR >= start + count { exit }
+            {
+                line = NR ": " substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { print "[output limit reached]"; exit }
+                print line
+                used += length(line) + 1
+            }
+        ' "$resolved_path"
+        ;;
+    revision)
+        [[ $# -eq 0 ]] || usage
+        printf 'HEAD: '
+        git -C "$root" rev-parse HEAD
+        git -C "$root" status --short --untracked-files=no | awk -v limit="$max_bytes" '
+            NR > 50 { print "[change list limit reached]"; exit }
+            {
+                line = substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { print "[output limit reached]"; exit }
+                print line
+                used += length(line) + 1
+            }
+        ' || :
+        ;;
+    *) usage ;;
+esac
