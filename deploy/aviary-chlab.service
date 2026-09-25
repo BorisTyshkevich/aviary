@@ -1,0 +1,19 @@
+[Unit]
+Description=Aviary ClickHouse verification lab
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=root
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/work/aviary
+Environment=PATH=/home/ubuntu/.local/go/bin:/usr/bin:/bin
+Environment=GOMODCACHE=/home/ubuntu/go/pkg/mod
+ExecStart=/home/ubuntu/.local/go/bin/go run ./cmd/aviary chlab-service
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

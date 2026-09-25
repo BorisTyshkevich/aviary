@@ -164,8 +164,9 @@ Attach a channel delivery target to a session. Subsequent messages sent or gener
 | `agent` | string | yes | Agent name |
 | `session_id` | string | yes | Session ID |
 | `channel_type` | string | yes | Channel type: `"slack"`, `"discord"`, or `"signal"` |
-| `channel_id` | string | yes | Channel or conversation ID |
-| `target` | string | yes | Delivery target string (platform-specific) |
+| `channel_id` | string | yes | Configured channel instance ID in the agent config |
+| `target` | string | yes | Platform channel or conversation ID |
+| `thread_ts` | string | no | Slack thread root timestamp for replies in that thread |
 
 **Returns:** Text confirmation including the delivery route.
 

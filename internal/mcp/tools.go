@@ -127,6 +127,7 @@ func stub(name string) (*sdkmcp.CallToolResult, struct{}, error) {
 // Register wires all Aviary MCP tools onto s.
 // Tool handlers are stubs; replaced in later phases by real implementations.
 func Register(s *sdkmcp.Server) {
+	registerCHLabTools(s)
 	registerAgentTools(s)
 	registerRulesTools(s)
 	registerSessionTools(s)
@@ -840,6 +841,7 @@ type sessionSetTargetArgs struct {
 	ChannelType string `json:"channel_type"`
 	ChannelID   string `json:"channel_id"`
 	Target      string `json:"target"`
+	ThreadTS    string `json:"thread_ts,omitempty"`
 }
 
 func resolveSessionTargetIdentity(agentName, sessionID string) (agentID, resolvedAgentName string, err error) {
@@ -1183,6 +1185,7 @@ func registerSessionTools(s *sdkmcp.Server) {
 			Type:         channelType,
 			ConfiguredID: configuredID,
 			ID:           targetID,
+			ThreadTS:     strings.TrimSpace(args.ThreadTS),
 		}
 		if err := sessiontarget.Set(agentID, agentName, sessionID, target, channelMgr); err != nil {
 			return nil, struct{}{}, fmt.Errorf("setting session target: %w", err)
