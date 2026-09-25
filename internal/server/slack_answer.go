@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -12,6 +13,11 @@ import (
 
 const slackAnswerInlineLimit = 400
 
+var (
+	slackMarkdownLine   = regexp.MustCompile(`^(?:#{1,6}[ \t]+|[*+-][ \t]+|[0-9]+[.)][ \t]+|>[ \t]+|(?:-{3,}|\*{3,}|_{3,})$)`)
+	slackInlineEmphasis = regexp.MustCompile(`(?:^|[^\pL\pN])(?:\*[^*\s](?:[^*]*[^*\s])?\*|_[^_\s](?:[^_]*[^_\s])?_)(?:$|[^\pL\pN])`)
+)
+
 func shouldAttachSlackAnswer(answer string) bool {
 	answer = strings.TrimSpace(answer)
 	if answer == "" {
@@ -20,18 +26,9 @@ func shouldAttachSlackAnswer(answer string) bool {
 	if utf8.RuneCountInString(answer) > slackAnswerInlineLimit || strings.ContainsAny(answer, "\r\n") {
 		return true
 	}
-	orderedList := false
-	for i, r := range answer {
-		if r < '0' || r > '9' {
-			orderedList = i > 0 && strings.HasPrefix(answer[i:], ". ")
-			break
-		}
-	}
 	return strings.Contains(answer, "**") || strings.Contains(answer, "__") ||
-		strings.Contains(answer, "~~") || strings.ContainsAny(answer, "`[]") || orderedList ||
-		strings.HasPrefix(answer, "# ") ||
-		strings.HasPrefix(answer, "- ") || strings.HasPrefix(answer, "* ") ||
-		strings.HasPrefix(answer, "> ")
+		strings.Contains(answer, "~~") || strings.ContainsAny(answer, "`[") ||
+		slackMarkdownLine.MatchString(answer) || slackInlineEmphasis.MatchString(answer)
 }
 
 func splitSlackPlainText(answer string, limit int) []string {
