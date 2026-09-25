@@ -176,6 +176,7 @@
                             "description": "Glob patterns matched against group message text. At least one must match to forward the message."
                           },
                           "respond_to_mentions": { "type": "boolean" },
+                          "ignore_broadcast_mentions": { "type": "boolean" },
                           "restrict_tools": {
                             "type": "array",
                             "items": { "type": "string" }

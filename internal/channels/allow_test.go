@@ -258,7 +258,7 @@ func TestCheckAllowed_MentionPrefixGroupOnly_FalseReplyToSelfBypasses(t *testing
 	entries := []config.AllowFromEntry{
 		{From: "*", MentionPrefixes: []string{"aviary"}, MentionPrefixGroupOnly: &f},
 	}
-	result := checkAllowedReplyContinuation(entries, "+1", "+1", false)
+	result := checkAllowedReplyContinuation(entries, "+1", "+1", "hello", false)
 	assert.True(t, result.allowed)
 }
 
@@ -295,4 +295,26 @@ func TestCheckAllowed_ExcludePrefixes_GlobPattern(t *testing.T) {
 	}
 	assert.False(t, checkAllowed(entries, "+1", "+1", "bot: do something", false, "", false).allowed)
 	assert.True(t, checkAllowed(entries, "+1", "+1", "human: do something", false, "", false).allowed)
+}
+
+func TestCheckAllowed_IgnoreBroadcastMentions(t *testing.T) {
+	entries := []config.AllowFromEntry{{From: "*", AllowedGroups: "*", IgnoreBroadcastMentions: true}}
+	for _, message := range []string{
+		"<!here> status?", "status <!channel> please", "<!everyone|everyone> help",
+		"@here status?", "status @everyone please", "<@BOTID> @channel help",
+	} {
+		assert.False(t, checkAllowed(entries, "user1", "group1", message, true, "BOTID", false).allowed, message)
+		assert.False(t, checkAllowedReplyContinuation(entries, "user1", "group1", message, true).allowed, message)
+	}
+	assert.True(t, checkAllowed(entries, "user1", "group1", "<@BOTID> help", true, "BOTID", false).allowed)
+	assert.True(t, checkAllowed(entries, "user1", "group1", "somewhere helpful", true, "BOTID", false).allowed)
+	assert.True(t, checkAllowed(entries, "user1", "user1", "@here in a DM", false, "BOTID", false).allowed)
+
+	entries[0].IgnoreBroadcastMentions = false
+	assert.True(t, checkAllowed(entries, "user1", "group1", "<!here> status?", true, "BOTID", false).allowed)
+}
+
+func TestCheckAllowedReplyContinuation_StillAppliesExclusions(t *testing.T) {
+	entries := []config.AllowFromEntry{{From: "*", AllowedGroups: "*", ExcludePrefixes: []string{"!"}}}
+	assert.False(t, checkAllowedReplyContinuation(entries, "user1", "group1", "!ignore", true).allowed)
 }

@@ -2,6 +2,7 @@ package channels
 
 import (
 	"path"
+	"regexp"
 	"strings"
 
 	"github.com/lsegal/aviary/internal/config"
@@ -42,11 +43,13 @@ func checkAllowed(
 // continues without requiring a fresh mention.
 func checkAllowedReplyContinuation(
 	entries []config.AllowFromEntry,
-	from, channelID string,
+	from, channelID, text string,
 	isGroup bool,
 ) allowResult {
-	return checkAllowedWithOptions(entries, from, channelID, "", isGroup, "", false, true)
+	return checkAllowedWithOptions(entries, from, channelID, text, isGroup, "", false, true)
 }
+
+var broadcastMention = regexp.MustCompile(`(?i)<!((here|channel|everyone)([|>]))|(^|[^[:alnum:]_])@(here|channel|everyone)\b`)
 
 func checkAllowedWithOptions(
 	entries []config.AllowFromEntry,
@@ -66,6 +69,9 @@ func checkAllowedWithOptions(
 		// ExcludePrefixes is a global denylist: drop the message if any pattern
 		// matches, regardless of whether it is a DM or group message.
 		if matchesMentionPrefixes(text, entry.ExcludePrefixes) {
+			return allowResult{}
+		}
+		if isGroup && entry.IgnoreBroadcastMentions && broadcastMention.MatchString(text) {
 			return allowResult{}
 		}
 		for _, id := range splitFrom(entry.From) {

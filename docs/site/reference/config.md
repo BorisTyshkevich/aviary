@@ -163,7 +163,7 @@ channels:
 | `show_typing` | bool | `true` | Show a typing or progress indicator while processing on supported channels (Signal typing notifications and Slack assistant status indicators) |
 | `separate_top_level_sessions` | bool | `false` | For Slack, start a distinct session for each top-level message thread instead of sharing one channel session |
 | `react_to_emoji` | bool | `true` | Treat emoji reactions on the agent's own messages as prompts |
-| `reply_to_replies` | bool | `true` | Respond when someone replies to one of the agent's messages |
+| `reply_to_replies` | bool | `true` | Let Slack thread replies and Signal replies to the agent continue without a fresh mention |
 | `send_read_receipts` | bool | `true` | Send read receipts for messages the agent will act on |
 | `group_chat_history` | int | `50` | Number of recent group chat messages retained as context. Set to `-1` to disable. |
 | `disabled_tools` | []string | | Tools disabled for messages arriving on this channel |
@@ -175,7 +175,7 @@ channels:
 - `url` must contain the Slack App-Level token (`xapp-...`) when `type: slack`.
 - `token` must contain the Slack Bot token (`xoxb-...`) when `type: slack`.
 - Slack apps using Events API and Socket Mode cannot send classic typing indicators, but `show_typing` enables Slack assistant thread status updates while Aviary is working.
-- Slack replies inside an existing thread are treated as replies and do not require an `@bot` mention or configured mention prefix.
+- Slack replies inside an existing thread do not require an `@bot` mention or configured mention prefix by default. Set `reply_to_replies: false` to require the normal mention rules for thread replies.
 - Set `separate_top_level_sessions: true` to keep each new top-level Slack message and its thread replies in a separate session.
 - `users:read` is required on the Slack bot token if you want Aviary to resolve Slack user names for name-based routing.
 - Slack Event Subscriptions should include both message events and the `app_mention` event if you want the bot to answer `@bot` mentions in channels.
@@ -204,6 +204,7 @@ Each entry controls which senders and groups can trigger the agent.
 | `mention_prefixes` | []string | | Glob patterns matched against group message text. At least one must match (unless `respond_to_mentions` triggers). |
 | `exclude_prefixes` | []string | | Glob patterns; messages matching any pattern are silently dropped |
 | `respond_to_mentions` | bool | `false` | Also forward group messages that directly @mention the bot |
+| `ignore_broadcast_mentions` | bool | `false` | Drop group messages containing `@here`, `@channel`, or `@everyone`, including thread replies. Supports Slack broadcast tokens and Discord mentions. |
 | `mention_prefix_group_only` | bool | `true` | When `true`, prefix/mention filtering applies only to group messages; direct messages from allowed senders are always forwarded. |
 | `restrict_tools` | []string | | Override the tool allowlist for messages matching this entry |
 | `model` | string | | Override model for messages matching this entry |

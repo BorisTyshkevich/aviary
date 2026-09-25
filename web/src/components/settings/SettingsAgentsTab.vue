@@ -530,6 +530,14 @@
 											</label>
 											<label class="block cursor-pointer">
 												<div class="flex items-center gap-2">
+													<input type="checkbox" v-model="entry.ignore_broadcast_mentions"
+														class="h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
+													<span class="text-xs font-medium text-gray-700 dark:text-gray-300">Ignore @here, @channel, and @everyone</span>
+												</div>
+												<p class="mt-0.5 pl-5 text-[11px] leading-4 text-gray-400 dark:text-gray-500">Drop group messages with broadcast mentions, including thread replies.</p>
+											</label>
+											<label class="block cursor-pointer">
+												<div class="flex items-center gap-2">
 													<input type="checkbox" :checked="entry.mention_prefix_group_only !== false"
 														class="h-3.5 w-3.5 shrink-0 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800"
 														@change="entry.mention_prefix_group_only = ($event.target as HTMLInputElement).checked ? undefined : false" />

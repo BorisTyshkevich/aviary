@@ -1264,6 +1264,56 @@ func TestRoutedSlackMessage_SharedConnectionRoutesMatchingSpec(t *testing.T) {
 	assert.False(t, ok)
 }
 
+func TestRoutedSlackMessage_ReplyToRepliesFalseRequiresMention(t *testing.T) {
+	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
+	ch.botUserID = "UBOT"
+	disabled := false
+	spec := channelSpec{channelConfig: config.ChannelConfig{
+		Type: "slack", ID: "bot", ReplyToReplies: &disabled,
+		AllowFrom: []config.AllowFromEntry{{From: "*", AllowedGroups: "C123", RespondToMentions: true}},
+	}}
+	msg := IncomingMessage{Type: "slack", From: "U123", Channel: "C123", Text: "follow up", IsThreadReply: true}
+	_, ok := routedSlackMessage(ch, spec, msg)
+	assert.False(t, ok)
+
+	msg.Text = "<@UBOT> follow up"
+	_, ok = routedSlackMessage(ch, spec, msg)
+	assert.True(t, ok)
+
+	spec.channelConfig.ReplyToReplies = nil
+	msg.Text = "follow up"
+	_, ok = routedSlackMessage(ch, spec, msg)
+	assert.True(t, ok)
+}
+
+func TestSlackChannel_ReplyToRepliesFalseRequiresMention(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"ok":true,"messages":[]}`))
+	}))
+	defer api.Close()
+
+	disabled := false
+	ch := newChannel(config.ChannelConfig{
+		Type: "slack", URL: "xapp-token", Token: "xoxb-token", ReplyToReplies: &disabled,
+		AllowFrom: []config.AllowFromEntry{{From: "*", AllowedGroups: "C123", RespondToMentions: true}},
+	}, "m", nil).(*SlackChannel)
+	ch.client = slack.New("xoxb-token", slack.OptionAPIURL(api.URL+"/"))
+	ch.botUserID = "UBOT"
+	var messages []IncomingMessage
+	ch.OnMessage(func(msg IncomingMessage) { messages = append(messages, msg) })
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		User: "U123", Channel: "C123", Text: "follow up",
+		TimeStamp: "1710000001.000001", ThreadTimeStamp: "1710000000.000001",
+	})
+	assert.Empty(t, messages)
+
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		User: "U123", Channel: "C123", Text: "<@UBOT> follow up",
+		TimeStamp: "1710000002.000001", ThreadTimeStamp: "1710000000.000001",
+	})
+	assert.Len(t, messages, 1)
+}
+
 func TestRoutedSlackMessage_SharedConnectionResolvesChannelName(t *testing.T) {
 	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
 	ch.botUserID = "UBOT"

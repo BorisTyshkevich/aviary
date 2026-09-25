@@ -20,13 +20,14 @@ import (
 
 // SlackChannel connects to Slack using Socket Mode (no public URL required).
 type SlackChannel struct {
-	appToken      string // xapp-... token for socket mode
-	botToken      string // xoxb-... token for posting
-	allowFrom     []config.AllowFromEntry
-	model         string
-	fallbacks     []string
-	disabledTools []string
-	showStatus    bool
+	appToken       string // xapp-... token for socket mode
+	botToken       string // xoxb-... token for posting
+	allowFrom      []config.AllowFromEntry
+	model          string
+	fallbacks      []string
+	disabledTools  []string
+	showStatus     bool
+	replyToReplies bool
 
 	botUserID         string // populated on connect via auth.test
 	resolvedAllowFrom []config.AllowFromEntry
@@ -55,14 +56,15 @@ func NewSlackChannel(appToken, botToken string, allowFrom []config.AllowFromEntr
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	sm := socketmode.New(api)
 	return &SlackChannel{
-		appToken:   appToken,
-		botToken:   botToken,
-		allowFrom:  allowFrom,
-		model:      model,
-		fallbacks:  fallbacks,
-		showStatus: true,
-		client:     api,
-		sm:         sm,
+		appToken:       appToken,
+		botToken:       botToken,
+		allowFrom:      allowFrom,
+		model:          model,
+		fallbacks:      fallbacks,
+		showStatus:     true,
+		replyToReplies: true,
+		client:         api,
+		sm:             sm,
 	}
 }
 
@@ -440,8 +442,8 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	}
 
 	result := checkAllowed(c.allowedEntries(), from, channelID, text, isGroup, c.botUserID, false)
-	if !result.allowed && isThreadReply {
-		result = checkAllowedReplyContinuation(c.allowedEntries(), from, channelID, isGroup)
+	if !result.allowed && isThreadReply && c.replyToReplies {
+		result = checkAllowedReplyContinuation(c.allowedEntries(), from, channelID, text, isGroup)
 	}
 	if !result.allowed {
 		c.logf("slack: ignored message from=%s channel=%s", from, channelID)

@@ -440,8 +440,8 @@ func routedSlackMessage(ch *SlackChannel, spec channelSpec, msg IncomingMessage)
 	}
 	allowFrom := ch.resolvedEntriesForRouting(spec.channelConfig.AllowFrom)
 	result := checkAllowed(allowFrom, msg.From, msg.Channel, msg.Text, isGroup, botUserID, false)
-	if !result.allowed && msg.IsThreadReply {
-		result = checkAllowedReplyContinuation(allowFrom, msg.From, msg.Channel, isGroup)
+	if !result.allowed && msg.IsThreadReply && config.BoolOr(spec.channelConfig.ReplyToReplies, true) {
+		result = checkAllowedReplyContinuation(allowFrom, msg.From, msg.Channel, msg.Text, isGroup)
 	}
 	if !result.allowed {
 		return IncomingMessage{}, false
@@ -716,6 +716,7 @@ func newChannel(cc config.ChannelConfig, agentModel string, agentFallbacks []str
 		ch := NewSlackChannel(cc.URL, cc.Token, cc.AllowFrom, model, fallbacks)
 		ch.disabledTools = cc.DisabledTools
 		ch.showStatus = config.BoolOr(cc.ShowTyping, true)
+		ch.replyToReplies = config.BoolOr(cc.ReplyToReplies, true)
 		return ch
 	case "discord":
 		if cc.ShowTyping != nil {

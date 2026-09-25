@@ -22,6 +22,7 @@ export interface AllowFromEntry {
 	mention_prefixes?: string[];
 	exclude_prefixes?: string[];
 	respond_to_mentions?: boolean;
+	ignore_broadcast_mentions?: boolean;
 	mention_prefix_group_only?: boolean;
 	restrict_tools?: string[];
 	model?: string;

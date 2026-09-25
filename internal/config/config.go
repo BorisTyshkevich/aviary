@@ -149,6 +149,9 @@ type AllowFromEntry struct {
 	// syntax (e.g. <@BOTID>).  On Signal this uses the envelope's wasMentioned
 	// field provided by signal-cli.
 	RespondToMentions bool `yaml:"respond_to_mentions,omitempty" json:"respond_to_mentions,omitempty"`
+	// IgnoreBroadcastMentions drops group messages containing @here, @channel,
+	// or @everyone, including replies in an existing thread.
+	IgnoreBroadcastMentions bool `yaml:"ignore_broadcast_mentions,omitempty" json:"ignore_broadcast_mentions,omitempty"`
 	// MentionPrefixGroupOnly controls whether MentionPrefixes and
 	// RespondToMentions filtering is restricted to group chats only.
 	// Defaults to true (current behaviour). Set to false to also require a
@@ -215,10 +218,9 @@ type ChannelConfig struct {
 	// on its own messages. On Signal, this treats the emoji as a prompt and
 	// mirrors the same reaction back. Defaults to true for supported channels.
 	ReactToEmoji *bool `yaml:"react_to_emoji,omitempty"   json:"react_to_emoji,omitempty"`
-	// ReplyToReplies controls whether the agent responds when someone replies
-	// to one of its own messages. Replies still have to match the entry's
-	// sender/group allowFrom scope, but can continue the conversation without
-	// re-satisfying mention-based group gating.
+	// ReplyToReplies lets Slack thread replies and Signal replies to the agent's
+	// messages continue without re-satisfying mention-based allowFrom rules.
+	// Sender and group allowFrom rules still apply.
 	// Defaults to true for channels that support it.
 	ReplyToReplies *bool `yaml:"reply_to_replies,omitempty" json:"reply_to_replies,omitempty"`
 	// SendReadReceipts controls whether the agent sends read receipts for

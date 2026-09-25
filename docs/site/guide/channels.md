@@ -91,6 +91,8 @@ Your Slack app should also have:
 
 If the bot should respond when you type something like `@Aviary hi` in a channel, Slack must be configured to deliver `app_mention` events to the app.
 
+Set `reply_to_replies: false` on the Slack channel to require a fresh mention in thread replies. Set `ignore_broadcast_mentions: true` on an `allow_from` entry to drop group messages with `@here`, `@channel`, or `@everyone`, including thread replies.
+
 If you add `files:write` to an existing Slack app, reinstall the app to the workspace so the bot token receives the new scope.
 
 If you want the bot to work in a channel like `#alerts`, invite it there in Slack the same way you would invite a teammate.
