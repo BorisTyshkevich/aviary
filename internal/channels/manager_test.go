@@ -782,6 +782,49 @@ func TestSlackChannel_HandleAppMention(t *testing.T) {
 	assert.Equal(t, time.Unix(1710000000, 123456000).UTC(), msg.ReceivedAt)
 }
 
+func TestSlackChannel_DeduplicatesMessageAndAppMention(t *testing.T) {
+	ch := NewSlackChannel("xapp-token", "xoxb-token", []config.AllowFromEntry{{
+		From: "*", AllowedGroups: "*", RespondToMentions: true,
+	}}, "m", nil)
+	ch.botUserID = "UBOT"
+	var messages []IncomingMessage
+	ch.OnMessage(func(m IncomingMessage) { messages = append(messages, m) })
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		User: "U123", Channel: "C123", Text: "<@UBOT> hi", TimeStamp: "1710000000.123456",
+	})
+	ch.handleAppMentionEvent(&slackevents.AppMentionEvent{
+		User: "U123", Channel: "C123", Text: "<@UBOT> hi", TimeStamp: "1710000000.123456",
+	})
+	assert.Len(t, messages, 1)
+}
+
+func TestSlackChannel_IgnoresOwnChannelJoin(t *testing.T) {
+	ch := NewSlackChannel("xapp-token", "xoxb-token", []config.AllowFromEntry{{
+		From: "*", AllowedGroups: "*", RespondToMentions: true,
+	}}, "m", nil)
+	ch.botUserID = "UBOT"
+	var messages []IncomingMessage
+	ch.OnMessage(func(m IncomingMessage) { messages = append(messages, m) })
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		User: "UBOT", Channel: "C123", Text: "<@UBOT> has joined the channel", TimeStamp: "1710000000.123456", SubType: "channel_join",
+	})
+	assert.Empty(t, messages)
+}
+
+func TestSlackChannel_IgnoresRootOnlyMessageReplied(t *testing.T) {
+	ch := NewSlackChannel("xapp-token", "xoxb-token", []config.AllowFromEntry{{
+		From: "*", AllowedGroups: "*", RespondToMentions: true,
+	}}, "m", nil)
+	ch.botUserID = "UBOT"
+	var messages []IncomingMessage
+	ch.OnMessage(func(m IncomingMessage) { messages = append(messages, m) })
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		SubType: "message_replied", Channel: "C123", TimeStamp: "1710000000.123456",
+		Message: &slack.Msg{User: "U123", Text: "<@UBOT> hi", Timestamp: "1710000000.123456", LatestReply: "1710000000.123456"},
+	})
+	assert.Empty(t, messages)
+}
+
 func TestSlackChannel_HandleMessageUsesTimestampAsThreadFallback(t *testing.T) {
 	ch := NewSlackChannel("xapp-token", "xoxb-token", []config.AllowFromEntry{{From: "*"}}, "m", nil)
 	msgs := make(chan IncomingMessage, 1)
@@ -1148,6 +1191,33 @@ func TestRoutedSlackMessage_SharedConnectionRoutesMatchingSpec(t *testing.T) {
 	assert.Equal(t, "model/ony", routed.Model)
 
 	_, ok = routedSlackMessage(ch, coder, msg)
+	assert.False(t, ok)
+}
+
+func TestRoutedSlackMessage_SharedConnectionResolvesChannelName(t *testing.T) {
+	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
+	ch.botUserID = "UBOT"
+	ch.channelAliases = map[string]string{"bvt-test": "C123"}
+	spec := channelSpec{
+		agentName: "clickhouse-expert",
+		channelConfig: config.ChannelConfig{
+			Type: "slack",
+			ID:   "bot",
+			AllowFrom: []config.AllowFromEntry{{
+				From:              "*",
+				AllowedGroups:     "#bvt-test",
+				RespondToMentions: true,
+			}},
+		},
+	}
+	msg := IncomingMessage{Type: "slack", From: "U123", Channel: "C123", Text: "<@UBOT> Where is merge eligibility checked?"}
+
+	_, ok := routedSlackMessage(ch, spec, msg)
+	assert.True(t, ok)
+	assert.True(t, matchesAnyAllowedGroup(ch.resolvedEntriesForRouting(spec.channelConfig.AllowFrom), msg.Channel))
+
+	msg.Channel = "COTHER"
+	_, ok = routedSlackMessage(ch, spec, msg)
 	assert.False(t, ok)
 }
 
