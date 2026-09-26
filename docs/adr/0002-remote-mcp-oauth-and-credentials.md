@@ -36,14 +36,16 @@ Dynamic Client Registration is not required for the initial Altinity interoperab
 A dynamic connection is explicit, for example:
 
 ```text
-@aexp connect to https://mcp.cluster.environment.altinity.cloud
+@bot connect https://mcp.cluster.environment.altinity.cloud
 ```
 
-The connection attempt creates an outbound MCP client and starts the MCP handshake/tool discovery.
+The command handler validates the explicit request and network policy, configures the thread's single dynamic connection, and starts the MCP handshake/tool discovery. No agent/LLM run is started for this command.
 
-If the remote server returns an authorization-required response during initialization or discovery, Aviary creates an OAuth transaction and terminates the current agent run.
+If the remote server returns an authorization-required response during command initialization or discovery, Aviary creates an OAuth transaction, sends the initiating user a private authorization link, and finishes the command without waiting for the browser.
 
-A later authorization-required response during a remote tool call behaves the same way.
+A later authorization-required response during an agent's remote tool call creates an OAuth transaction and terminates that agent run.
+
+Ordinary turn-start discovery is different: when an attached dynamic or static connection lacks valid authorization, report that it needs login, omit its unavailable tools, and continue with available tools. Do not block unrelated work, borrow another user's credentials, or fall back to an old/different connection.
 
 No agent run waits for a browser.
 
@@ -116,7 +118,7 @@ Persist:
 
 If the server issues a refresh token, Aviary may refresh non-interactively.
 
-If interactive authorization is required, Aviary terminates the current agent run and initiates a new authorization flow.
+If interactive authorization is required during a remote tool call, Aviary terminates the current agent run and initiates a new authorization flow. Initial connect-command authorization completes independently without creating an agent run.
 
 The current Altinity broker limitation of no downstream refresh token is accepted; reauthorization is required after expiry until that server behavior changes.
 

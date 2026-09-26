@@ -6,7 +6,7 @@
 
 ## Context
 
-Dynamic remote MCP means a Slack user can ask Aviary to connect to a URL supplied in the conversation.
+Dynamic remote MCP means a Slack user can issue an explicit `@bot connect URL` command. Aviary parses it before the agent/LLM and manages the thread's single dynamic MCP attachment.
 
 That is intentionally an outbound-network capability from the Aviary host. It must therefore be controlled by deployment configuration.
 
@@ -148,7 +148,7 @@ Logs must not contain bearer tokens, authorization codes, PKCE verifiers, sensit
 
 ### Allow any URL without policy
 
-Rejected because `mcp_connect(url)` would become unrestricted outbound network access for any user who can invoke the agent.
+Rejected because `@bot connect URL` would become unrestricted outbound network access for any user allowed to issue the command.
 
 ### Hard-code `*.altinity.cloud`
 

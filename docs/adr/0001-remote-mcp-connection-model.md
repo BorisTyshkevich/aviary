@@ -24,7 +24,9 @@ Authentication ownership is independent of how the server was discovered. A stat
 
 ### 1. Static and dynamic remote connections are both first-class
 
-A static server is persisted in Aviary configuration. A dynamic server is attached to the current session/thread after an explicit user request.
+A static server is persisted in Aviary configuration. A dynamic server is attached through the explicit `@bot connect URL` command, parsed and handled by Aviary before starting an agent/LLM run. It is a thread configuration action, not a model-callable tool. Each thread has at most one dynamic MCP connection at a time; static servers remain separate.
+
+Reject replacement while an agent turn is active in that thread. The user must wait for the turn to finish or stop it first. Checking for an active turn and changing the attachment must be coordinated so a concurrent turn cannot start against a changing target.
 
 Conceptually:
 
@@ -79,9 +81,11 @@ The Go agent tool client composes:
 - eligible static remote tools;
 - dynamic remote tools attached to the current session/thread.
 
-Remote connection state must follow the same session/thread identity used by the agent run. A connection created in thread A must not affect thread B, even when both use the same Aviary agent.
+Remote connection state is keyed by the originating agent, Slack installation/workspace, channel, and root thread timestamp, independently of the conversation-history session. A connection created in thread A must not affect thread B, even when both use the same Aviary agent or channel-wide conversation history.
 
-Within a Slack thread, connection descriptors and conversation history are shared. Slack permissions are the security boundary for reading that thread, including previously posted remote tool results. Aviary does not impose an additional per-user visibility boundary on those results.
+The agent may read full channel history permitted by Slack. The current thread's persisted connection descriptor is the authoritative dynamic MCP target. Historical tool names, URLs, or results cannot select a connection or retarget a call. Replaced connection namespaces must not silently resolve to the new cluster.
+
+Within a Slack thread, the single dynamic connection descriptor and conversation history are shared. Slack permissions are the security boundary for reading that thread, including previously posted remote tool results. Aviary does not impose an additional per-user visibility boundary on those results.
 
 Sharing an attachment does not share personal authorization. If Alice connects a resource and Bob later requests a tool call in the same thread, discovery and calls use Bob's credentials. If Bob has not authorized the resource, he receives his own authorization handoff. Alice's token, authenticated client, or user-specific tool catalog must never be reused for Bob.
 
