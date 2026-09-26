@@ -112,7 +112,7 @@ func runInstallService(_ *cobra.Command, _ []string) error {
 		DisplayName: "Aviary",
 		Description: "Aviary agent server",
 		Exec:        exe,
-		Args:        []string{"serve", "start", "-d"},
+		Args:        []string{"serve", "start"},
 		WorkingDir:  filepath.Dir(exe),
 	}
 	fmt.Printf("Installing service: %s\n", opts.Name)
