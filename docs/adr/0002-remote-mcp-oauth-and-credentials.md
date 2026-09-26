@@ -36,14 +36,16 @@ Dynamic Client Registration is not required for the initial Altinity interoperab
 A dynamic connection is explicit, for example:
 
 ```text
-@aexp connect to https://mcp.cluster.environment.altinity.cloud
+@bot connect https://mcp.cluster.environment.altinity.cloud
 ```
 
-The connection attempt creates an outbound MCP client and starts the MCP handshake/tool discovery.
+The command handler validates the explicit request and network policy, configures the thread's single dynamic connection, and starts the MCP handshake/tool discovery. No agent/LLM run is started for this command.
 
-If the remote server returns an authorization-required response during initialization or discovery, Aviary creates an OAuth transaction and terminates the current agent run.
+If the remote server returns an authorization-required response during command initialization or discovery, Aviary creates an OAuth transaction, sends the initiating user a private authorization link, and finishes the command without waiting for the browser.
 
-A later authorization-required response during a remote tool call behaves the same way.
+A later authorization-required response during an agent's remote tool call creates an OAuth transaction and terminates that agent run.
+
+Ordinary turn-start discovery is different: when an attached dynamic or static connection lacks valid authorization, report that it needs login, omit its unavailable tools, and continue with available tools. Do not block unrelated work, borrow another user's credentials, or fall back to an old/different connection.
 
 No agent run waits for a browser.
 
@@ -94,6 +96,10 @@ The endpoint string typed by the user is not by itself a sufficient long-term cr
 
 A user may reuse a still-valid personal credential for the same resource from another thread.
 
+The personal credential owner is the authenticated sender of the current interactive turn. It must not be inferred from the thread creator, connection creator, most recent author, model arguments, or conversation text. Bob may read Alice's prior thread results when Slack permits that access, but any new personal-auth MCP discovery or call initiated by Bob must use Bob's credentials. If Bob has none, require Bob's authorization; never fall back to Alice's credentials.
+
+Scheduled jobs cannot use personal credentials. This applies even when the job was created from a personal-authenticated conversation. Scheduled jobs may use configured static no-auth or shared-OAuth connections, subject to their permissions.
+
 ### 6. Shared credentials are allowed only for configured static servers
 
 A statically configured server may specify shared OAuth credentials. Those are created through Aviary's control plane and are not owned by a Slack user.
@@ -112,7 +118,7 @@ Persist:
 
 If the server issues a refresh token, Aviary may refresh non-interactively.
 
-If interactive authorization is required, Aviary terminates the current agent run and initiates a new authorization flow.
+If interactive authorization is required during a remote tool call, Aviary terminates the current agent run and initiates a new authorization flow. Initial connect-command authorization completes independently without creating an agent run.
 
 The current Altinity broker limitation of no downstream refresh token is accepted; reauthorization is required after expiry until that server behavior changes.
 

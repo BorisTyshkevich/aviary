@@ -18,48 +18,52 @@ Remote MCP does not require Slack HTTP push mode.
 
 Aviary continues receiving Slack messages over the existing Socket Mode WebSocket. OAuth browser redirects use Aviary's public HTTP server, but Slack event delivery remains independent.
 
-### 2. Add an explicit local connect operation
+### 2. Handle connect as a deterministic thread configuration command
 
-Aviary exposes a local tool conceptually equivalent to:
-
-```text
-mcp_connect(endpoint)
-```
-
-Skills/prompts may guide the model to use this tool when the user explicitly requests a connection, for example:
+Aviary recognizes this command directly in the incoming Slack message before invoking the agent/LLM:
 
 ```text
-please connect to https://mcp.cluster.environment.altinity.cloud
+@bot connect URL
 ```
 
-The connection URL must come from explicit user intent and must pass remote MCP network policy.
+For example:
 
-The connect operation creates/updates the thread-scoped remote connection descriptor and attempts MCP initialization/tool discovery.
+```text
+@bot connect https://mcp.cluster.environment.altinity.cloud
+```
+
+Parse the command from the original message and trusted Slack sender identity, not from enriched channel history, quoted tool results, or model output. Normal sender/channel access checks still apply. Validate the exact endpoint through remote MCP network policy before dialing.
+
+The command manages one dynamic connection descriptor per thread and attempts MCP initialization/tool discovery. Connection management is not exposed as an agent/script tool. Status and disconnect are also deterministic configuration operations. Configured static MCP servers may coexist with the single dynamic connection.
 
 ### 3. Remote tools are attached to the current session/thread
 
-The agent tool client composes local and remote tools using the current Aviary session identity.
+The agent tool client composes local and remote tools using the incoming thread identity independently of the session used for conversation history. The agent may explore the full channel history permitted by Slack, but the current thread has only one authoritative dynamic MCP target.
 
 For Slack, the connection context includes:
 
 - Slack workspace/team;
 - channel;
-- thread timestamp/session identity;
+- root thread timestamp and originating Aviary agent/installation;
 - Slack user for personal credentials.
 
 A dynamic connection in one thread does not automatically appear in another thread.
 
-### 4. The first authorization-required response ends the current turn
+Historical connection names and results are context only. Validate every call against the current thread attachment and its connection identity; never map a stale connection name to the current cluster merely because it occupies the same slot.
+
+Thread participants share connection descriptors and visible conversation results under Slack's access rules. Each interactive turn carries its own trusted sender principal. Resolve personal credentials and authenticated tool discovery for that principal on every turn; never borrow the attachment creator's credentials or authenticated client. Bob's missing authorization must produce an ephemeral handoff to Bob, even if Alice already authorized the same thread attachment.
+
+### 4. Explicit connect and tool-call authorization handoffs
 
 During explicit connect:
 
 ```text
-mcp_connect
+@bot connect URL (no agent/LLM run)
   -> MCP initialize / tools/list
   -> authorization required
   -> create OAuth transaction
   -> send ephemeral authorization link
-  -> stop current agent run
+  -> finish command; browser completes independently
 ```
 
 During later use:
@@ -102,6 +106,8 @@ A remote tool must pass the same effective agent/per-message permission checks w
 
 Directly supplying a namespaced tool name must not bypass the current session's connection or permissions.
 
+Scheduled prompt and script jobs have no authority to use personal credentials. Only eligible static no-auth or shared-OAuth connections may contribute tools to a scheduled run. Enforce this again at invocation so direct names and scripts cannot bypass it. A scheduled run's reply thread or creator must not be used to impersonate an interactive Slack principal.
+
 ### 8. Channel-specific UX stays outside OAuth protocol logic
 
 The OAuth/core layer reports structured authorization-required/completed state.
@@ -112,6 +118,18 @@ The Slack adapter is responsible for:
 - posting the completion notification to the original thread.
 
 OAuth state and token exchange logic do not depend on Slack message rendering.
+
+### 9. Missing authorization during discovery does not block normal turns
+
+When an ordinary message starts a turn, missing or expired authorization on an attached dynamic or static MCP connection does not block available local or other eligible tools. Show that the connection needs login and exclude its unavailable tools. The current descriptor remains authoritative; do not fall back to a previous cluster, another thread's connection, or another user's credential.
+
+If authorization instead fails during an actual remote tool call, follow the stop-and-authorize behavior above. Do not automatically replay the failed call.
+
+### 10. Reject replacement while a thread has an active turn
+
+If `@bot connect NEW_URL` would replace a connection while any agent turn is active in the same thread, reject the replacement with an instruction to wait or stop that turn first. Keep the current attachment unchanged. Check turn activity and update the attachment atomically relative to starting a new turn; a check followed by an uncoordinated update is insufficient.
+
+Activity is tracked by the originating Slack thread, independently of shared channel-history session IDs. Never change an active turn's connection target underneath it.
 
 ## Consequences
 
