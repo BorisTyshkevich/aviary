@@ -163,6 +163,22 @@ func TestHTTPHandlerServesRequest(t *testing.T) {
 
 }
 
+func TestHTTPHandlerAcceptsForwardedHost(t *testing.T) {
+	ts := httptest.NewServer(HTTPHandler(NewServer()))
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, ts.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"proxy-test","version":"1.0"}}}`))
+	require.NoError(t, err)
+	req.Host = "llmbox.example.ts.net"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+
+	res, err := ts.Client().Do(req)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = res.Body.Close() })
+	require.Equal(t, http.StatusOK, res.StatusCode)
+}
+
 func TestBearerTransportAddsAuthHeader(t *testing.T) {
 	var seenAuth string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

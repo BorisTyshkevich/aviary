@@ -29,7 +29,11 @@ func NewServer() *mcp.Server {
 func HTTPHandler(s *mcp.Server) http.Handler {
 	base := mcp.NewStreamableHTTPHandler(func(_ *http.Request) *mcp.Server {
 		return s
-	}, nil)
+	}, &mcp.StreamableHTTPOptions{
+		// Aviary authenticates MCP requests, and reverse proxies such as Tailscale
+		// Serve forward their public Host to this loopback listener.
+		DisableLocalhostProtection: true,
+	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if agentID := r.Header.Get("X-Aviary-Agent-ID"); agentID != "" {
