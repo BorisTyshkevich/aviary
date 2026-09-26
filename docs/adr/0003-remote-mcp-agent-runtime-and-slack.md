@@ -49,6 +49,8 @@ For Slack, the connection context includes:
 
 A dynamic connection in one thread does not automatically appear in another thread.
 
+Thread participants share connection descriptors and visible conversation results under Slack's access rules. Each interactive turn carries its own trusted sender principal. Resolve personal credentials and authenticated tool discovery for that principal on every turn; never borrow the attachment creator's credentials or authenticated client. Bob's missing authorization must produce an ephemeral handoff to Bob, even if Alice already authorized the same thread attachment.
+
 ### 4. The first authorization-required response ends the current turn
 
 During explicit connect:
@@ -101,6 +103,8 @@ A remote tool must pass the same effective agent/per-message permission checks w
 - it is invoked indirectly by scripts.
 
 Directly supplying a namespaced tool name must not bypass the current session's connection or permissions.
+
+Scheduled prompt and script jobs have no authority to use personal credentials. Only eligible static no-auth or shared-OAuth connections may contribute tools to a scheduled run. Enforce this again at invocation so direct names and scripts cannot bypass it. A scheduled run's reply thread or creator must not be used to impersonate an interactive Slack principal.
 
 ### 8. Channel-specific UX stays outside OAuth protocol logic
 

@@ -94,6 +94,10 @@ The endpoint string typed by the user is not by itself a sufficient long-term cr
 
 A user may reuse a still-valid personal credential for the same resource from another thread.
 
+The personal credential owner is the authenticated sender of the current interactive turn. It must not be inferred from the thread creator, connection creator, most recent author, model arguments, or conversation text. Bob may read Alice's prior thread results when Slack permits that access, but any new personal-auth MCP discovery or call initiated by Bob must use Bob's credentials. If Bob has none, require Bob's authorization; never fall back to Alice's credentials.
+
+Scheduled jobs cannot use personal credentials. This applies even when the job was created from a personal-authenticated conversation. Scheduled jobs may use configured static no-auth or shared-OAuth connections, subject to their permissions.
+
 ### 6. Shared credentials are allowed only for configured static servers
 
 A statically configured server may specify shared OAuth credentials. Those are created through Aviary's control plane and are not owned by a Slack user.

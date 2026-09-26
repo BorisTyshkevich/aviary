@@ -81,6 +81,10 @@ The Go agent tool client composes:
 
 Remote connection state must follow the same session/thread identity used by the agent run. A connection created in thread A must not affect thread B, even when both use the same Aviary agent.
 
+Within a Slack thread, connection descriptors and conversation history are shared. Slack permissions are the security boundary for reading that thread, including previously posted remote tool results. Aviary does not impose an additional per-user visibility boundary on those results.
+
+Sharing an attachment does not share personal authorization. If Alice connects a resource and Bob later requests a tool call in the same thread, discovery and calls use Bob's credentials. If Bob has not authorized the resource, he receives his own authorization handoff. Alice's token, authenticated client, or user-specific tool catalog must never be reused for Bob.
+
 ### 4. Persist connection descriptors, not live MCP clients
 
 Persist enough state to reconstruct a connection:
@@ -117,6 +121,12 @@ AdminUI continues to use Aviary's inbound MCP server for configuration.
 The Go agent runtime uses a generic outbound MCP client directly.
 
 They may share configuration types, credential storage, and helper libraries, but there is no requirement for the agent runtime to route through the admin MCP API.
+
+### 7. Scheduled jobs cannot use personal credentials
+
+Scheduled prompt and script jobs may use eligible administrator-configured static servers with no authentication or shared OAuth. They cannot discover or call tools through personal OAuth connections, even if a job was created by an authenticated Slack user or targets that user's thread.
+
+A job's creator, reply target, and conversation history do not grant a personal credential identity. Enforce this restriction during discovery and invocation, including indirect script calls. Missing or expired shared authorization requires an administrator action; a scheduled job must not start a personal OAuth flow.
 
 ## Consequences
 
