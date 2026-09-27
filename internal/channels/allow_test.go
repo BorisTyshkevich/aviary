@@ -69,6 +69,7 @@ func TestIsDirectMention(t *testing.T) {
 		want      bool
 	}{
 		{"<@BOTID> help", "BOTID", true},
+		{"<@BOTID|Aviary> help", "BOTID", true},
 		{"<@BOTID>", "BOTID", true},
 		{"hello <@BOTID> world", "BOTID", true},
 		{"<@OTHERID>", "BOTID", false},

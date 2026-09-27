@@ -22,6 +22,7 @@ type slackConnectionIntake struct {
 	validateEndpoint func(context.Context, string, string) error
 	validatePassword func(context.Context, connections.Target, connections.Credential) error
 	specs            []channelSpec
+	claimCommand     func(slackIngress, channelSpec) bool
 	promptMu         sync.Mutex
 	startMu          sync.Mutex
 	stopped          bool
@@ -187,6 +188,12 @@ func (i *slackConnectionIntake) handle(in slackIngress) bool {
 	}
 	if i.service == nil || i.channel.botUserID == "" || i.channel.teamID == "" || in.RootTS == "" {
 		i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() { i.reply(in.ChannelID, in.RootTS, "Connection setup is unavailable.") })
+		return true
+	}
+	if i.claimCommand != nil && !i.claimCommand(in, *selected) {
+		i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() {
+			i.reply(in.ChannelID, in.RootTS, "Connection command could not select one authorized agent. Ask an administrator to check channel routing.")
+		})
 		return true
 	}
 	i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() { i.executeCommand(in, *selected, cmd) })

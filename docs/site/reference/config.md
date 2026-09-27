@@ -190,7 +190,7 @@ channels:
 | `show_typing` | bool | `true` | Show a typing or progress indicator while processing on supported channels (Signal typing notifications and Slack assistant status indicators) |
 | `separate_top_level_sessions` | bool | `false` | For Slack, start a distinct session for each top-level message thread instead of sharing one channel session |
 | `react_to_emoji` | bool | `true` | Treat emoji reactions on the agent's own messages as prompts |
-| `reply_to_replies` | bool | `true` | On Signal, respond when someone replies to one of the agent's messages |
+| `reply_to_replies` | bool | `true` | On Signal, respond to replies to the agent's messages. On Slack, let authorized participants continue a thread claimed by an explicit bot mention without another mention. |
 | `send_read_receipts` | bool | `true` | Send read receipts for messages the agent will act on |
 | `group_chat_history` | int | `50` | Number of recent group chat messages retained as context. Set to `-1` to disable. |
 | `disabled_tools` | []string | | Tools disabled for messages arriving on this channel |
@@ -202,7 +202,8 @@ channels:
 - `url` must contain the Slack App-Level token (`xapp-...`) when `type: slack`.
 - `token` must contain the Slack Bot token (`xoxb-...`) when `type: slack`.
 - Slack apps using Events API and Socket Mode cannot send classic typing indicators, but `show_typing` enables Slack assistant thread status updates while Aviary is working.
-- Slack group replies must match the bot's `@mention` or configured mention prefix when those filters are set, even inside an existing thread. Each bot evaluates its own mention.
+- The first authorized explicit bot mention or literal configured mention prefix claims a Slack thread for one agent when `reply_to_replies` is true. A bot mention can claim a channel-scoped catch-all rule or a rule configured to respond to mentions; a prefix-gated rule also requires its prefix. Wildcard mention prefixes remain ordinary message filters and do not claim or transfer threads. Authorized participants can continue a claimed thread without another mention. Sender, channel, exclude, and tool rules apply to each reply. A mention of another bot routes that message when the other bot has an enabled channel rule that accepts its mention; it does not change the thread owner. Ambiguous explicit targets are ignored. Unclaimed threads still follow ordinary `allow_from` rules; mention-gated agents ignore their untagged replies. Set `reply_to_replies: false` to require a fresh bot mention or literal prefix for every reply.
+- Thread claims survive restarts and expire 90 days after the Slack thread root. Removing, disabling, or re-enabling the owning channel spec leaves its old claim without an active owner; start a fresh thread to establish new affinity.
 - Set `separate_top_level_sessions: true` to keep each new top-level Slack message and its thread replies in a separate session.
 - `users:read` is required on the Slack bot token if you want Aviary to resolve Slack user names for name-based routing.
 - Slack Event Subscriptions should include both message events and the `app_mention` event if you want the bot to answer `@bot` mentions in channels.

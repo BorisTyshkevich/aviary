@@ -798,7 +798,7 @@ func TestSlackChannel_HandleAppMention(t *testing.T) {
 	assert.Equal(t, time.Unix(1710000000, 123456000).UTC(), msg.ReceivedAt)
 }
 
-func TestSlackChannel_ThreadReplyRequiresOwnMention(t *testing.T) {
+func TestSlackChannel_UnclaimedThreadReplyRequiresOwnMention(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []any{}})
 	}))
@@ -1288,7 +1288,7 @@ func TestRoutedSlackMessage_SharedConnectionRoutesMatchingSpec(t *testing.T) {
 	assert.False(t, ok)
 }
 
-func TestRoutedSlackMessage_ThreadReplyRequiresOwnMention(t *testing.T) {
+func TestRoutedSlackMessage_WithoutAffinityRequiresOwnMention(t *testing.T) {
 	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
 	ch.botUserID = "UCLICKSEARCH"
 	spec := channelSpec{channelConfig: config.ChannelConfig{AllowFrom: []config.AllowFromEntry{{

@@ -40,6 +40,7 @@ type Manager struct {
 	specs               map[string]channelSpec
 	slack               map[string]*sharedSlackChannel
 	slackAlias          map[string]string
+	affinity            *slackThreadAffinity
 	connectionService   *connections.Service
 	connectionValidator func(context.Context, string, string) error
 	credentialValidator func(context.Context, connections.Target, connections.Credential) error
@@ -97,6 +98,7 @@ func NewManager() *Manager {
 		specs:      make(map[string]channelSpec),
 		slack:      make(map[string]*sharedSlackChannel),
 		slackAlias: make(map[string]string),
+		affinity:   &slackThreadAffinity{},
 	}
 }
 
@@ -112,6 +114,11 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 	if err != nil {
 		slog.Warn("channel state read failed", "err", err)
 		state = &store.AppState{}
+	}
+	if m.affinity != nil {
+		if err := m.affinity.prune(); err != nil {
+			slog.Warn("slack thread affinity prune failed", "err", err)
+		}
 	}
 
 	desired := make(map[string]struct{})
@@ -375,8 +382,10 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	base := resolvedSpecs[0].channelConfig
 	base.AllowFrom = mergeAllowFrom(resolvedSpecs)
 	ch := NewSlackChannel(base.URL, base.Token, base.AllowFrom, "", nil)
+	ch.affinityPass = func(in slackIngress) bool { return in.RootTS != "" && in.RootTS != in.MessageTS }
 	ch.showStatus = anySlackStatusEnabled(resolvedSpecs)
 	intake := &slackConnectionIntake{channel: ch, service: m.connectionService, validateEndpoint: m.connectionValidator, validatePassword: m.credentialValidator, specs: resolvedSpecs}
+	intake.claimCommand = func(in slackIngress, selected channelSpec) bool { return m.claimSlackCommand(ch, in, selected) }
 	ch.intake = intake.handle
 	ch.intakeStart = intake.start
 	ch.intakeWait = intake.wait
@@ -414,17 +423,7 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	}
 
 	ch.OnMessage(func(msg IncomingMessage) {
-		for _, spec := range resolvedSpecs {
-			if !shouldProcessIncomingMessage(spec.metadata, msg) {
-				continue
-			}
-			routed, ok := routedSlackMessage(ch, spec, msg)
-			if !ok {
-				continue
-			}
-			intake.ensureSetup(spec.agentName, routed)
-			msgFn(spec.agentName, spec.channelConfig.Type, spec.channelConfig.ID, ch, routed)
-		}
+		m.routeSlackMessage(ch, msg, intake, msgFn)
 	})
 
 	cctx, cancel := context.WithCancel(ctx)
@@ -467,31 +466,7 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 }
 
 func routedSlackMessage(ch *SlackChannel, spec channelSpec, msg IncomingMessage) (IncomingMessage, bool) {
-	isGroup := !strings.HasPrefix(msg.Channel, "D")
-	botUserID := ch.botUserID
-	if botUserID == "" {
-		botUserID = spec.channelConfig.ID
-	}
-	allowFrom := ch.resolvedEntriesForRouting(spec.channelConfig.AllowFrom)
-	result := checkAllowed(allowFrom, msg.From, msg.Channel, msg.Text, isGroup, botUserID, false)
-	if !result.allowed {
-		return IncomingMessage{}, false
-	}
-	routed := msg
-	routed.RestrictTools = result.restrictTools
-	routed.DisabledTools = spec.channelConfig.DisabledTools
-	routed.Model = result.model
-	if routed.Model == "" {
-		routed.Model = firstNonEmpty(spec.channelConfig.Model, spec.agentModel)
-	}
-	routed.Fallbacks = result.fallbacks
-	if len(routed.Fallbacks) == 0 {
-		routed.Fallbacks = spec.channelConfig.Fallbacks
-	}
-	if len(routed.Fallbacks) == 0 {
-		routed.Fallbacks = spec.agentFallbacks
-	}
-	return routed, true
+	return routedSlackMessageWithPolicy(ch, spec, msg, msg.Text, false)
 }
 
 func mergeAllowFrom(specs []channelSpec) []config.AllowFromEntry {

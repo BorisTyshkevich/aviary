@@ -17,6 +17,8 @@ type IncomingMessage struct {
 	ThreadTS       string // optional platform thread timestamp/root ID
 	IsThreadReply  bool   // true when the message is a reply inside a platform thread
 	Text           string
+	OriginalText   string // trusted, un-enriched text from the platform event
+	IsEdited       bool   // true when this event changes an existing message
 	MediaURL       string // optional inline media for the LLM (typically a data URL)
 	ReceivedAt     time.Time
 	RestrictTools  []string // per-entry tool allow-list override; nil means use agent defaults

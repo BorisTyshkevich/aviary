@@ -93,6 +93,8 @@ If the bot should respond when you type something like `@Aviary hi` in a channel
 
 If you add `files:write` to an existing Slack app, reinstall the app to the workspace so the bot token receives the new scope.
 
+Aviary automatically uploads the complete answer as a Markdown (`.md`) file in the thread when the trimmed answer exceeds 400 Unicode characters, contains a newline, or is recognized as Markdown. It introduces the file with a short, plain-text summary when one can be generated. Short plain-text answers stay inline. If the upload fails, Aviary sends the answer inline in chunks. This behavior has no per-agent setting.
+
 If you want the bot to work in a channel like `#alerts`, invite it there in Slack the same way you would invite a teammate.
 
 ### What Goes Into Aviary
@@ -133,6 +135,8 @@ In the destination channel thread, send `@Aviary connect https://cluster.example
 If Slack shows the URL as a hostname or custom link label, Aviary connects to the link's actual HTTPS destination, including its port, regardless of the displayed text.
 
 Use `@Aviary status` to see the thread target and whether your own credentials are ready. Use `@Aviary disconnect` to detach it. Each participant supplies their own credentials for the shared target. A connection command must match one authorized agent when the bot is shared across agents. The endpoint must pass the configured connection network policy. An inferred or explicit MCP target reports unsupported transport until outbound MCP support is available.
+
+An authorized `@Aviary` message or connection command claims its Slack thread when `reply_to_replies` is enabled. Other authorized participants may then reply in that thread without repeating the mention. A mention of another bot addresses that message to the other bot when it has an enabled channel rule that accepts its mention; it does not transfer the thread. Literal mention prefixes work when the corresponding bot is installed and invited to the channel. Ambiguous bot addresses are ignored. Sender and channel permissions still apply to every reply. Thread affinity lasts 90 days from the root message; start a new thread after that or after the owning channel is removed and re-enabled. Set `reply_to_replies: false` to require a fresh bot mention or literal prefix on each reply.
 
 ### Common Confusions
 
