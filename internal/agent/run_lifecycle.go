@@ -210,7 +210,13 @@ func RetireCheckpointsForUserStop(agentID, sessionID string) error {
 			if errors.Is(readErr, os.ErrNotExist) {
 				continue // a completing run removed it after ReadDir
 			}
-			failures = append(failures, readErr)
+			// An unreadable record cannot be classified or safely retired. Keep it
+			// for inspection without failing a stop that can retire other records.
+			name := entry.Name()
+			if len(name) > 80 {
+				name = name[:80]
+			}
+			slog.Warn("agent: retaining unreadable checkpoint during user stop", "checkpoint", name)
 			continue
 		}
 		if cp.Slack != nil || (sessionID != "" && cp.SessionID != sessionID) {

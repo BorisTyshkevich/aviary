@@ -227,6 +227,7 @@ func (s *Server) recoverClaimedSlackCheckpoint(ctx context.Context, route channe
 	// Persist uncertainty before the first byte of a standalone notice can go
 	// out. A crash or unknown transport result must never trigger a fresh post.
 	body := slackRecoveryNotice(meta)
+	priorDisposition := meta.Disposition
 	meta.Disposition, meta.NoticeAttempted = agent.SlackDispositionUnconfirmed, true
 	if !persistSlackRecovery(path, &cp) {
 		return
@@ -236,7 +237,7 @@ func (s *Server) recoverClaimedSlackCheckpoint(ctx context.Context, route channe
 	cancel()
 	if err != nil {
 		if slackRecoveryRejected(err) {
-			meta.Disposition, meta.NoticeAttempted = agent.SlackDispositionPending, false
+			meta.Disposition, meta.NoticeAttempted = priorDisposition, false
 			_ = persistSlackRecovery(path, &cp)
 			slog.Warn("server: Slack recovery notice rejected; check route and posting permissions", "checkpoint", filepath.Base(path))
 		} else {
@@ -244,7 +245,7 @@ func (s *Server) recoverClaimedSlackCheckpoint(ctx context.Context, route channe
 		}
 		return
 	}
-	meta.Disposition, meta.CleanupPending = agent.SlackDispositionHandled, meta.ProgressTS != ""
+	meta.Disposition, meta.CleanupPending, meta.NoticeAttempted = agent.SlackDispositionHandled, meta.ProgressTS != "", false
 	if !persistSlackRecovery(path, &cp) {
 		return
 	}

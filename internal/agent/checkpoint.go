@@ -176,9 +176,10 @@ func (h *CheckpointHandle) RecordNoticeAttempt() error {
 	})
 }
 
-// RecordTerminal atomically saves the known progress timestamp with terminal
-// delivery and cleanup state. A handled outcome can never be downgraded.
-func (h *CheckpointHandle) RecordTerminal(disposition SlackDisposition, cleanupPending bool, progressTS string) error {
+// RecordTerminal atomically saves the known progress timestamp, whether a
+// standalone notice may have landed, and terminal cleanup state. A handled
+// outcome can never be downgraded.
+func (h *CheckpointHandle) RecordTerminal(disposition SlackDisposition, cleanupPending bool, progressTS string, noticeAttempted bool) error {
 	return h.update(func(meta *SlackCheckpoint) error {
 		switch disposition {
 		case SlackDispositionPending, SlackDispositionHandled, SlackDispositionUnconfirmed:
@@ -195,18 +196,17 @@ func (h *CheckpointHandle) RecordTerminal(disposition SlackDisposition, cleanupP
 			return errors.New("slack cleanup is pending without a progress timestamp")
 		}
 		if meta.Disposition == SlackDispositionHandled {
-			if disposition == SlackDispositionHandled && meta.CleanupPending {
-				meta.CleanupPending = cleanupPending
+			if disposition == SlackDispositionHandled {
+				meta.NoticeAttempted = noticeAttempted
+				if meta.CleanupPending {
+					meta.CleanupPending = cleanupPending
+				}
 			}
 			return nil
 		}
 		meta.Disposition = disposition
 		meta.CleanupPending = cleanupPending
-		if disposition == SlackDispositionPending {
-			// The caller observed a definite rejection. A fresh bounded notice
-			// is safe on recovery; an unconfirmed attempt retains its marker.
-			meta.NoticeAttempted = false
-		}
+		meta.NoticeAttempted = noticeAttempted
 		return nil
 	})
 }

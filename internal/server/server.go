@@ -576,10 +576,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				presenter.hooks.ProgressCreated = handle.RecordProgressTimestamp
 				presenter.hooks.NoticeAttempting = handle.RecordNoticeAttempt
 				presenter.hooks.TerminalAccepted = func(result slackTerminalResult) error {
-					return handle.RecordTerminal(agent.SlackDispositionHandled, result.CleanupPending, result.ProgressTimestamp)
+					return handle.RecordTerminal(agent.SlackDispositionHandled, result.CleanupPending, result.ProgressTimestamp, result.NoticeAttempted)
 				}
 				presenter.hooks.TerminalFinalized = func(result slackTerminalResult) {
-					if err := handle.RecordTerminal(agent.SlackDisposition(result.Disposition), result.CleanupPending, result.ProgressTimestamp); err != nil {
+					if err := handle.RecordTerminal(agent.SlackDisposition(result.Disposition), result.CleanupPending, result.ProgressTimestamp, result.NoticeAttempted); err != nil {
 						slog.Warn("server: Slack terminal checkpoint update failed")
 					}
 				}

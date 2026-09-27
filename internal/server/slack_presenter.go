@@ -63,7 +63,9 @@ type slackTerminalResult struct {
 	ConfirmedNewReply bool
 	ProgressTimestamp string
 	CleanupPending    bool
-	NoticeAttempted   bool
+	// NoticeAttempted is the durable uncertainty marker for a standalone post.
+	// A definite rejection clears it even though an HTTP attempt occurred.
+	NoticeAttempted bool
 }
 
 // slackPresenterHooks mark the persistence boundaries needed by recovery.
@@ -354,9 +356,9 @@ func (p *slackPresenter) standaloneNotice(body string, outcome slackTerminalOutc
 	}
 	ctx, cancel := p.operationContext(slackAnswerCallTimeout)
 	defer cancel()
-	result.NoticeAttempted = true
 	if err := p.post(ctx, body); err != nil {
 		result.Disposition = slackErrorDisposition(err)
+		result.NoticeAttempted = result.Disposition == slackDispositionUnconfirmed
 		return result
 	}
 	result.Disposition = slackDispositionHandled
@@ -473,13 +475,13 @@ func (p *slackPresenter) answer(ctx context.Context, model, answer string) slack
 func deadlineOf(ctx context.Context) time.Time { deadline, _ := ctx.Deadline(); return deadline }
 
 func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err error) slackTerminalResult {
+	answerUnconfirmed := slackErrorDisposition(err) == slackDispositionUnconfirmed
 	body := "Unable to deliver the answer."
 	outcome := slackOutcomeDeliveryFailed
 	if deliveredParts > 0 {
 		body, outcome = "Answer incomplete.", slackOutcomePartial
 	}
-	var delivery *channels.SlackDeliveryError
-	if !errors.As(err, &delivery) || !delivery.Rejected {
+	if answerUnconfirmed {
 		body = "Answer delivery could not be confirmed."
 		outcome = slackOutcomeUnconfirmed
 		if deliveredParts > 0 {
@@ -505,8 +507,14 @@ func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err
 				result = p.accepted(result, false)
 			}
 		}
+		if answerUnconfirmed && result.Disposition != slackDispositionHandled {
+			result.Disposition = slackDispositionUnconfirmed
+		}
 		return result
 	}
 	result = p.editNotice(body, outcome)
+	if answerUnconfirmed && result.Disposition != slackDispositionHandled {
+		result.Disposition = slackDispositionUnconfirmed
+	}
 	return result
 }

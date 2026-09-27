@@ -3,15 +3,19 @@ package server
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/channels"
+	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/store"
 )
 
@@ -170,16 +174,79 @@ func TestSlackRecoveryDefiniteRejectionCanRetryLater(t *testing.T) {
 }
 
 func TestSlackRecoveryUncertainPostIsNeverRepeated(t *testing.T) {
-	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{})
-	sender.postError = errors.New("fake transport uncertainty")
+	for _, disposition := range []agent.SlackDisposition{agent.SlackDispositionPending, agent.SlackDispositionUnconfirmed} {
+		t.Run(string(disposition), func(t *testing.T) {
+			path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{Disposition: disposition})
+			sender.postError = errors.New("fake transport uncertainty")
+			(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+			meta := readRecovery(t, path).Slack
+			require.Equal(t, agent.SlackDispositionUnconfirmed, meta.Disposition)
+			require.True(t, meta.NoticeAttempted)
+			sender.postError = nil
+			(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+			posts, _, _ := sender.snapshot()
+			require.Len(t, posts, 1)
+		})
+	}
+}
+
+func TestSlackRecoveryRejectedUncertaintyNoticeKeepsUnconfirmedAnswer(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{Disposition: agent.SlackDispositionUnconfirmed})
+	sender.postError = &channels.SlackDeliveryError{Rejected: true, Cause: errors.New("fake rate limit rejected")}
 	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
 	meta := readRecovery(t, path).Slack
 	require.Equal(t, agent.SlackDispositionUnconfirmed, meta.Disposition)
-	require.True(t, meta.NoticeAttempted)
+	require.False(t, meta.NoticeAttempted)
+	posts, _, _ := sender.snapshot()
+	require.Equal(t, []string{"C-original/1700000000.000001:Delivery could not be confirmed. Please check this thread before retrying."}, posts)
 	sender.postError = nil
 	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
-	posts, _, _ := sender.snapshot()
-	require.Len(t, posts, 1)
+	posts, _, _ = sender.snapshot()
+	require.Len(t, posts, 2)
+	require.Equal(t, posts[0], posts[1], "recovery must retain uncertainty wording")
+	require.NoFileExists(t, path)
+}
+
+type uncertainAnswerNoticeChannel struct {
+	deliveryTestChannel
+	calls atomic.Int32
+}
+
+func (c *uncertainAnswerNoticeChannel) PostThreadTextContext(ctx context.Context, channel, thread, body string) (string, error) {
+	_, _ = c.deliveryTestChannel.PostThreadTextContext(ctx, channel, thread, body)
+	if c.calls.Add(1) == 1 {
+		return "", errors.New("fake uncertain answer acceptance")
+	}
+	return "", &channels.SlackDeliveryError{Rejected: true, Cause: errors.New("fake rejected notice")}
+}
+
+func TestLiveSlackUncertainAnswerRejectedNoticePersistsUnconfirmedRecovery(t *testing.T) {
+	setupServerDataDir(t)
+	resetSlogForTest()
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeDeliveryText(w, "fake answer")
+	}))
+	t.Cleanup(model.Close)
+	cfg := liveSlackConfig("vllm/test", false)
+	cfg.Models.Providers["vllm"] = config.ProviderConfig{BaseURI: model.URL}
+	srv := New(cfg, "fake-token")
+	ch := &uncertainAnswerNoticeChannel{}
+	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "alerts", ch, liveSlackMessage())
+	runner, ok := srv.agents.Get("bot")
+	require.True(t, ok)
+	runner.Wait()
+	path, cp := liveSlackCheckpoint(t)
+	require.Equal(t, agent.SlackDispositionUnconfirmed, cp.Slack.Disposition)
+	require.False(t, cp.Slack.NoticeAttempted)
+	require.Equal(t, []string{"fake answer", "Answer delivery could not be confirmed."}, ch.posted())
+	recoverySender := &recoverySender{}
+	route := channels.SlackAuthenticatedRoute{AgentName: "bot", ConfiguredID: "alerts", InstallationID: "bot-fake",
+		WorkspaceID: "team-fake", Channel: recoverySender, StopBeforeDispatch: make(chan struct{}),
+		CurrentCheck: func() bool { return true }}
+	srv.recoverSlackCheckpoint(context.Background(), route, path)
+	posts, _, _ := recoverySender.snapshot()
+	require.Equal(t, []string{"C123/1700000000.000001:Delivery could not be confirmed. Please check this thread before retrying."}, posts)
+	require.NoFileExists(t, path)
 }
 
 func TestSlackRecoveryRequiresMatchingAuthenticatedRoute(t *testing.T) {

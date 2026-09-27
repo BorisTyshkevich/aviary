@@ -353,13 +353,26 @@ func TestSlackPresenterStandaloneNoticeFailureIsNotRepeated(t *testing.T) {
 			require.True(t, first)
 			require.Equal(t, slackOutcomeNotice, result.Outcome)
 			require.Equal(t, tc.want, result.Disposition)
-			require.True(t, result.NoticeAttempted)
+			require.Equal(t, tc.want == slackDispositionUnconfirmed, result.NoticeAttempted)
 			_, first = p.Terminal(nil, "done", "", "late answer", false)
 			require.False(t, first)
 			posts, _, _, _ := sender.snapshot()
 			require.Len(t, posts, 1)
 		})
 	}
+}
+
+func TestSlackPresenterUncertainAnswerKeepsDispositionAfterRejectedNotice(t *testing.T) {
+	rejected := &channels.SlackDeliveryError{Cause: errors.New("fake rejected follow-up"), Rejected: true}
+	sender := &presenterTestSender{postErrors: []error{errors.New("fake uncertain answer"), rejected}}
+	p := presenterForTest(sender, false)
+	result, first := p.Terminal(nil, "done", "", "answer", false)
+	require.True(t, first)
+	require.Equal(t, slackOutcomeUnconfirmed, result.Outcome)
+	require.Equal(t, slackDispositionUnconfirmed, result.Disposition)
+	require.False(t, result.NoticeAttempted, "a rejected notice permits a later fixed notice")
+	posts, _, _, _ := sender.snapshot()
+	require.Equal(t, []string{"answer", "Answer delivery could not be confirmed."}, posts)
 }
 
 func TestSlackPresenterKnownProgressRetainedWhenNoticeEditFails(t *testing.T) {
