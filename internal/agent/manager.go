@@ -13,19 +13,42 @@ import (
 	"time"
 
 	"github.com/lsegal/aviary/internal/config"
+	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
 	"github.com/lsegal/aviary/internal/llm"
+	"github.com/lsegal/aviary/internal/preparation"
 	"github.com/lsegal/aviary/internal/store"
 )
 
 // Manager maintains a registry of AgentRunners and reconciles them with config.
 type Manager struct {
-	mu      sync.RWMutex
-	runners map[string]*AgentRunner // keyed by agent name
-	order   []string                // agent names in config entry order
-	session *SessionManager
-	factory *llm.Factory
-	cfg     *config.Config // latest reconciled config, for checkpoint timeout
+	mu          sync.RWMutex
+	runners     map[string]*AgentRunner // keyed by agent name
+	order       []string                // agent names in config entry order
+	session     *SessionManager
+	factory     *llm.Factory
+	cfg         *config.Config // latest reconciled config, for checkpoint timeout
+	connections *connections.Service
+	preparation *preparation.Engine
+}
+
+// SetPreparationEngine installs scoped artifact storage before reconciliation.
+func (m *Manager) SetPreparationEngine(engine *preparation.Engine) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.preparation = engine
+}
+
+// SetConnectionService installs the thread lifecycle service before reconciliation.
+func (m *Manager) SetConnectionService(service *connections.Service) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.connections = service
+	for _, runner := range m.runners {
+		runner.mu.Lock()
+		runner.connections = service
+		runner.mu.Unlock()
+	}
 }
 
 // NewManager creates a new Manager with an optional LLM factory.
@@ -100,6 +123,8 @@ func (m *Manager) Reconcile(cfg *config.Config) {
 			}
 		}
 		runner := NewAgentRunner(a, ac, provider, m.factory)
+		runner.connections = m.connections
+		runner.preparation = m.preparation
 		m.runners[name] = runner
 		go m.recoverCheckpoints(runner)
 	}

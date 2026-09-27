@@ -40,7 +40,17 @@ func Validate(cfg *Config, authGet func(key string) (string, error)) []Issue {
 	v.checkModels(cfg.Models)
 	v.checkBrowser(cfg.Browser)
 	v.checkScheduler(cfg.Scheduler)
+	v.checkConnections(cfg.Connections)
 	return v.issues
+}
+
+func (v *validator) checkConnections(c *ConnectionPolicyConfig) {
+	if c == nil {
+		return
+	}
+	if err := c.Network.Validate(); err != nil {
+		v.errorf("connections.network", "%v", err)
+	}
 }
 
 type validator struct {
@@ -127,6 +137,7 @@ func (v *validator) checkAgents(agents []AgentConfig, models ModelsConfig) {
 		if a.Permissions != nil && a.Permissions.Exec != nil && len(a.Permissions.Exec.AllowedCommands) == 0 {
 			v.errorf(f+".permissions.exec.allowedCommands", "permissions.exec requires at least one allowedCommands entry")
 		}
+		v.checkPreparationHook(f, a.Hooks)
 
 		for j, ch := range a.Channels {
 			v.checkChannel(fmt.Sprintf("%s.channels[%d]", f, j), ch)

@@ -113,7 +113,7 @@ web/
 pnpm test:go          # Go unit tests
 pnpm test:e2e         # Playwright e2e tests (reuses running dev server)
 pnpm test:e2e:ui      # Playwright with interactive UI
-pnpm test             # lint + Go tests + e2e (full CI suite)
+pnpm test             # Go tests + e2e; run pnpm lint separately for code changes
 ```
 
 ## Linting
@@ -123,7 +123,8 @@ pnpm lint             # Go (golangci-lint) + web (Biome)
 pnpm lint:fix         # Auto-fix web lint/format issues
 ```
 
-Run `pnpm lint` before submitting a PR — CI enforces it.
+Run `pnpm lint` after code changes and before submitting a code PR — CI enforces
+it. Documentation-only changes do not require a local lint run.
 
 ## Building a Release Binary
 

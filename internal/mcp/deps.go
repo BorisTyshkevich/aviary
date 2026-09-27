@@ -7,18 +7,22 @@ import (
 	"github.com/lsegal/aviary/internal/auth"
 	"github.com/lsegal/aviary/internal/browser"
 	"github.com/lsegal/aviary/internal/channels"
+	"github.com/lsegal/aviary/internal/clickhouseconn"
+	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/scheduler"
 )
 
 // Deps holds the runtime dependencies injected into MCP tool handlers.
 // Fields are nil until the relevant phase initializes them.
 type Deps struct {
-	Agents    *agent.Manager
-	Scheduler *scheduler.Scheduler
-	Channels  *channels.Manager
-	Browser   *browser.Manager
-	Auth      *auth.FileStore // credential store; nil until server starts
-	Upgrade   func(context.Context, string) error
+	Agents      *agent.Manager
+	Scheduler   *scheduler.Scheduler
+	Channels    *channels.Manager
+	Browser     *browser.Manager
+	Auth        *auth.FileStore // credential store; nil until server starts
+	Upgrade     func(context.Context, string) error
+	Connections *connections.Service
+	ClickHouse  func() clickhouseconn.Adapter
 }
 
 // globalDeps is set by the server at startup.

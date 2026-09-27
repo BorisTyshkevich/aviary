@@ -12,6 +12,14 @@ Remote MCP adds an outbound Go MCP client to the agent path. It must be scoped t
 
 ## Decision
 
+ADR 0005 defines transport inference and explicit transport overrides for the
+connect command. Direct ClickHouse starts in the destination thread and collects
+credentials through a private DM prompt. Both transports share the single dynamic
+target slot and busy-thread rules below; connect commands never carry passwords.
+For Milestone A2, only the direct ClickHouse branch is implemented. MCP handshake,
+remote discovery and OAuth behavior below remain deferred. ADR 0006 defines the
+preparation lifecycle that precedes model requests in A2.
+
 ### 1. Keep Slack Socket Mode
 
 Remote MCP does not require Slack HTTP push mode.
@@ -34,7 +42,7 @@ For example:
 
 Parse the command from the original message and trusted Slack sender identity, not from enriched channel history, quoted tool results, or model output. Normal sender/channel access checks still apply. Validate the exact endpoint through remote MCP network policy before dialing.
 
-The command manages one dynamic connection descriptor per thread and attempts MCP initialization/tool discovery. Connection management is not exposed as an agent/script tool. Status and disconnect are also deterministic configuration operations. Configured static MCP servers may coexist with the single dynamic connection.
+The command manages one dynamic target descriptor per thread and dispatches to the selected transport: private database setup for ClickHouse, or MCP initialization/tool discovery once available. Connection management is not exposed as an agent/script tool. Status and disconnect are also deterministic configuration operations. Configured static MCP servers may coexist with the single dynamic connection once implemented.
 
 ### 3. Remote tools are attached to the current session/thread
 

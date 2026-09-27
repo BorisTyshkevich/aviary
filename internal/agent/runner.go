@@ -15,8 +15,10 @@ import (
 
 	"github.com/lsegal/aviary/internal/buildinfo"
 	"github.com/lsegal/aviary/internal/config"
+	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
 	"github.com/lsegal/aviary/internal/llm"
+	"github.com/lsegal/aviary/internal/preparation"
 	"github.com/lsegal/aviary/internal/store"
 )
 
@@ -32,14 +34,16 @@ func extractProvider(model string) string {
 //
 //nolint:revive
 type AgentRunner struct {
-	agent    *domain.Agent
-	cfg      *config.AgentConfig
-	provider llm.Provider    // nil until Phase 5 wiring; falls back to stub
-	factory  providerFactory // used to create fallback providers on demand
-	stopCh   chan struct{}
-	mu       sync.Mutex
-	active   sync.WaitGroup
-	canceled bool
+	agent       *domain.Agent
+	cfg         *config.AgentConfig
+	provider    llm.Provider    // nil until Phase 5 wiring; falls back to stub
+	factory     providerFactory // used to create fallback providers on demand
+	stopCh      chan struct{}
+	mu          sync.Mutex
+	active      sync.WaitGroup
+	canceled    bool
+	connections *connections.Service
+	preparation *preparation.Engine
 }
 
 type providerFactory interface {
@@ -70,6 +74,8 @@ type RunOverrides struct {
 	Bare             bool
 	History          *bool
 	SuppressDelivery bool
+	// DeferAnswerPersistence lets an authenticated channel publish only after delivery.
+	DeferAnswerPersistence bool
 }
 
 // Prompt sends a message to the agent and fans out stream events to consumers.
@@ -116,11 +122,21 @@ func (r *AgentRunner) promptCore(
 		}
 		return
 	}
+	turnCtx, release, err := r.reserveConnectionTurn(ctx)
+	if err != nil {
+		r.mu.Unlock()
+		for _, c := range consumers {
+			c(StreamEvent{Type: StreamEventError, AgentID: r.agent.ID, Err: err})
+		}
+		return
+	}
+	ctx = turnCtx
 	r.active.Add(1)
 	r.mu.Unlock()
 
 	go func() {
 		defer r.active.Done()
+		defer release()
 
 		promptCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -128,6 +144,9 @@ func (r *AgentRunner) promptCore(
 		sessionID := r.resolveSessionID(promptCtx)
 		promptCtx = WithSessionID(promptCtx, sessionID)
 		promptCtx = WithSessionAgentID(promptCtx, r.agent.ID)
+		promptCtx = WithToolPolicy(promptCtx, func(name string) bool {
+			return len(r.filterTools([]ToolInfo{{Name: name}}, overrides.RestrictTools, overrides.DisabledTools)) != 0
+		})
 		untrack := trackSessionRun(r.agent.ID, sessionID, cancel)
 		defer untrack()
 
@@ -259,13 +278,15 @@ func (r *AgentRunner) promptCore(
 			}
 		}()
 
+		// Capture the cancellation channel before preparation adds context values.
+		turnDone := promptCtx.Done()
 		// Stop if stopCh is closed.
 		go func() {
 			select {
 			case <-r.stopCh:
 				close(serverStoppedCh)
 				cancel()
-			case <-promptCtx.Done():
+			case <-turnDone:
 			}
 		}()
 
@@ -310,7 +331,9 @@ func (r *AgentRunner) promptCore(
 			// No LLM provider configured — surface as a message so the UI shows it but tests pass.
 			slog.Warn("agent: no provider", "agent", r.agent.Name, "model", effectiveModel)
 			msg := fmt.Sprintf("[no LLM provider configured for %q — check credentials and model settings]", effectiveModel)
-			r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, msg, "", effectiveModel)
+			if !overrides.DeferAnswerPersistence && !privateConnectionTurn(promptCtx) {
+				r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, msg, "", effectiveModel)
+			}
 			emit(StreamEvent{Type: StreamEventText, Text: msg})
 			deliver(msg)
 			emit(StreamEvent{Type: StreamEventDone, Text: msg, Model: effectiveModel})
@@ -323,6 +346,12 @@ func (r *AgentRunner) promptCore(
 			systemPrompt string
 			err          error
 		)
+		promptCtx, evidence, prepErr := r.prepareTurn(promptCtx)
+		if prepErr != nil {
+			deliverAssistantError(prepErr)
+			emit(StreamEvent{Type: StreamEventError, Err: prepErr})
+			return
+		}
 		if !overrides.Bare {
 			toolClient, err = newToolClientFactory(promptCtx)
 			if err != nil {
@@ -366,7 +395,7 @@ func (r *AgentRunner) promptCore(
 		// user turn. Task sessions never use conversation IDs.
 		metaPath := store.SessionMetaPath(r.agent.ID, sessionID)
 		var conversationID string
-		if useHistory && !r.isTaskSession(sessionID) {
+		if useHistory && !r.isTaskSession(sessionID) && !privateConnectionTurn(promptCtx) {
 			if meta, err := store.ReadSessionMeta(metaPath); err == nil &&
 				meta.Conversation != nil &&
 				meta.Conversation.ID != "" &&
@@ -384,6 +413,9 @@ func (r *AgentRunner) promptCore(
 			}
 		}
 		toolNames := make(map[string]struct{}, len(tools))
+		if evidence != "" {
+			conversation = append(conversation, llm.Message{Role: llm.RoleUser, Content: evidence})
+		}
 		for _, t := range tools {
 			toolNames[t.Name] = struct{}{}
 		}
@@ -579,10 +611,12 @@ func (r *AgentRunner) promptCore(
 			// Answer is done — persist and return.
 			// Persist each returned image as a separate assistant message.
 			for _, mURL := range mediaURLs {
-				r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, "", mURL, effectiveModel)
+				if !privateConnectionTurn(promptCtx) {
+					r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, "", mURL, effectiveModel)
+				}
 			}
 			var assistantMsgID string
-			if answer != "" {
+			if answer != "" && !overrides.DeferAnswerPersistence && !privateConnectionTurn(promptCtx) {
 				assistantMsgID = r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, answer, "", effectiveModel)
 			}
 			slog.Info("agent: prompt done", "agent", r.agent.Name, "model", effectiveModel)
@@ -596,7 +630,7 @@ func (r *AgentRunner) promptCore(
 				}
 			}
 			// Save the provider-native response ID for conversation continuity.
-			if lastResponseID != "" {
+			if lastResponseID != "" && !privateConnectionTurn(promptCtx) {
 				meta := store.SessionMeta{Conversation: &store.ConversationMeta{
 					ID:         lastResponseID,
 					LastUsedAt: time.Now(),
@@ -1054,7 +1088,7 @@ func (r *AgentRunner) filterTools(tools []ToolInfo, restrictTools, disabledTools
 
 	available := make([]ToolInfo, 0, len(tools))
 	for _, t := range tools {
-		if config.IsToolAllowedByPreset(preset, t.Name) {
+		if config.IsToolAllowedByPreset(preset, t.permissionName()) {
 			available = append(available, t)
 		}
 	}
@@ -1073,7 +1107,7 @@ func (r *AgentRunner) filterTools(tools []ToolInfo, restrictTools, disabledTools
 		}
 		filtered = make([]ToolInfo, 0, len(available))
 		for _, t := range available {
-			if _, ok := allowed[t.Name]; ok {
+			if _, ok := allowed[t.permissionName()]; ok {
 				filtered = append(filtered, t)
 			}
 		}
@@ -1095,7 +1129,7 @@ func (r *AgentRunner) filterTools(tools []ToolInfo, restrictTools, disabledTools
 	}
 	result := make([]ToolInfo, 0, len(filtered))
 	for _, t := range filtered {
-		if _, ok := blocked[t.Name]; !ok {
+		if _, ok := blocked[t.permissionName()]; !ok {
 			result = append(result, t)
 		}
 	}
@@ -1198,14 +1232,18 @@ func (r *AgentRunner) executeToolCall(
 		emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args, Error: callErr.Error()}})
 		errRec := toolEventRecord{Name: name, Args: args, Error: callErr.Error()}
 		errPayload, _ := json.Marshal(errRec)
-		r.appendSessionMessage(sessionID, domain.MessageRoleTool, string(errPayload), "", "")
+		if !privateConnectionTurn(promptCtx) {
+			r.appendSessionMessage(sessionID, domain.MessageRoleTool, string(errPayload), "", "")
+		}
 		return "error: " + callErr.Error(), false
 	}
 
 	emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args, Result: resultText}})
 	histRec := toolEventRecord{Name: name, Args: args, Result: resultText}
 	histPayload, _ := json.Marshal(histRec)
-	r.appendSessionMessage(sessionID, domain.MessageRoleTool, string(histPayload), "", "")
+	if !privateConnectionTurn(promptCtx) {
+		r.appendSessionMessage(sessionID, domain.MessageRoleTool, string(histPayload), "", "")
+	}
 	return resultText, false
 }
 

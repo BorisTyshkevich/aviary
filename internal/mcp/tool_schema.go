@@ -8,6 +8,8 @@ import (
 
 	"github.com/google/jsonschema-go/jsonschema"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/lsegal/aviary/internal/agent"
 )
 
 func addTool[Args any](
@@ -18,7 +20,14 @@ func addTool[Args any](
 	if tool != nil && tool.InputSchema == nil {
 		tool.InputSchema = inferredInputSchema[Args]()
 	}
-	sdkmcp.AddTool(s, tool, handler)
+	sdkmcp.AddTool(s, tool, func(ctx context.Context, req *sdkmcp.CallToolRequest, args Args) (*sdkmcp.CallToolResult, struct{}, error) {
+		if _, scoped := agent.ToolPolicyAllows(ctx, tool.Name); scoped || agent.PrivateDataContext(ctx) {
+			if err := agentToolPermitted(ctx, tool.Name); err != nil {
+				return nil, struct{}{}, err
+			}
+		}
+		return handler(ctx, req, args)
+	})
 }
 
 func inferredInputSchema[T any]() any {

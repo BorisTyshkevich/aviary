@@ -69,9 +69,19 @@ export interface AgentEntry {
 	memory?: string;
 	rules?: string;
 	fallbacks: string[];
+	hooks?: AgentHooks;
 	permissions?: AgentPermissions;
 	channels: AgentChannel[];
 	tasks: AgentTask[];
+}
+
+export interface AgentHooks {
+	before_turn?: {
+		argv: string[];
+		timeout?: string;
+		on_error?: "continue" | "stop";
+		allow_credential?: boolean;
+	};
 }
 
 export interface AgentTask {
@@ -123,6 +133,25 @@ export interface SchedulerConfig {
 	precompute_tasks?: boolean;
 }
 
+export interface ConnectionRule {
+	host: string;
+	ports: number[];
+	cidrs: string[];
+}
+
+export interface ConnectionRewrite {
+	host: string;
+	connect_via: string;
+	cidrs: string[];
+}
+
+export interface ConnectionPolicyConfig {
+	network: {
+		allow?: ConnectionRule[];
+		rewrites?: ConnectionRewrite[];
+	};
+}
+
 export interface SkillConfig {
 	enabled?: boolean;
 	settings?: Record<string, unknown>;
@@ -135,6 +164,7 @@ export interface AppConfig {
 	browser: BrowserConfig;
 	search: SearchConfig;
 	scheduler: SchedulerConfig;
+	connections?: ConnectionPolicyConfig;
 	skills: Record<string, SkillConfig>;
 }
 
@@ -230,6 +260,7 @@ export const useSettingsStore = defineStore("settings", () => {
 					web: { ...base.search.web, ...(parsed.search?.web ?? {}) },
 				},
 				scheduler: { ...base.scheduler, ...parsed.scheduler },
+				connections: parsed.connections,
 				skills: parsed.skills ?? {},
 			};
 		} catch (e) {

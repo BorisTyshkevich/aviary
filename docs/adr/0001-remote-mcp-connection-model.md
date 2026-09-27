@@ -22,9 +22,15 @@ Authentication ownership is independent of how the server was discovered. A stat
 
 ## Decision
 
+ADR 0005 extends the dynamic slot to hold either direct ClickHouse or remote MCP,
+never both, and defines DM-only credential entry for direct ClickHouse.
+Milestone A2 implements the shared lifecycle and direct adapter only. Outbound
+MCP, its OAuth flows and configured static servers below are deferred roadmap
+decisions, not A2 acceptance criteria. ADR 0006 covers preparation and artifacts.
+
 ### 1. Static and dynamic remote connections are both first-class
 
-A static server is persisted in Aviary configuration. A dynamic server is attached through the explicit `@bot connect URL` command, parsed and handled by Aviary before starting an agent/LLM run. It is a thread configuration action, not a model-callable tool. Each thread has at most one dynamic MCP connection at a time; static servers remain separate.
+A static server is persisted in Aviary configuration. A dynamic server is attached through the explicit `@bot connect URL` command, parsed and handled by Aviary before starting an agent/LLM run. It is a thread configuration action, not a model-callable tool. Each thread has at most one dynamic target, direct ClickHouse or MCP, at a time; static servers remain separate.
 
 Reject replacement while an agent turn is active in that thread. The user must wait for the turn to finish or stop it first. Checking for an active turn and changing the attachment must be coordinated so a concurrent turn cannot start against a changing target.
 
