@@ -116,6 +116,9 @@ pnpm test:e2e:ui      # Playwright with interactive UI
 pnpm test             # Go tests + e2e; run pnpm lint separately for code changes
 ```
 
+For direct connection fixtures and preparation/MCP smoke coverage, see
+[Direct connections verification](docs/testing/direct-connections.md).
+
 ## Linting
 
 ```shell
@@ -167,7 +170,7 @@ The server is usually already running during development (`pnpm dev` starts it).
 3. **Pass all checks locally** before pushing:
 
    ```shell
-   pnpm test      # lint + Go tests + e2e (mirrors CI exactly)
+   pnpm lint && pnpm test  # full checks for code changes
    ```
 
    CI runs Go tests on Linux, macOS, and Windows, plus Go lint, web lint, and Playwright e2e tests. Fix any failures before opening the PR.
