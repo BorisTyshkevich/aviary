@@ -358,8 +358,10 @@ func registerAgentTools(s *sdkmcp.Server) {
 			case agent.StreamEventTool:
 				if progressToken != nil && args.IncludeToolProgress && e.Tool != nil {
 					payload, err := json.Marshal(map[string]any{
-						"name": e.Tool.Name,
-						"args": e.Tool.Args,
+						"name":          e.Tool.Name,
+						"invocation_id": e.Tool.InvocationID,
+						"state":         e.Tool.State,
+						"args":          e.Tool.Args,
 					})
 					if err == nil {
 						progressCount++

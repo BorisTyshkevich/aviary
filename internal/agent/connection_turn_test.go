@@ -11,6 +11,7 @@ import (
 	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
 	"github.com/lsegal/aviary/internal/llm"
+	"github.com/lsegal/aviary/internal/preparation"
 	"github.com/lsegal/aviary/internal/store"
 )
 
@@ -52,13 +53,45 @@ func TestPrivateTurnDoesNotPersistToolEvidence(t *testing.T) {
 	r := NewAgentRunner(&domain.Agent{ID: "private"}, &config.AgentConfig{}, nil, nil)
 	ctx := privateTestContext(t, r)
 	client := &privateEvidenceClient{}
-	text, stop := r.executeToolCall(ctx, func(StreamEvent) {}, client, "shared", nil, toolEventRecord{Name: "artifact_read"}, "artifact_read", nil)
+	var raw, public int
+	text, stop := r.executeToolCall(ctx, func(event StreamEvent) {
+		if event.Type == StreamEventTool {
+			raw++
+		}
+		if event.Type == StreamEventToolProgress {
+			public++
+		}
+	}, client, "shared", nil, toolEventRecord{Name: "artifact_read"}, "artifact_read", nil, map[string]string{"artifact_read": "artifact_read"}, "tool_test")
 	require.False(t, stop)
 	require.Equal(t, "alice-private-evidence", text)
+	require.Equal(t, 2, raw)
+	require.Zero(t, public)
 	rows, err := store.ReadJSONL[domain.Message](store.SessionPath("private", "shared"))
 	if err == nil {
 		require.Empty(t, rows)
 	}
+}
+
+func TestPrivatePreparationTurnDoesNotEmitPublicToolProgress(t *testing.T) {
+	setTestDataDir(t)
+	r := NewAgentRunner(&domain.Agent{ID: "private"}, &config.AgentConfig{}, nil, nil)
+	ctx := WithPreparationState(context.Background(), PreparationState{
+		Input:    preparation.Input{Execution: testConnectionExecution()},
+		Snapshot: []byte("fake-private-evidence"),
+	})
+	var raw, public int
+	_, stopped := r.executeToolCall(ctx, func(event StreamEvent) {
+		if event.Type == StreamEventTool {
+			raw++
+		}
+		if event.Type == StreamEventToolProgress {
+			public++
+		}
+	}, &privateEvidenceClient{}, "shared", nil, toolEventRecord{Name: "artifact_read"}, "artifact_read", nil,
+		map[string]string{"artifact_read": "artifact_read"}, "tool_preparation")
+	require.False(t, stopped)
+	require.Equal(t, 2, raw)
+	require.Zero(t, public)
 }
 
 type privateEvidenceClient struct{}

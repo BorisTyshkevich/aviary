@@ -199,10 +199,12 @@ type ChannelConfig struct {
 	URL           string           `yaml:"url,omitempty"           json:"url,omitempty"`
 	AllowFrom     []AllowFromEntry `yaml:"allow_from,omitempty"     json:"allow_from,omitempty"`
 	DisabledTools []string         `yaml:"disabled_tools,omitempty" json:"disabled_tools,omitempty"`
-	// ShowTyping controls whether a typing indicator is shown while the agent
-	// processes a message. Defaults to true for channels that support it.
-	// Currently this is implemented for Signal only.
+	// ShowTyping controls Signal typing and generic Slack assistant status while
+	// the agent processes a message. Defaults to true on supported channels.
 	ShowTyping *bool `yaml:"show_typing,omitempty"     json:"show_typing,omitempty"`
+	// ToolProgress enables temporary, generic tool-state messages for Slack runs.
+	// It defaults to false and is valid only for Slack channels.
+	ToolProgress *bool `yaml:"tool_progress,omitempty" json:"tool_progress,omitempty"`
 	// SeparateTopLevelSessions controls Slack channel session naming. When true,
 	// every top-level Slack message gets its own session keyed by the Slack
 	// thread/root timestamp, so all replies in that Slack thread share a session.

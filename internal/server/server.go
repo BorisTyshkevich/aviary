@@ -451,13 +451,16 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		msg.Text = fmt.Sprintf("%s: %s\n\n%s", msg.QuoteAuthor, msg.QuoteText, msg.Text)
 	}
 
-	slackStreamer := newSlackThreadStreamer(channelType, ch, msg)
-	if slackStreamer != nil {
-		slackStreamer.summarize = func(ctx context.Context, model, answer string) (string, error) {
-			return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+	var presenter *slackPresenter
+	if channelType == "slack" && strings.TrimSpace(msg.ThreadTS) != "" {
+		if sender, ok := ch.(slackPresenterSender); ok {
+			presenter = newSlackPresenter(sender, msg.Channel, msg.ThreadTS, config.BoolOr(channelCfg.ToolProgress, false))
+			presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {
+				return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+			}
 		}
 	}
-	if slackStreamer != nil {
+	if presenter != nil {
 		rOpts.SuppressDelivery = true
 		execution, _ := connections.ExecutionFromContext(msgCtx)
 		rOpts.DeferAnswerPersistence = execution.Personal()
@@ -465,48 +468,58 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 
 	runner.PromptMediaWithOverrides(msgCtx, msg.Text, msg.MediaURL, rOpts, func(e agent.StreamEvent) {
 		switch e.Type {
-		case agent.StreamEventError:
-			if assistantStatus != nil {
-				assistantStatus.BeforeTerminal()
+		case agent.StreamEventToolProgress:
+			if presenter != nil && !e.Private && e.PublicTool != nil {
+				presenter.Tool(e.PublicTool.Name, e.PublicTool.InvocationID, string(e.PublicTool.State))
 			}
-			delivered := slackStreamer != nil && slackStreamer.SendPlain("Unable to complete this request.")
+		case agent.StreamEventError:
+			if presenter != nil {
+				_, _ = presenter.Terminal(assistantStatus, "error", "", "", false)
+				if stopTyping != nil {
+					stopTyping()
+				}
+				return
+			}
+			if assistantStatus != nil {
+				assistantStatus.Finish(false)
+			}
 			if stopTyping != nil {
 				stopTyping()
-			}
-			if assistantStatus != nil {
-				assistantStatus.Finish(delivered)
 			}
 		case agent.StreamEventStop:
-			if assistantStatus != nil {
-				assistantStatus.BeforeTerminal()
+			if presenter != nil {
+				_, _ = presenter.Terminal(assistantStatus, "stop", "", "", false)
+				if stopTyping != nil {
+					stopTyping()
+				}
+				return
 			}
-			delivered := slackStreamer != nil && slackStreamer.SendPlain("Stopped.")
+			if assistantStatus != nil {
+				assistantStatus.Finish(false)
+			}
 			if stopTyping != nil {
 				stopTyping()
 			}
-			if assistantStatus != nil {
-				assistantStatus.Finish(delivered)
-			}
 		case agent.StreamEventDone:
-			if assistantStatus != nil {
-				assistantStatus.BeforeTerminal()
-			}
-			delivered := false
-			if slackStreamer != nil && agent.ShouldDeliverReply(e.Text) {
-				delivered = slackStreamer.SendAnswer(msgCtx, e.Model, e.Text)
-				if delivered && rOpts.DeferAnswerPersistence {
+			if presenter != nil {
+				result, first := presenter.Terminal(assistantStatus, "done", e.Model, e.Text, e.AlreadyAnswered)
+				if first && result.Outcome == slackOutcomeAnswer && rOpts.DeferAnswerPersistence {
 					if sessionID, ok := agent.SessionIDFromContext(msgCtx); ok {
 						if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {
 							slog.Warn("server: failed to record delivered answer")
 						}
 					}
 				}
+				if stopTyping != nil {
+					stopTyping()
+				}
+				return
+			}
+			if assistantStatus != nil {
+				assistantStatus.Finish(false)
 			}
 			if stopTyping != nil {
 				stopTyping()
-			}
-			if assistantStatus != nil {
-				assistantStatus.Finish(delivered)
 			}
 		}
 	})
@@ -557,79 +570,6 @@ func channelSessionNameForIncoming(agentID string, cc config.ChannelConfig, msg 
 		return baseName
 	}
 	return sessionName
-}
-
-type slackThreadStreamer struct {
-	thread    channels.ThreadMessageSender
-	answer    slackAnswerSender
-	summarize func(context.Context, string, string) (string, error)
-	channel   string
-	threadTS  string
-}
-
-type slackAnswerSender interface {
-	SendThreadPlainText(channel, threadTS, text string) error
-	SendThreadMarkdownFile(ctx context.Context, channel, threadTS, introduction, answer string) error
-}
-
-func newSlackThreadStreamer(channelType string, ch channels.Channel, msg channels.IncomingMessage) *slackThreadStreamer {
-	if channelType != "slack" || strings.TrimSpace(msg.ThreadTS) == "" {
-		return nil
-	}
-	thread, ok := ch.(channels.ThreadMessageSender)
-	if !ok {
-		return nil
-	}
-	streamer := &slackThreadStreamer{
-		thread:   thread,
-		channel:  msg.Channel,
-		threadTS: strings.TrimSpace(msg.ThreadTS),
-	}
-	if answer, ok := ch.(slackAnswerSender); ok {
-		streamer.answer = answer
-	}
-	return streamer
-}
-
-func (s *slackThreadStreamer) SendAnswer(ctx context.Context, model, answer string) bool {
-	if s == nil || strings.TrimSpace(answer) == "" {
-		return false
-	}
-	if !shouldAttachSlackAnswer(answer) || s.answer == nil {
-		return s.SendPlain(answer)
-	}
-	introduction := "Full answer attached."
-	if s.summarize != nil {
-		if summary, err := s.summarize(ctx, model, answer); err == nil && summary != "" {
-			introduction = summary
-		} else if err != nil {
-			slog.Warn("server: failed to summarize Slack answer", "err", err)
-		}
-	}
-	if err := s.answer.SendThreadMarkdownFile(ctx, s.channel, s.threadTS, introduction, answer); err != nil {
-		slog.Warn("server: failed to upload Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
-		return s.SendPlain(answer)
-	}
-	return true
-}
-
-func (s *slackThreadStreamer) SendPlain(answer string) bool {
-	if s == nil || answer == "" {
-		return false
-	}
-	for _, part := range splitSlackPlainText(answer, 3900) {
-		var err error
-		if s.answer != nil {
-			err = s.answer.SendThreadPlainText(s.channel, s.threadTS, part)
-		} else {
-			_, err = s.thread.SendThreadMessageAndGetID(s.channel, s.threadTS, part)
-		}
-		if err != nil {
-			slog.Warn("server: failed to send Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
-			return false
-		}
-	}
-	return true
 }
 
 func (s *Server) listen() (net.Listener, error) {

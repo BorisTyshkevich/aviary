@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -66,7 +67,7 @@ type slackIngress struct {
 // NewSlackChannel creates a SlackChannel.
 // appToken is the App-Level token (xapp-), botToken is the Bot token (xoxb-).
 func NewSlackChannel(appToken, botToken string, allowFrom []config.AllowFromEntry, model string, fallbacks []string) *SlackChannel {
-	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
+	api := slack.New(botToken, slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(slackStatusHTTPClient{base: http.DefaultClient}))
 	sm := socketmode.New(api)
 	return &SlackChannel{
 		appToken:  appToken,
@@ -113,104 +114,78 @@ func (c *SlackChannel) OnGroupChatMessage(fn func(IncomingMessage)) {
 
 // Send posts a message to a Slack channel.
 func (c *SlackChannel) Send(channel, text string) error {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
 		return err
 	}
-	_, _, err = c.client.PostMessage(resolvedChannel, slack.MsgOptionText(text, false))
+	_, _, err = c.client.PostMessageContext(ctx, resolvedChannel, slack.MsgOptionText(text, false))
 	return err
 }
 
 // SendAndGetID posts a message and returns the Slack message timestamp, which
 // serves as the message ID for EditMessage.
 func (c *SlackChannel) SendAndGetID(channel, text string) (string, error) {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
 		return "", err
 	}
-	_, timestamp, err := c.client.PostMessage(resolvedChannel, slack.MsgOptionText(text, false))
+	_, timestamp, err := c.client.PostMessageContext(ctx, resolvedChannel, slack.MsgOptionText(text, false))
 	return timestamp, err
 }
 
 // SendThreadMessageAndGetID posts a reply to a Slack thread and returns the
 // message timestamp, which can later be passed to EditMessage.
 func (c *SlackChannel) SendThreadMessageAndGetID(channel, threadTS, text string) (string, error) {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
+	if strings.TrimSpace(threadTS) == "" {
+		return "", fmt.Errorf("slack thread timestamp is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
 		return "", err
 	}
-	threadTS = strings.TrimSpace(threadTS)
-	if threadTS == "" {
-		return "", fmt.Errorf("slack thread timestamp is required")
-	}
-	opts := []slack.MsgOption{
-		slack.MsgOptionText(text, false),
-		slack.MsgOptionTS(threadTS),
-	}
-	_, timestamp, err := c.client.PostMessage(
-		resolvedChannel,
-		opts...,
-	)
+	_, timestamp, err := c.client.PostMessageContext(ctx, resolvedChannel,
+		slack.MsgOptionText(text, false), slack.MsgOptionTS(threadTS))
 	return timestamp, err
 }
 
 // SendThreadPlainText posts an unformatted reply to a Slack thread.
 func (c *SlackChannel) SendThreadPlainText(channel, threadTS, text string) error {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
-	if err != nil {
-		return err
-	}
-	threadTS = strings.TrimSpace(threadTS)
-	if threadTS == "" {
-		return fmt.Errorf("slack thread timestamp is required")
-	}
-	_, _, err = c.client.PostMessage(resolvedChannel,
-		slack.MsgOptionText(text, false),
-		slack.MsgOptionDisableMarkdown(),
-		slack.MsgOptionTS(threadTS),
-	)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := c.PostThreadTextContext(ctx, channel, threadTS, text)
 	return err
 }
 
 // SendThreadMarkdownFile shares the complete answer and its short introduction
 // in one file-share message in the original Slack thread.
 func (c *SlackChannel) SendThreadMarkdownFile(ctx context.Context, channel, threadTS, introduction, answer string) error {
-	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
-	if err != nil {
-		return err
-	}
-	threadTS = strings.TrimSpace(threadTS)
-	if threadTS == "" {
-		return fmt.Errorf("slack thread timestamp is required")
-	}
-	if answer == "" {
-		return fmt.Errorf("slack answer file cannot be empty")
-	}
-	filename := "aviary-answer-" + time.Now().UTC().Format("20060102T150405.000000000Z") + ".md"
-	_, err = c.client.UploadFileContext(ctx, slack.UploadFileParameters{
-		Content:         answer,
-		FileSize:        len(answer),
-		Filename:        filename,
-		Title:           filename,
-		InitialComment:  introduction,
-		Channel:         resolvedChannel,
-		ThreadTimestamp: threadTS,
-	})
-	return err
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return c.ShareThreadMarkdownFileContext(callCtx, channel, threadTS, introduction, answer)
 }
 
 // EditMessage updates a previously posted Slack message in place.
 func (c *SlackChannel) EditMessage(channel, msgID, text string) error {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
 		return err
 	}
-	_, _, _, err = c.client.UpdateMessage(resolvedChannel, msgID, slack.MsgOptionText(text, false))
+	_, _, _, err = c.client.UpdateMessageContext(ctx, resolvedChannel, msgID, slack.MsgOptionText(text, false))
 	return err
 }
 
 // SendAssistantStatusContext bounds a native status request by the caller's deadline.
 func (c *SlackChannel) SendAssistantStatusContext(ctx context.Context, channel, threadTS, status string) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
 		return err
@@ -233,7 +208,9 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 	c.logf("slack: starting socket mode session")
 
 	// Fetch the bot's own user ID so we can detect direct @mentions in groups.
-	resp, err := c.client.AuthTestContext(ctx)
+	authCtx, authCancel := context.WithTimeout(ctx, 10*time.Second)
+	resp, err := c.client.AuthTestContext(authCtx)
+	authCancel()
 	if err != nil || resp == nil || strings.TrimSpace(resp.UserID) == "" || strings.TrimSpace(resp.TeamID) == "" {
 		c.logf("slack: auth.test did not establish installation and workspace identity")
 		return fmt.Errorf("slack identity unavailable")
@@ -243,7 +220,10 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 	c.teamID = resp.TeamID
 	c.identityMu.Unlock()
 	c.logf("slack: auth ok user_id=%s team=%s", resp.UserID, strings.TrimSpace(resp.Team))
-	if err := c.refreshIdentityCache(ctx); err != nil {
+	cacheCtx, cacheCancel := context.WithTimeout(ctx, 30*time.Second)
+	cacheErr := c.refreshIdentityCache(cacheCtx)
+	cacheCancel()
+	if err := cacheErr; err != nil {
 		c.logf("slack: failed to refresh users/channels: %v", err)
 		slog.Warn("slack: failed to load users/channels; name-based routing disabled", "err", err)
 	} else {

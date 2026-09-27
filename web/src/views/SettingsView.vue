@@ -1607,6 +1607,9 @@ function hydrateDraftConfig(config: AppConfig): AppConfig {
 		(agent.channels ?? []).forEach((ch) => {
 			if (ch.enabled === undefined) ch.enabled = true;
 			if (ch.show_typing === undefined) ch.show_typing = true;
+			if (ch.type === "slack" && ch.tool_progress === undefined)
+				ch.tool_progress = false;
+			if (ch.type !== "slack") delete ch.tool_progress;
 			if (ch.reply_to_replies === undefined) ch.reply_to_replies = true;
 			if (ch.ignore_other_user_mentions === undefined)
 				ch.ignore_other_user_mentions = false;
@@ -2758,6 +2761,8 @@ function normalizedDraftConfig(): AppConfig {
 				.map((v) => v.trim())
 				.filter(Boolean),
 			show_typing: ch.show_typing === false ? false : undefined,
+			tool_progress:
+				ch.type === "slack" && ch.tool_progress === true ? true : undefined,
 			separate_top_level_sessions:
 				ch.separate_top_level_sessions === true ? true : undefined,
 			reply_to_replies: ch.reply_to_replies === false ? false : undefined,

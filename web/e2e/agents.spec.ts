@@ -845,6 +845,57 @@ test("Slack other-user mention rule survives settings save", async ({
 	});
 });
 
+test("Slack tool progress loads and saves independently of typing", async ({
+	page,
+}) => {
+	let savedConfig: unknown = null;
+	await mockMCP(page, {
+		config_get: {
+			...CONFIG,
+			agents: [
+				{
+					...CONFIG.agents[0],
+					channels: [
+						{
+							type: "slack",
+							id: "workspace-bot",
+							show_typing: false,
+							tool_progress: true,
+							allow_from: [{ from: "*" }],
+						},
+					],
+				},
+			],
+		},
+		config_save: (args) => {
+			savedConfig = JSON.parse(String(args?.config ?? "{}"));
+			return "ok";
+		},
+	});
+	await page.goto("/settings");
+	await page.getByRole("link", { name: "Agents & Tasks", exact: true }).click();
+	await page
+		.getByRole("button", { name: "Channels", exact: true })
+		.first()
+		.click();
+	const progress = page.getByLabel("Show tool progress");
+	await expect(progress).toBeChecked();
+	await expect(page.getByLabel("Show typing indicator")).not.toBeChecked();
+	await progress.uncheck();
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	expect(savedConfig).toMatchObject({
+		agents: [{ channels: [{ show_typing: false }] }],
+	});
+	expect(JSON.stringify(savedConfig)).not.toContain("tool_progress");
+	await progress.check();
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	expect(savedConfig).toMatchObject({
+		agents: [{ channels: [{ tool_progress: true, show_typing: false }] }],
+	});
+});
+
 test("saving settings preserves task prompt newlines", async ({ page }) => {
 	let savedConfig: unknown = null;
 
