@@ -413,7 +413,7 @@ func TestSlackPrivateTurnToolProgressModes(t *testing.T) {
 			model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				rounds++
 				if rounds == 1 {
-					writeDeliveryToolCall(w, "clickhouse_query", map[string]any{
+					writeDeliveryToolCall(w, "clickhouse_"+generation+"__query", map[string]any{
 						"sql":  "SELECT count() FROM events WHERE password = 'fake-secret-literal' /* fake-secret-comment */",
 						"path": "/fake-secret-private-path", "token": "fake-secret-token", "generation": generation, "max_rows": 10,
 					})
@@ -431,7 +431,7 @@ func TestSlackPrivateTurnToolProgressModes(t *testing.T) {
 			target, selected := srv.connections.Current(privateSlackDeliveryScope())
 			require.True(t, selected)
 			generation = target.Generation
-			tool := &slowDeliveryToolClient{delay: 10 * time.Millisecond, name: "clickhouse_query", result: "fake-secret-raw-result"}
+			tool := &slowDeliveryToolClient{delay: 10 * time.Millisecond, name: "clickhouse_" + generation + "__query", result: "fake-secret-raw-result"}
 			agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
 			t.Cleanup(func() { agent.SetToolClientFactory(nil) })
 			ch := &deliveryTestChannel{}
