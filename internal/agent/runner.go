@@ -292,6 +292,7 @@ func (r *AgentRunner) promptCore(
 
 		emit := func(e StreamEvent) {
 			e.AgentID = r.agent.ID
+			e.Private = privateConnectionTurn(promptCtx)
 			for _, c := range consumers {
 				c(e)
 			}

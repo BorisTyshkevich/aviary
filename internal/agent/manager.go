@@ -155,6 +155,18 @@ func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
 			_ = store.DeleteJSON(path)
 			continue
 		}
+		if cp.requiresTrustedIngress() {
+			// Deferred/suppressed turns depend on their original trusted channel
+			// consumer. Replaying them here could expose private context or mark
+			// an answer complete without delivering it.
+			slog.Info("agent: checkpoint needs trusted ingress, notifying session",
+				"agent", runner.agent.Name, "session", cp.SessionID)
+			msg := "I was interrupted. Please resend your request if it is still needed."
+			runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
+			deliverToSession(runner.agent.ID, cp.SessionID, msg)
+			_ = store.DeleteJSON(path)
+			continue
+		}
 
 		age := time.Since(cp.CreatedAt)
 		if age > timeout {

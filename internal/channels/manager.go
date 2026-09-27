@@ -380,6 +380,7 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	ch.intake = intake.handle
 	ch.intakeStart = intake.start
 	ch.intakeWait = intake.wait
+	ch.intakeContext = intake.baseContext
 	ch.intakeDeferred = intake.enqueue
 	ch.redactReference = intake.redactReference
 

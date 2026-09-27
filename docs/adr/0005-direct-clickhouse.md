@@ -131,11 +131,15 @@ thread and target generation. This applies to tool-history reads, summaries,
 memory and provider-side conversation continuation, not only artifact files.
 Do not resume a channel-wide provider conversation containing another principal's
 private evidence. A result becomes shared through successful posting, not merely
-through insertion in Aviary's internal conversation log.
+through insertion in Aviary's internal conversation log. Verbose channel output
+also omits private tool details and progress. Built-in shared browser, search and
+lab state is unavailable during private turns.
 
 Checkpoint recovery, scheduled jobs and ordinary control-plane prompts cannot
 manufacture a personal identity from session IDs or supplied sender fields.
 Personal tool use requires an authenticated ingress to establish that identity.
+Interrupted channel turns that depend on their original delivery consumer are
+not replayed; recovery records an interruption notice requesting a fresh message.
 Tests may inject identities through test-only seams; production model-callable
 tools cannot impersonate Slack users.
 

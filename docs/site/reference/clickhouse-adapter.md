@@ -36,13 +36,13 @@ functions through its outbound connection policy.
 
 Unposted results and preparation evidence are kept out of shared session history,
 provider continuation and tool-call argument logs. Built-in shared-memory writes,
-nested agent runs, session publication, shared browser tools and web search are
+nested agent runs, session publication, shared browser/lab tools and web search are
 unavailable during a private turn. These tools have shared state or diagnostics;
 they are not a private evidence publication mechanism. Read-only local tools and
 explicitly configured trusted deployment executables remain available.
 Configured host executables are trusted code, not a sandbox. A final Slack answer
-is recorded in shared history only after successful delivery. Enabling verbose
-Slack tool output explicitly publishes those results to the thread's audience.
+is recorded in shared history only after successful delivery. Verbose Slack output also omits private tool details and progress; only the
+final answer is published.
 
 The driver normally derives `max_execution_time` from a Go context deadline.
 The adapter deliberately hides that deadline from the driver while retaining

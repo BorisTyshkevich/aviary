@@ -83,7 +83,7 @@ func TestConnectionToolsRequireTrustedPersonalLeaseAndFreshGeneration(t *testing
 		t.Fatal(err)
 	}
 	defer func(c interface{ Close() error }) { _ = c.Close() }(client)
-	for _, name := range []string{"agent_run", "session_send", "channel_send_file", "agent_file_write", "browser_open", "web_search"} {
+	for _, name := range []string{"agent_run", "session_send", "channel_send_file", "agent_file_write", "browser_open", "web_search", "chlab_start", "chlab_query", "chlab_node_add"} {
 		if err := agentToolPermitted(ctx, name); err == nil {
 			t.Fatalf("private turn allowed %s", name)
 		}
@@ -194,6 +194,33 @@ func TestLiveConnectionToolsInProcess(t *testing.T) {
 			t.Fatal("tool policy denial bypassed")
 		}
 		lease.End()
+	}
+	// Exercise both owners concurrently through separate in-process MCP sessions.
+	outcomes := make(chan bool, 2)
+	for index, account := range fixture.Accounts[:2] {
+		go func(index int, username string) {
+			principal := connections.Principal{InstallationID: "i", WorkspaceID: "w", UserID: string(rune('a' + index))}
+			lease, err := s.Begin(scope)
+			if err != nil {
+				outcomes <- false
+				return
+			}
+			defer lease.End()
+			ctx := agent.WithSessionAgentID(connections.WithLease(connections.WithExecution(context.Background(), connections.Execution{Kind: connections.Interactive, Scope: scope, Principal: principal}), lease), "bot")
+			client, err := NewAgentToolClient(ctx)
+			if err != nil {
+				outcomes <- false
+				return
+			}
+			defer func() { _ = client.Close() }()
+			result, err := client.CallToolText(ctx, connectionToolName(target, "query"), map[string]any{"sql": "SELECT currentUser()", "max_rows": 1, "max_bytes": 1024})
+			outcomes <- err == nil && mcpIdentityMatches(result, username)
+		}(index, account.Username)
+	}
+	for range 2 {
+		if !<-outcomes {
+			t.Fatal("concurrent principal isolation failed")
+		}
 	}
 	lease, _ := s.Begin(scope)
 	defer lease.End()

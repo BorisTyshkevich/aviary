@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/connections"
@@ -273,5 +274,45 @@ func TestSlackConnectionIntakeDoesNotBlockSocketEventLoop(t *testing.T) {
 			t.Fatal("async command did not attach target")
 		case <-time.After(time.Millisecond):
 		}
+	}
+}
+
+func TestClassifiedReplyLookupCancelsWithIntake(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(entered)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	ch := NewSlackChannel("xapp-fake", "xoxb-fake", nil, "", nil)
+	ch.client = slack.New("xoxb-fake", slack.OptionAPIURL(server.URL+"/"))
+	intake := &slackConnectionIntake{channel: ch}
+	ctx, cancel := context.WithCancel(context.Background())
+	intake.start(ctx)
+	defer func() { cancel(); intake.wait() }()
+	ch.intakeDeferred = intake.enqueue
+	ch.intakeContext = intake.baseContext
+	ch.redactReference = func(channel, root string) bool { return channel == "D1" && root == "100.000001" }
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		SubType: slack.MsgSubTypeMessageReplied, Channel: "D1", ThreadTimeStamp: "100.000001", TimeStamp: "100.000001",
+		Message: &slack.Msg{Timestamp: "100.000001", LatestReply: "100.000002"},
+	})
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("classified reply lookup did not start")
+	}
+	cancel()
+	done := make(chan struct{})
+	go func() { intake.wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("classified reply lookup delayed intake shutdown")
 	}
 }

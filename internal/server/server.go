@@ -494,6 +494,9 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	runner.PromptMediaWithOverrides(msgCtx, msg.Text, msg.MediaURL, rOpts, func(e agent.StreamEvent) {
 		switch e.Type {
 		case agent.StreamEventTool:
+			if e.Private {
+				return
+			}
 			if slackStreamer != nil && e.Tool != nil {
 				if status := slackToolStatusText(e.Tool); status != "" {
 					if as, ok := ch.(channels.AssistantStatusSender); ok && as.ShowAssistantStatus() && strings.TrimSpace(msg.ThreadTS) != "" {
@@ -507,6 +510,9 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				}
 			}
 		case agent.StreamEventStatus:
+			if e.Private {
+				return
+			}
 			if slackStreamer == nil {
 				sendOrEditStatus(e.Text)
 			}

@@ -51,6 +51,7 @@ type SlackChannel struct {
 	intake          func(slackIngress) bool
 	intakeStart     func(context.Context)
 	intakeWait      func()
+	intakeContext   func() context.Context
 	intakeDeferred  func(string, func()) bool
 	redactReference func(channelID, threadTS string) bool
 }
@@ -376,8 +377,12 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 			root = firstNonEmpty(event.ThreadTimeStamp, event.Message.ThreadTimestamp, event.Message.Timestamp, event.TimeStamp)
 		}
 		if strings.HasPrefix(event.Channel, "D") && c.redactReference != nil && c.redactReference(event.Channel, root) && c.intakeDeferred != nil {
+			lookupContext := context.Background()
+			if c.intakeContext != nil {
+				lookupContext = c.intakeContext()
+			}
 			c.intakeDeferred(event.Channel+"\x00"+root, func() {
-				normalized, ok := c.normalizeMessageRepliedEvent(context.Background(), event)
+				normalized, ok := c.normalizeMessageRepliedEvent(lookupContext, event)
 				if ok {
 					c.handleMessageEvent(normalized)
 				}

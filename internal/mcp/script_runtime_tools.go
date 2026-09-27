@@ -12,8 +12,8 @@ import (
 
 func agentToolPermitted(ctx context.Context, name string) error {
 	if agent.PrivateDataContext(ctx) {
-		if strings.HasPrefix(name, "browser_") || name == "web_search" {
-			return fmt.Errorf("shared browser and search state are unavailable during a private evidence turn")
+		if strings.HasPrefix(name, "browser_") || strings.HasPrefix(name, "chlab_") || name == "web_search" {
+			return fmt.Errorf("shared browser, lab and search state are unavailable during a private evidence turn")
 		}
 		switch name {
 		case "agent_file_write", "file_write", "file_append", "file_copy", "file_move", "agent_rules_set", "agent_run", "session_send", "channel_send_file", "task_schedule",

@@ -25,6 +25,7 @@ type ToolEvent struct {
 
 // StreamEvent is a single event emitted during an agent response.
 type StreamEvent struct {
+	Private  bool // tool details and progress are private and must not be published to shared channels
 	Type     StreamEventType
 	AgentID  string
 	Text     string // set for StreamEventText
