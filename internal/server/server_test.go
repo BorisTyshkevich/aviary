@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/slack-go/slack"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -42,9 +41,7 @@ type statusStubChannel struct {
 	statuses []string
 }
 
-func (c *statusStubChannel) ShowAssistantStatus() bool { return true }
-
-func (c *statusStubChannel) SendAssistantStatus(_, _, status string) error {
+func (c *statusStubChannel) SendAssistantStatusContext(_ context.Context, _, _, status string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.statuses = append(c.statuses, status)
@@ -55,12 +52,6 @@ func (c *statusStubChannel) snapshotStatuses() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string{}, c.statuses...)
-}
-
-type threadStubChannel struct{}
-
-func (threadStubChannel) SendThreadMessageAndGetID(_, _, _ string) (string, error) {
-	return "msg-1", nil
 }
 
 type recordingThreadChannel struct {
@@ -1585,45 +1576,28 @@ func TestHandleIncomingChannelMessage_SendsAssistantStatus(t *testing.T) {
 	}, time.Second, 10*time.Millisecond)
 }
 
-func TestSlackThreadStreamer_GroupsCompletedToolCallsInCollapsedBlock(t *testing.T) {
-	streamer := &slackThreadStreamer{thread: threadStubChannel{}}
-	streamer.UpsertToolOutput(&agent.ToolEvent{Name: "pending_tool", Args: map[string]any{"query": "work"}})
-	streamer.UpsertToolOutput(&agent.ToolEvent{Name: "agent_file_read", Args: map[string]any{"file": "README.md"}})
-	streamer.UpsertToolOutput(&agent.ToolEvent{Name: "agent_file_read", Args: map[string]any{"file": "README.md"}, Result: "contents"})
-	streamer.UpsertToolOutput(&agent.ToolEvent{Name: "shell_command", Args: map[string]any{"command": "go test ./..."}, Error: "failed"})
-	streamer.UpsertToolOutput(&agent.ToolEvent{Name: "agent_task", Args: map[string]any{"id": "abc"}, Result: "done\nwith details"})
-
-	blocks := streamer.toolBlocks()
-
-	assert.Len(t, blocks, 1)
-	tools, ok := blocks[0].(*slack.SectionBlock)
+func TestHandleIncomingChannelMessage_UsesSelectedSlackRouteStatus(t *testing.T) {
+	setupServerDataDir(t)
+	resetSlogForTest()
+	enabled, disabled := true, false
+	cfg := &config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "stub", Channels: []config.ChannelConfig{
+		{Type: "slack", ID: "quiet", ShowTyping: &disabled},
+		{Type: "slack", ID: "active", ShowTyping: &enabled},
+	}}}}
+	srv := New(cfg, "tok")
+	shared := &statusStubChannel{}
+	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "quiet", shared, channels.IncomingMessage{
+		Type: "slack", Channel: "C1", ThreadTS: "1710000000.000001", From: "U123", Text: "quiet",
+	})
+	runner, ok := srv.agents.Get("bot")
 	require.True(t, ok)
-	assert.False(t, tools.Expand)
-	require.NotNil(t, tools.Text)
-	text := tools.Text.Text
-	assert.Contains(t, text, ":hammer_and_wrench: *Tool Calls*")
-	assert.NotContains(t, text, ":hammer_and_wrench: *Tool Calls*\n\n")
-	assert.Contains(t, text, ":thinking_face: `pending_tool` :arrow_right: `{\"query\":\"work\"}`")
-	assert.NotContains(t, text, "agent_file_read")
-	assert.NotContains(t, text, "README.md")
-	assert.Contains(t, text, ":warning: `shell_command` :arrow_right: `{\"command\":\"go test ./...\"}`\n\nError:\n```failed```")
-	assert.Contains(t, text, ":white_check_mark: `agent_task` :arrow_right: `{\"id\":\"abc\"}`\n\nOutput:\n```done\nwith details```")
-	assert.NotContains(t, text, "\n\nDetails\n")
-	assert.NotContains(t, text, "Input:")
-	assert.NotContains(t, text, "contents")
-	assert.NotContains(t, text, "Running")
-
-	_, err := json.Marshal(blocks)
-	assert.NoError(t, err)
-	assert.LessOrEqual(t, len(text), 3000)
-}
-
-func TestCompactToolInput_TruncatesLongInputsOnOneLine(t *testing.T) {
-	input := compactToolInput(map[string]any{"command": "echo " + strings.Repeat("x", 300)}, 80)
-
-	assert.LessOrEqual(t, len(input), 80)
-	assert.True(t, strings.HasSuffix(input, "..."))
-	assert.NotContains(t, input, "\n")
+	runner.Wait()
+	require.Empty(t, shared.snapshotStatuses())
+	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "active", shared, channels.IncomingMessage{
+		Type: "slack", Channel: "C2", ThreadTS: "1710000000.000002", From: "U123", Text: "active",
+	})
+	runner.Wait()
+	require.Equal(t, []string{"is thinking", ""}, shared.snapshotStatuses())
 }
 
 func TestSlackThreadStreamer_SendsOneCompletedAnswer(t *testing.T) {
@@ -1683,16 +1657,6 @@ func TestSlackThreadStreamer_SendsShortPlainAnswerWithoutFile(t *testing.T) {
 	streamer.SendAnswer(context.Background(), "test/model", "Looks good.")
 	assert.Equal(t, []string{"Looks good."}, ch.plain)
 	assert.Empty(t, ch.answer)
-}
-
-func TestSlackToolStatusText_FileRead(t *testing.T) {
-	status := slackToolStatusText(&agent.ToolEvent{
-		Name: "agent_file_read",
-		Args: map[string]any{"file": "README.md"},
-	})
-
-	assert.Equal(t, "is reading README.md", status)
-	assert.Equal(t, "", slackToolStatusText(&agent.ToolEvent{Name: "agent_file_read", Result: "contents"}))
 }
 
 func TestStageOutgoingMedia_CopiesToChannelDir(t *testing.T) {

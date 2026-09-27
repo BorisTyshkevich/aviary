@@ -42,8 +42,7 @@ unavailable during a private turn. These tools have shared state or diagnostics;
 they are not a private evidence publication mechanism. Read-only local tools and
 explicitly configured trusted deployment executables remain available.
 Configured host executables are trusted code, not a sandbox. A final Slack answer
-is recorded in shared history only after successful delivery. Verbose Slack output also omits private tool details and progress; only the
-final answer is published.
+is recorded in shared history only after successful delivery. Private turns publish no tool progress; only a successfully delivered final answer is published.
 
 The driver normally derives `max_execution_time` from a Go context deadline.
 The adapter deliberately hides that deadline from the driver while retaining

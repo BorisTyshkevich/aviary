@@ -104,6 +104,7 @@ test("agents and tasks tab shows configured entries", async ({ page }) => {
 	await expect(
 		page.locator('input[placeholder="assistant"]').first(),
 	).toHaveValue("assistant");
+	await expect(page.getByText("Verbose mode", { exact: true })).toHaveCount(0);
 
 	// Tasks subtab
 	await page

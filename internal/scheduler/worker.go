@@ -228,8 +228,6 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 		switch e.Type {
 		case agent.StreamEventText:
 			reply.WriteString(e.Text)
-		case agent.StreamEventStatus:
-			logs.Addf("status: %s", e.Text)
 		case agent.StreamEventMedia:
 			logs.Addf("media: %s", e.MediaURL)
 		case agent.StreamEventDone, agent.StreamEventStop:

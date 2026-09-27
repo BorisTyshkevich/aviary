@@ -1213,7 +1213,7 @@ func TestSlackChannel_SendAssistantStatus(t *testing.T) {
 	ch.channelAliases = map[string]string{"alerts": "C123"}
 	ch.identityMu.Unlock()
 
-	err := ch.SendAssistantStatus("#alerts", "1710000000.123456", "is thinking")
+	err := ch.SendAssistantStatusContext(context.Background(), "#alerts", "1710000000.123456", "is thinking")
 	assert.NoError(t, err)
 	assert.Equal(t, "C123", gotChannel)
 	assert.Equal(t, "1710000000.123456", gotThread)

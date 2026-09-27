@@ -362,7 +362,6 @@ const settingsConfig = {
 			model: "anthropic/claude-sonnet-4-5",
 			fallbacks: ["openai/gpt-5-mini"],
 			working_dir: "/workspace/aviary",
-			verbose: true,
 			permissions: {
 				preset: "minimal",
 				tools: [

@@ -27,6 +27,19 @@ func TestDefault(t *testing.T) {
 
 }
 
+func TestAgentConfigDropsRemovedVerboseSetting(t *testing.T) {
+	var agent AgentConfig
+	assert.NoError(t, yaml.Unmarshal([]byte("name: assistant\nmodel: test/model\nverbose: true\n"), &agent))
+
+	yamlData, err := yaml.Marshal(agent)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(yamlData), "verbose")
+
+	jsonData, err := json.Marshal(agent)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(jsonData), "verbose")
+}
+
 func TestValidateConnections(t *testing.T) {
 	cfg := Default()
 	cfg.Connections = &ConnectionPolicyConfig{Network: endpointpolicy.Policy{Allow: []endpointpolicy.Rule{{}}}}

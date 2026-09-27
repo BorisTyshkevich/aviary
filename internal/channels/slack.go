@@ -27,7 +27,6 @@ type SlackChannel struct {
 	model         string
 	fallbacks     []string
 	disabledTools []string
-	showStatus    bool
 
 	botUserID         string // populated on connect via auth.test
 	teamID            string // populated on connect via auth.test
@@ -70,14 +69,13 @@ func NewSlackChannel(appToken, botToken string, allowFrom []config.AllowFromEntr
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken))
 	sm := socketmode.New(api)
 	return &SlackChannel{
-		appToken:   appToken,
-		botToken:   botToken,
-		allowFrom:  allowFrom,
-		model:      model,
-		fallbacks:  fallbacks,
-		showStatus: true,
-		client:     api,
-		sm:         sm,
+		appToken:  appToken,
+		botToken:  botToken,
+		allowFrom: allowFrom,
+		model:     model,
+		fallbacks: fallbacks,
+		client:    api,
+		sm:        sm,
 	}
 }
 
@@ -201,26 +199,6 @@ func (c *SlackChannel) SendThreadMarkdownFile(ctx context.Context, channel, thre
 	return err
 }
 
-// SendThreadBlocksAndGetID posts a reply with Block Kit content to a Slack
-// thread and returns the message timestamp.
-func (c *SlackChannel) SendThreadBlocksAndGetID(channel, threadTS, fallbackText string, blocks ...slack.Block) (string, error) {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
-	if err != nil {
-		return "", err
-	}
-	threadTS = strings.TrimSpace(threadTS)
-	if threadTS == "" {
-		return "", fmt.Errorf("slack thread timestamp is required")
-	}
-	opts := []slack.MsgOption{
-		slack.MsgOptionText(fallbackText, false),
-		slack.MsgOptionBlocks(blocks...),
-		slack.MsgOptionTS(threadTS),
-	}
-	_, timestamp, err := c.client.PostMessage(resolvedChannel, opts...)
-	return timestamp, err
-}
-
 // EditMessage updates a previously posted Slack message in place.
 func (c *SlackChannel) EditMessage(channel, msgID, text string) error {
 	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
@@ -231,32 +209,9 @@ func (c *SlackChannel) EditMessage(channel, msgID, text string) error {
 	return err
 }
 
-// EditMessageBlocks updates a previously posted Slack message with Block Kit
-// content.
-func (c *SlackChannel) EditMessageBlocks(channel, msgID, fallbackText string, blocks ...slack.Block) error {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
-	if err != nil {
-		return err
-	}
-	_, _, _, err = c.client.UpdateMessage(
-		resolvedChannel,
-		msgID,
-		slack.MsgOptionText(fallbackText, false),
-		slack.MsgOptionBlocks(blocks...),
-	)
-	return err
-}
-
-// ShowAssistantStatus reports whether Slack assistant status updates are
-// enabled for this channel.
-func (c *SlackChannel) ShowAssistantStatus() bool {
-	return c.showStatus
-}
-
-// SendAssistantStatus updates Slack's native assistant thread status. Passing
-// an empty status clears any existing indicator.
-func (c *SlackChannel) SendAssistantStatus(channel, threadTS, status string) error {
-	resolvedChannel, err := c.resolveDeliveryTarget(context.Background(), channel)
+// SendAssistantStatusContext bounds a native status request by the caller's deadline.
+func (c *SlackChannel) SendAssistantStatusContext(ctx context.Context, channel, threadTS, status string) error {
+	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
 		return err
 	}
@@ -264,7 +219,7 @@ func (c *SlackChannel) SendAssistantStatus(channel, threadTS, status string) err
 	if threadTS == "" {
 		return fmt.Errorf("slack assistant status requires a thread timestamp")
 	}
-	return c.client.SetAssistantThreadsStatusContext(context.Background(), slack.AssistantThreadsSetStatusParameters{
+	return c.client.SetAssistantThreadsStatusContext(ctx, slack.AssistantThreadsSetStatusParameters{
 		ChannelID: resolvedChannel,
 		ThreadTS:  threadTS,
 		Status:    strings.TrimSpace(status),
