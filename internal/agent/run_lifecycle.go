@@ -205,18 +205,22 @@ func RetireCheckpointsForUserStop(agentID, sessionID string) error {
 			continue
 		}
 		path := filepath.Join(dir, entry.Name())
-		if sessionID != "" {
-			cp, readErr := store.ReadJSON[RunCheckpoint](path)
-			if readErr != nil {
-				if errors.Is(readErr, os.ErrNotExist) {
-					continue // a completing run removed it after ReadDir
-				}
-				failures = append(failures, readErr)
-				continue
+		cp, readErr := store.ReadJSON[RunCheckpoint](path)
+		if readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				continue // a completing run removed it after ReadDir
 			}
-			if cp.SessionID != sessionID {
-				continue
+			// An unreadable record cannot be classified or safely retired. Keep it
+			// for inspection without failing a stop that can retire other records.
+			name := entry.Name()
+			if len(name) > 80 {
+				name = name[:80]
 			}
+			slog.Warn("agent: retaining unreadable checkpoint during user stop", "checkpoint", name)
+			continue
+		}
+		if cp.Slack != nil || (sessionID != "" && cp.SessionID != sessionID) {
+			continue // Slack terminal/cleanup work stays with authenticated recovery
 		}
 		if err := retireCheckpoint(path); err != nil {
 			failures = append(failures, err)

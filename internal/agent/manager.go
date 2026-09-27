@@ -170,6 +170,18 @@ func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
+		// Slack delivery has a separate, authenticated recovery owner. Filter
+		// before claiming so a generic wake cannot displace its pending callback.
+		cp, readErr := store.ReadJSON[RunCheckpoint](path)
+		if readErr != nil {
+			if !os.IsNotExist(readErr) {
+				slog.Warn("agent: retaining unreadable checkpoint", "path", path, "err", readErr)
+			}
+			continue
+		}
+		if cp.Slack != nil {
+			continue
+		}
 		m.mu.RLock()
 		stopped = m.stopped
 		m.mu.RUnlock()
@@ -219,19 +231,19 @@ func (m *Manager) wakeCheckpointRecovery(runner *AgentRunner, name, path string,
 func (m *Manager) recoverCheckpoint(runner *AgentRunner, name, path string, timeout time.Duration) {
 	cp, err := store.ReadJSON[RunCheckpoint](path)
 	if err != nil {
-		slog.Warn("agent: ignoring unreadable checkpoint", "path", path, "err", err)
-		_ = store.DeleteJSON(path)
+		if !os.IsNotExist(err) {
+			slog.Warn("agent: retaining unreadable checkpoint", "path", path, "err", err)
+		}
 		return
 	}
+	if cp.Slack != nil {
+		return // authenticated Slack recovery owns this target and disposition
+	}
 	if cp.requiresTrustedIngress() {
-		// Deferred/suppressed turns depend on their original trusted channel
-		// consumer. Replaying them here could expose private context or mark
-		// an answer complete without delivering it.
-		slog.Info("agent: checkpoint needs trusted ingress, notifying session",
+		// Old non-replayable records have no authenticated original target.
+		// Session-wide delivery registrations may point at an unrelated thread.
+		slog.Warn("agent: dropping checkpoint without trusted original target",
 			"agent", runner.agent.Name, "session", cp.SessionID)
-		msg := "I was interrupted. Please resend your request if it is still needed."
-		runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
-		deliverToSession(runner.agent.ID, cp.SessionID, msg)
 		_ = store.DeleteJSON(path)
 		return
 	}

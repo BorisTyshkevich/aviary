@@ -37,7 +37,7 @@ type drainingPresenterChannel struct {
 }
 
 func (c *drainingPresenterChannel) PostThreadTextContext(_ context.Context, _, _, text string) (string, error) {
-	if text == "Stopped." {
+	if text == "Interrupted; please resend your request." {
 		c.terminalOnce.Do(func() { close(c.terminalEntered) })
 		<-c.releaseTerminal
 	}
@@ -273,7 +273,7 @@ func TestServerRootCancellationDrainsAdmittedChannelRun(t *testing.T) {
 	ch := &drainingPresenterChannel{terminalEntered: make(chan struct{}), releaseTerminal: make(chan struct{})}
 	<-srv.routerReady
 	srv.msgFn("bot", "slack", "route", ch, channels.IncomingMessage{
-		Type: "slack", Channel: "C1", ThreadTS: "1.000001", From: "U1", Text: "request",
+		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C1", ThreadTS: "1.000001", From: "U1", Text: "request",
 	})
 	select {
 	case <-modelEntered:
@@ -298,7 +298,7 @@ func TestServerRootCancellationDrainsAdmittedChannelRun(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not finish after terminal callback")
 	}
-	require.Positive(t, checkpointCountForServerTest("bot"), "runner stop must retain replayable channel checkpoint")
+	require.Zero(t, checkpointCountForServerTest("bot"), "accepted interruption notice retires its Slack checkpoint")
 }
 
 func checkpointCountForServerTest(agentID string) int {

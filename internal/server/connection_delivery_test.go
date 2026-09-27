@@ -315,7 +315,7 @@ func TestSlackNoReplyClearsStatusWithoutPosting(t *testing.T) {
 	srv := New(cfg, "fake-token")
 	ch := &statusDeliveryChannel{}
 	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "alerts", ch, channels.IncomingMessage{
-		Type: "slack", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
+		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
 	})
 	runner, ok := srv.agents.Get("bot")
 	require.True(t, ok)
@@ -373,13 +373,13 @@ func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
 	runner, ok := srv.agents.Get("bot")
 	require.True(t, ok)
 	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "quiet", shared, channels.IncomingMessage{
-		Type: "slack", Channel: "C1", ThreadTS: "1700000000.000001", From: "U1", Text: "quiet",
+		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C1", ThreadTS: "1700000000.000001", From: "U1", Text: "quiet",
 	})
 	runner.Wait()
 	require.Equal(t, []string{"synthetic final"}, shared.posted())
 	require.Empty(t, shared.deletedMessages())
 	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "active", shared, channels.IncomingMessage{
-		Type: "slack", Channel: "C2", ThreadTS: "1700000000.000002", From: "U1", Text: "active",
+		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C2", ThreadTS: "1700000000.000002", From: "U1", Text: "active",
 	})
 	runner.Wait()
 	posted := shared.posted()

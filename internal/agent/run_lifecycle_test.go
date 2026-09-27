@@ -384,7 +384,7 @@ func TestUserStopRetiresOnlySelectedStaleCheckpoints(t *testing.T) {
 	require.FileExists(t, second)
 }
 
-func TestScopedUserStopIgnoresVanishedCheckpointAndReportsCorruption(t *testing.T) {
+func TestScopedUserStopIgnoresVanishedCheckpointAndRetainsCorruption(t *testing.T) {
 	setTestDataDir(t)
 	dir := store.CheckpointDir("stale")
 	require.NoError(t, os.MkdirAll(dir, 0o700))
@@ -394,9 +394,25 @@ func TestScopedUserStopIgnoresVanishedCheckpointAndReportsCorruption(t *testing.
 		"a checkpoint removed after listing must not make an already requested stop fail")
 	bad := store.CheckpointPath("stale", "corrupt")
 	require.NoError(t, os.WriteFile(bad, []byte("not json"), 0o600))
-	err := RetireCheckpointsForUserStop("stale", "session")
-	require.ErrorContains(t, err, "parsing")
+	require.NoError(t, RetireCheckpointsForUserStop("stale", "session"))
 	require.FileExists(t, bad, "corrupt checkpoint remains for inspection")
+}
+
+func TestAgentWideUserStopRetiresReadableRunsAndRetainsUnclassifiedRecords(t *testing.T) {
+	setTestDataDir(t)
+	valid := store.CheckpointPath("mixed-stop", "valid")
+	slack := store.CheckpointPath("mixed-stop", "slack")
+	corrupt := store.CheckpointPath("mixed-stop", "corrupt")
+	require.NoError(t, store.WriteJSON(valid, RunCheckpoint{SessionID: "session", Message: "request"}))
+	require.NoError(t, store.WriteJSON(slack, RunCheckpoint{SessionID: "session", Slack: &SlackCheckpoint{
+		InstallationID: "bot-fake", WorkspaceID: "team-fake", ChannelID: "C123",
+		RootThreadTS: "123.456", Disposition: SlackDispositionHandled, CleanupPending: true,
+	}}))
+	require.NoError(t, os.WriteFile(corrupt, []byte("invalid checkpoint json"), 0o600))
+	require.NoError(t, RetireCheckpointsForUserStop("mixed-stop", ""))
+	require.NoFileExists(t, valid)
+	require.FileExists(t, slack, "Slack terminal cleanup remains owned by authenticated recovery")
+	require.FileExists(t, corrupt, "unclassified record remains for inspection")
 }
 
 func TestUserStopSuppressesClaimedRecoveryUntilRelease(t *testing.T) {

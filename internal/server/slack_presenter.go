@@ -49,27 +49,31 @@ const (
 	slackOutcomeAlreadyDone    slackTerminalOutcome = "already_answered"
 	slackOutcomeNotice         slackTerminalOutcome = "notice"
 	slackOutcomeStopped        slackTerminalOutcome = "stopped"
+	slackOutcomeInterrupted    slackTerminalOutcome = "interrupted"
 	slackOutcomeEmpty          slackTerminalOutcome = "empty"
 	slackOutcomeDeliveryFailed slackTerminalOutcome = "delivery_failed"
 	slackOutcomePartial        slackTerminalOutcome = "partial"
 	slackOutcomeUnconfirmed    slackTerminalOutcome = "unconfirmed"
 )
 
-// slackTerminalResult is the handoff seam for checkpoint disposition in PR3b.
+// slackTerminalResult records delivery certainty and temporary-message cleanup.
 type slackTerminalResult struct {
 	Outcome           slackTerminalOutcome
 	Disposition       slackTerminalDisposition
 	ConfirmedNewReply bool
 	ProgressTimestamp string
 	CleanupPending    bool
-	NoticeAttempted   bool
+	// NoticeAttempted is the durable uncertainty marker for a standalone post.
+	// A definite rejection clears it even though an HTTP attempt occurred.
+	NoticeAttempted bool
 }
 
 // slackPresenterHooks mark the persistence boundaries needed by recovery.
-// PR2 uses the presenter without hooks.
+// Hooks persist accepted progress and terminal outcomes around Slack writes.
 type slackPresenterHooks struct {
 	ProgressCreated   func(string) error
 	NoticeAttempting  func() error
+	TerminalAccepted  func(slackTerminalResult) error
 	TerminalFinalized func(slackTerminalResult)
 }
 
@@ -320,6 +324,20 @@ func (p *slackPresenter) cleanup() bool {
 	return false
 }
 
+func (p *slackPresenter) accepted(result slackTerminalResult, cleanupProgress bool) slackTerminalResult {
+	result.CleanupPending = cleanupProgress && result.ProgressTimestamp != ""
+	if p.hooks.TerminalAccepted != nil {
+		if err := p.hooks.TerminalAccepted(result); err != nil {
+			slog.Warn("server: Slack accepted terminal checkpoint update failed")
+			return result // keep known progress for later cleanup/recovery
+		}
+	}
+	if result.CleanupPending {
+		result.CleanupPending = p.cleanup()
+	}
+	return result
+}
+
 func (p *slackPresenter) post(ctx context.Context, body string) error {
 	callCtx, cancel := context.WithTimeout(ctx, slackAnswerCallTimeout)
 	defer cancel()
@@ -338,14 +356,14 @@ func (p *slackPresenter) standaloneNotice(body string, outcome slackTerminalOutc
 	}
 	ctx, cancel := p.operationContext(slackAnswerCallTimeout)
 	defer cancel()
-	result.NoticeAttempted = true
 	if err := p.post(ctx, body); err != nil {
 		result.Disposition = slackErrorDisposition(err)
+		result.NoticeAttempted = result.Disposition == slackDispositionUnconfirmed
 		return result
 	}
 	result.Disposition = slackDispositionHandled
 	result.ConfirmedNewReply = true
-	return result
+	return p.accepted(result, true)
 }
 
 func (p *slackPresenter) editNotice(body string, outcome slackTerminalOutcome) slackTerminalResult {
@@ -357,7 +375,7 @@ func (p *slackPresenter) editNotice(body string, outcome slackTerminalOutcome) s
 	err := p.sender.EditThreadTextContext(ctx, p.channel, ts, body)
 	cancel()
 	if err == nil {
-		return slackTerminalResult{Outcome: outcome, Disposition: slackDispositionHandled, ProgressTimestamp: ts}
+		return p.accepted(slackTerminalResult{Outcome: outcome, Disposition: slackDispositionHandled, ProgressTimestamp: ts}, false)
 	}
 	if slackErrorDisposition(err) == slackDispositionPending {
 		result := p.standaloneNotice(body, outcome)
@@ -388,9 +406,9 @@ func (p *slackPresenter) Terminal(status *slackRunStatus, kind, model, answer st
 	var result slackTerminalResult
 	switch {
 	case alreadyAnswered:
-		result = slackTerminalResult{Outcome: slackOutcomeAlreadyDone, Disposition: slackDispositionHandled, ProgressTimestamp: p.progressTimestamp(), CleanupPending: p.cleanup()}
+		result = p.accepted(slackTerminalResult{Outcome: slackOutcomeAlreadyDone, Disposition: slackDispositionHandled, ProgressTimestamp: p.progressTimestamp()}, true)
 	case kind == "done" && strings.TrimSpace(answer) != "" && !agent.ShouldDeliverReply(answer):
-		result = slackTerminalResult{Outcome: slackOutcomeSilence, Disposition: slackDispositionHandled, ProgressTimestamp: p.progressTimestamp(), CleanupPending: p.cleanup()}
+		result = p.accepted(slackTerminalResult{Outcome: slackOutcomeSilence, Disposition: slackDispositionHandled, ProgressTimestamp: p.progressTimestamp()}, true)
 	case kind == "done" && strings.TrimSpace(answer) != "":
 		result = p.answer(ctx, model, answer)
 	default:
@@ -400,13 +418,13 @@ func (p *slackPresenter) Terminal(status *slackRunStatus, kind, model, answer st
 		case "stop":
 			body = "Stopped."
 			outcome = slackOutcomeStopped
+		case "interrupted":
+			body = "Interrupted; please resend your request."
+			outcome = slackOutcomeInterrupted
 		case "error":
 			outcome = slackOutcomeNotice
 		}
 		result = p.editNotice(body, outcome)
-		if result.ConfirmedNewReply {
-			result.CleanupPending = p.cleanup()
-		}
 	}
 	return p.finishStatus(status, result), true
 }
@@ -450,20 +468,20 @@ func (p *slackPresenter) answer(ctx context.Context, model, answer string) slack
 	if deliveryErr != nil {
 		return p.failedAnswer(ctx, deliveredParts, deliveryErr)
 	}
-	return slackTerminalResult{Outcome: slackOutcomeAnswer, Disposition: slackDispositionHandled, ConfirmedNewReply: true,
-		ProgressTimestamp: p.progressTimestamp(), CleanupPending: p.cleanup()}
+	return p.accepted(slackTerminalResult{Outcome: slackOutcomeAnswer, Disposition: slackDispositionHandled, ConfirmedNewReply: true,
+		ProgressTimestamp: p.progressTimestamp()}, true)
 }
 
 func deadlineOf(ctx context.Context) time.Time { deadline, _ := ctx.Deadline(); return deadline }
 
 func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err error) slackTerminalResult {
+	answerUnconfirmed := slackErrorDisposition(err) == slackDispositionUnconfirmed
 	body := "Unable to deliver the answer."
 	outcome := slackOutcomeDeliveryFailed
 	if deliveredParts > 0 {
 		body, outcome = "Answer incomplete.", slackOutcomePartial
 	}
-	var delivery *channels.SlackDeliveryError
-	if !errors.As(err, &delivery) || !delivery.Rejected {
+	if answerUnconfirmed {
 		body = "Answer delivery could not be confirmed."
 		outcome = slackOutcomeUnconfirmed
 		if deliveredParts > 0 {
@@ -476,9 +494,7 @@ func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err
 		// message can only be promoted when the new notice did not land.
 		result = p.standaloneNotice(body, outcome)
 		result.ConfirmedNewReply = true
-		if result.Disposition == slackDispositionHandled {
-			result.CleanupPending = p.cleanup()
-		} else if p.progressTimestamp() != "" {
+		if result.Disposition != slackDispositionHandled && p.progressTimestamp() != "" {
 			// Editing a known message cannot create another reply, even when
 			// acceptance of the standalone notice remains uncertain.
 			ts := p.progressTimestamp()
@@ -486,15 +502,19 @@ func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err
 			editErr := p.sender.EditThreadTextContext(editCtx, p.channel, ts, body)
 			cancel()
 			result.CleanupPending = editErr != nil
-			if editErr == nil && result.Disposition == slackDispositionPending {
+			if editErr == nil {
 				result.Disposition = slackDispositionHandled
+				result = p.accepted(result, false)
 			}
+		}
+		if answerUnconfirmed && result.Disposition != slackDispositionHandled {
+			result.Disposition = slackDispositionUnconfirmed
 		}
 		return result
 	}
 	result = p.editNotice(body, outcome)
-	if result.ConfirmedNewReply {
-		result.CleanupPending = p.cleanup()
+	if answerUnconfirmed && result.Disposition != slackDispositionHandled {
+		result.Disposition = slackDispositionUnconfirmed
 	}
 	return result
 }
