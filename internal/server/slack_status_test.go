@@ -104,3 +104,23 @@ func TestSlackStatusStopsOnUnsupportedSurface(t *testing.T) {
 	status.Finish(false)
 	require.Equal(t, []string{"is thinking"}, ch.snapshot())
 }
+
+func TestSlackStatusSkipsNewWritesAfterSharedDrainDeadline(t *testing.T) {
+	srv := &Server{}
+	ch := &delayedStatusChannel{}
+	status := newSlackRunStatus(ch, "C123", "1710000000.123456")
+	status.contextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+		return srv.terminalContext(context.Background(), budget)
+	}
+	status.Start()
+	require.Equal(t, []string{"is thinking"}, ch.snapshot())
+	srv.terminalDrainUntil.Store(time.Now().Add(-time.Second).UnixNano())
+	status.Finish(false)
+	require.Equal(t, []string{"is thinking"}, ch.snapshot(), "terminal clear cannot start after drain deadline")
+
+	late := newSlackRunStatus(ch, "C123", "1710000000.123456")
+	late.contextFactory = status.contextFactory
+	late.Start()
+	late.Finish(false)
+	require.Equal(t, []string{"is thinking"}, ch.snapshot(), "late status startup cannot write after drain deadline")
+}

@@ -18,6 +18,9 @@ type RunCheckpoint struct {
 	AgentName string `json:"agent_name"`
 	// SessionID is the session the prompt was running in.
 	SessionID string `json:"session_id"`
+	// PromptMessageID identifies the user message for replayable runs. The
+	// checkpoint filename is the independent run identity.
+	PromptMessageID string `json:"prompt_message_id,omitempty"`
 	// Message is the original user message to re-issue.
 	Message string `json:"message"`
 	// MediaURL is an optional media attachment for the message.

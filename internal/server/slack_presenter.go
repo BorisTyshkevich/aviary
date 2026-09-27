@@ -74,15 +74,15 @@ type slackPresenterHooks struct {
 }
 
 type slackPresenter struct {
-	sender          slackPresenterSender
-	channel         string
-	threadTS        string
-	progressOn      bool
-	summarize       func(context.Context, string, string) (string, error)
-	terminalContext context.Context
-	delay           time.Duration
-	editGap         time.Duration
-	terminalTimeout time.Duration
+	sender                 slackPresenterSender
+	channel                string
+	threadTS               string
+	progressOn             bool
+	summarize              func(context.Context, string, string) (string, error)
+	terminalContextFactory func(time.Duration) (context.Context, context.CancelFunc)
+	delay                  time.Duration
+	editGap                time.Duration
+	terminalTimeout        time.Duration
 
 	mu              sync.Mutex
 	calls           []slackPublicCall
@@ -299,11 +299,11 @@ func (p *slackPresenter) progressTimestamp() string {
 	return p.progressTS
 }
 
-func (p *slackPresenter) terminalParent() context.Context {
-	if p.terminalContext != nil {
-		return p.terminalContext
+func (p *slackPresenter) operationContext(budget time.Duration) (context.Context, context.CancelFunc) {
+	if p.terminalContextFactory != nil {
+		return p.terminalContextFactory(budget)
 	}
-	return context.Background()
+	return context.WithTimeout(context.Background(), budget)
 }
 
 func (p *slackPresenter) cleanup() bool {
@@ -311,7 +311,7 @@ func (p *slackPresenter) cleanup() bool {
 	if ts == "" {
 		return false
 	}
-	callCtx, cancel := context.WithTimeout(p.terminalParent(), slackProgressTimeout)
+	callCtx, cancel := p.operationContext(slackProgressTimeout)
 	defer cancel()
 	if err := p.sender.DeleteThreadMessageContext(callCtx, p.channel, ts); err != nil {
 		slog.Warn("server: Slack progress cleanup remains pending")
@@ -336,7 +336,7 @@ func (p *slackPresenter) standaloneNotice(body string, outcome slackTerminalOutc
 			return result
 		}
 	}
-	ctx, cancel := context.WithTimeout(p.terminalParent(), slackAnswerCallTimeout)
+	ctx, cancel := p.operationContext(slackAnswerCallTimeout)
 	defer cancel()
 	result.NoticeAttempted = true
 	if err := p.post(ctx, body); err != nil {
@@ -353,7 +353,7 @@ func (p *slackPresenter) editNotice(body string, outcome slackTerminalOutcome) s
 	if ts == "" {
 		return p.standaloneNotice(body, outcome)
 	}
-	ctx, cancel := context.WithTimeout(p.terminalParent(), slackAnswerCallTimeout)
+	ctx, cancel := p.operationContext(slackAnswerCallTimeout)
 	err := p.sender.EditThreadTextContext(ctx, p.channel, ts, body)
 	cancel()
 	if err == nil {
@@ -383,7 +383,7 @@ func (p *slackPresenter) Terminal(status *slackRunStatus, kind, model, answer st
 		defer p.mu.Unlock()
 		return p.result, false
 	}
-	ctx, cancel := context.WithTimeout(p.terminalParent(), p.terminalTimeout)
+	ctx, cancel := p.operationContext(p.terminalTimeout)
 	defer cancel()
 	var result slackTerminalResult
 	switch {
@@ -482,7 +482,7 @@ func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err
 			// Editing a known message cannot create another reply, even when
 			// acceptance of the standalone notice remains uncertain.
 			ts := p.progressTimestamp()
-			editCtx, cancel := context.WithTimeout(p.terminalParent(), slackAnswerCallTimeout)
+			editCtx, cancel := p.operationContext(slackAnswerCallTimeout)
 			editErr := p.sender.EditThreadTextContext(editCtx, p.channel, ts, body)
 			cancel()
 			result.CleanupPending = editErr != nil

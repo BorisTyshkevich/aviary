@@ -16,6 +16,9 @@ type IncomingMessage struct {
 	Channel        string // channel ID or name
 	ThreadTS       string // optional platform thread timestamp/root ID
 	IsThreadReply  bool   // true when the message is a reply inside a platform thread
+	IsGroup        bool   // trusted platform group/channel classification
+	WasMentioned   bool   // trusted platform mention signal
+	WasReplyToSelf bool   // trusted Signal quote-of-this-bot signal
 	Text           string
 	OriginalText   string // trusted, un-enriched text from the platform event
 	IsEdited       bool   // true when this event changes an existing message
@@ -101,4 +104,9 @@ type GroupChatLogger interface {
 // returns an opaque message ID that can later be edited.
 type ThreadMessageSender interface {
 	SendThreadMessageAndGetID(channel, threadTS, text string) (msgID string, err error)
+}
+
+// ContextThreadMessageSender sends a plain terminal notice with a deadline.
+type ContextThreadMessageSender interface {
+	SendThreadPlainTextContext(ctx context.Context, channel, threadTS, text string) error
 }

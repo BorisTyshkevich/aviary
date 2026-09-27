@@ -38,10 +38,10 @@ type AgentRunner struct {
 	cfg         *config.AgentConfig
 	provider    llm.Provider    // nil until Phase 5 wiring; falls back to stub
 	factory     providerFactory // used to create fallback providers on demand
-	stopCh      chan struct{}
 	mu          sync.Mutex
 	active      sync.WaitGroup
 	canceled    bool
+	runs        map[string]*runCancellation
 	connections *connections.Service
 	preparation *preparation.Engine
 }
@@ -57,7 +57,7 @@ func NewAgentRunner(a *domain.Agent, cfg *config.AgentConfig, provider llm.Provi
 		agent:    a,
 		cfg:      cfg,
 		provider: provider,
-		stopCh:   make(chan struct{}),
+		runs:     make(map[string]*runCancellation),
 	}
 	if factory != nil {
 		runner.factory = factory
@@ -80,28 +80,28 @@ type RunOverrides struct {
 
 // Prompt sends a message to the agent and fans out stream events to consumers.
 // Each call runs in its own goroutine; multiple concurrent calls are supported.
-func (r *AgentRunner) Prompt(ctx context.Context, message string, consumers ...StreamConsumer) {
-	r.promptCore(ctx, message, "", RunOverrides{}, "", "", true, consumers...)
+func (r *AgentRunner) Prompt(ctx context.Context, message string, consumers ...StreamConsumer) RunAdmission {
+	return r.promptCore(ctx, message, "", RunOverrides{}, "", "", true, consumers...)
 }
 
 // PromptMedia is like Prompt but also attaches an image to the user message.
 // mediaURL may be a data URL ("data:image/png;base64,...") or a remote URL.
 // Pass an empty string for text-only messages.
-func (r *AgentRunner) PromptMedia(ctx context.Context, message, mediaURL string, consumers ...StreamConsumer) {
-	r.promptCore(ctx, message, mediaURL, RunOverrides{}, "", "", true, consumers...)
+func (r *AgentRunner) PromptMedia(ctx context.Context, message, mediaURL string, consumers ...StreamConsumer) RunAdmission {
+	return r.promptCore(ctx, message, mediaURL, RunOverrides{}, "", "", true, consumers...)
 }
 
 // PromptMediaWithOverrides is like PromptMedia but also applies per-run
 // overrides for model, fallbacks, and tool permissions.
-func (r *AgentRunner) PromptMediaWithOverrides(ctx context.Context, message, mediaURL string, overrides RunOverrides, consumers ...StreamConsumer) {
-	r.promptCore(ctx, message, mediaURL, overrides, "", "", true, consumers...)
+func (r *AgentRunner) PromptMediaWithOverrides(ctx context.Context, message, mediaURL string, overrides RunOverrides, consumers ...StreamConsumer) RunAdmission {
+	return r.promptCore(ctx, message, mediaURL, overrides, "", "", true, consumers...)
 }
 
 // PromptWithOverrides is like Prompt but applies the provided overrides for
 // this call only. Model, Fallbacks, RestrictTools, and DisabledTools in overrides take
 // precedence over agent-level defaults when non-empty.
-func (r *AgentRunner) PromptWithOverrides(ctx context.Context, message string, overrides RunOverrides, consumers ...StreamConsumer) {
-	r.promptCore(ctx, message, "", overrides, "", "", true, consumers...)
+func (r *AgentRunner) PromptWithOverrides(ctx context.Context, message string, overrides RunOverrides, consumers ...StreamConsumer) RunAdmission {
+	return r.promptCore(ctx, message, "", overrides, "", "", true, consumers...)
 }
 
 // promptCore is the shared implementation for Prompt, PromptMedia, and
@@ -113,33 +113,50 @@ func (r *AgentRunner) promptCore(
 	promptMsgID, checkpointPath string,
 	persistUserMessage bool,
 	consumers ...StreamConsumer,
-) {
+) RunAdmission {
 	r.mu.Lock()
 	if r.canceled {
 		r.mu.Unlock()
-		for _, c := range consumers {
-			c(StreamEvent{Type: StreamEventStop, AgentID: r.agent.ID})
-		}
-		return
+		return RunAdmission{Status: AdmissionRejectedStopping}
+	}
+	runID := newID("run")
+	if checkpointPath == "" {
+		checkpointPath = store.CheckpointPath(r.agent.ID, runID)
+	} else {
+		// Recovery keeps the durable checkpoint as the run identity.
+		runID = strings.TrimSuffix(filepath.Base(checkpointPath), filepath.Ext(checkpointPath))
+	}
+	releaseLive, claimed := claimLiveCheckpoint(checkpointPath)
+	if !claimed {
+		r.mu.Unlock()
+		return RunAdmission{Status: AdmissionRejectedStopping}
 	}
 	turnCtx, release, err := r.reserveConnectionTurn(ctx)
-	if err != nil {
-		r.mu.Unlock()
-		for _, c := range consumers {
-			c(StreamEvent{Type: StreamEventError, AgentID: r.agent.ID, Err: err})
-		}
-		return
-	}
-	ctx = turnCtx
+	runCtx, cancel := context.WithCancelCause(turnCtx)
+	state := &runCancellation{ctx: runCtx, cancel: cancel}
+	r.runs[runID] = state
 	r.active.Add(1)
 	r.mu.Unlock()
+	admission := RunAdmission{Status: AdmissionAccepted, RunID: runID}
 
 	go func() {
-		defer r.active.Done()
-		defer release()
+		defer func() {
+			cancel(nil)
+			release()
+			r.mu.Lock()
+			delete(r.runs, runID)
+			r.mu.Unlock()
+			releaseLive()
+			r.active.Done()
+		}()
+		if err != nil {
+			for _, c := range consumers {
+				c(StreamEvent{Type: StreamEventError, AgentID: r.agent.ID, Err: err})
+			}
+			return
+		}
 
-		promptCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
+		promptCtx := runCtx
 
 		sessionID := r.resolveSessionID(promptCtx)
 		promptCtx = WithSessionID(promptCtx, sessionID)
@@ -147,8 +164,11 @@ func (r *AgentRunner) promptCore(
 		promptCtx = WithToolPolicy(promptCtx, func(name string) bool {
 			return len(r.filterTools([]ToolInfo{{Name: name}}, overrides.RestrictTools, overrides.DisabledTools)) != 0
 		})
-		untrack := trackSessionRun(r.agent.ID, sessionID, cancel)
+		untrack := trackSessionRun(r.agent.ID, sessionID, func() { state.stop(StopCauseUser) })
 		defer untrack()
+		if checkpointRetired(checkpointPath) {
+			state.stop(StopCauseUser)
+		}
 
 		// Effective model for this run.
 		effectiveModel := overrides.Model
@@ -232,45 +252,43 @@ func (r *AgentRunner) promptCore(
 		if sender, ok := SessionSenderFromContext(promptCtx); ok {
 			userSender = sender
 		}
+		persistedPromptID := promptMsgID
 		if persistUserMessage {
-			promptMsgID = r.appendSessionMessageWithSender(sessionID, domain.MessageRoleUser, message, mediaURL, effectiveModel, userSender)
+			persistedPromptID = r.appendSessionMessageWithSender(sessionID, domain.MessageRoleUser, message, mediaURL, effectiveModel, userSender)
 		}
 
 		slog.Info("agent: prompt started", "agent", r.agent.Name, "model", effectiveModel)
-
-		serverStoppedCh := make(chan struct{})
 
 		// Write checkpoints only for interactive prompts. Scheduled jobs already
 		// have queue-level retry semantics, and replaying their session checkpoints
 		// on every reconcile creates noisy duplicate recovery loops.
 		_, isScheduledTaskRun := TaskIDFromContext(promptCtx)
 		// The checkpoint is deleted at goroutine exit unless the server was stopped.
-		if checkpointPath == "" && promptMsgID != "" && !isScheduledTaskRun {
+		checkpointOwned := !persistUserMessage
+		var checkpointErr error
+		if persistUserMessage && persistedPromptID != "" && !isScheduledTaskRun {
 			cp := &RunCheckpoint{
-				AgentName: r.agent.Name,
-				SessionID: sessionID,
-				Message:   message,
-				MediaURL:  mediaURL,
-				Overrides: overrides,
-				CreatedAt: time.Now(),
+				AgentName:       r.agent.Name,
+				SessionID:       sessionID,
+				PromptMessageID: persistedPromptID,
+				Message:         message,
+				MediaURL:        mediaURL,
+				Overrides:       overrides,
+				CreatedAt:       time.Now(),
 			}
-			cpath := store.CheckpointPath(r.agent.ID, promptMsgID)
-			if err := store.WriteJSON(cpath, cp); err != nil {
-				slog.Warn("agent: failed to write run checkpoint", "agent", r.agent.Name, "err", err)
+			if checkpointErr = store.WriteJSON(checkpointPath, cp); checkpointErr != nil {
+				slog.Warn("agent: failed to write run checkpoint", "agent", r.agent.Name, "err", checkpointErr)
 			} else {
-				checkpointPath = cpath
+				checkpointOwned = true
 			}
 		}
 		// Delete checkpoint at goroutine exit unless the server stopped this runner
 		// (in which case the checkpoint is kept for recovery on restart).
 		defer func() {
-			if checkpointPath == "" {
+			if !checkpointOwned {
 				return
 			}
-			select {
-			case <-serverStoppedCh:
-				// Server-initiated stop: keep checkpoint for recovery on restart.
-			default:
+			if state.completedTerminal() || state.stopCause() != StopCauseRunner {
 				// Normal completion, user-stop, or provider error: remove checkpoint.
 				if err := store.DeleteJSON(checkpointPath); err != nil {
 					slog.Warn("agent: failed to delete run checkpoint", "agent", r.agent.Name, "err", err)
@@ -278,24 +296,22 @@ func (r *AgentRunner) promptCore(
 			}
 		}()
 
-		// Capture the cancellation channel before preparation adds context values.
-		turnDone := promptCtx.Done()
-		// Stop if stopCh is closed.
-		go func() {
-			select {
-			case <-r.stopCh:
-				close(serverStoppedCh)
-				cancel()
-			case <-turnDone:
-			}
-		}()
-
 		emit := func(e StreamEvent) {
+			if e.Type == StreamEventDone || e.Type == StreamEventError {
+				state.complete()
+			}
 			e.AgentID = r.agent.ID
 			e.Private = privateConnectionTurn(promptCtx)
+			if e.Type == StreamEventStop {
+				e.StopCause = state.stopCause()
+			}
 			for _, c := range consumers {
 				c(e)
 			}
+		}
+		if checkpointErr != nil {
+			emit(StreamEvent{Type: StreamEventError, Err: checkpointErr})
+			return
 		}
 		deliver := func(text string) {
 			if !overrides.SuppressDelivery {
@@ -305,7 +321,7 @@ func (r *AgentRunner) promptCore(
 
 		// Guard: if this message was already successfully answered (e.g. by a
 		// concurrent run or on a retry), do not process it again.
-		if promptMsgID != "" && HasMessageResponse(r.agent.ID, sessionID, promptMsgID) {
+		if persistedPromptID != "" && HasMessageResponse(r.agent.ID, sessionID, persistedPromptID) {
 			emit(StreamEvent{Type: StreamEventDone, AlreadyAnswered: true})
 			return
 		}
@@ -625,11 +641,11 @@ func (r *AgentRunner) promptCore(
 			}
 			slog.Info("agent: prompt done", "agent", r.agent.Name, "model", effectiveModel)
 			// Mark the user message as responded so it is never processed twice.
-			if promptMsgID != "" {
+			if persistedPromptID != "" {
 				if assistantMsgID == "" {
 					assistantMsgID = newID("resp")
 				}
-				if err := MarkMessageResponded(r.agent.ID, sessionID, promptMsgID, assistantMsgID); err != nil {
+				if err := MarkMessageResponded(r.agent.ID, sessionID, persistedPromptID, assistantMsgID); err != nil {
 					slog.Warn("agent: failed to mark message responded", "session", sessionID, "err", err)
 				}
 			}
@@ -654,10 +670,15 @@ func (r *AgentRunner) promptCore(
 		deliver(errMsg)
 		emit(StreamEvent{Type: StreamEventError, Err: fmt.Errorf("tool loop exceeded %d rounds", maxToolRounds)})
 	}()
+	return admission
 }
 
-func (r *AgentRunner) recoverPrompt(ctx context.Context, checkpointID, checkpointPath string, cp RunCheckpoint, consumers ...StreamConsumer) {
-	r.promptCore(ctx, cp.Message, cp.MediaURL, cp.Overrides, checkpointID, checkpointPath, false, consumers...)
+func (r *AgentRunner) recoverPrompt(ctx context.Context, checkpointID, checkpointPath string, cp RunCheckpoint, consumers ...StreamConsumer) RunAdmission {
+	promptMessageID := cp.PromptMessageID
+	if promptMessageID == "" {
+		promptMessageID = checkpointID
+	}
+	return r.promptCore(ctx, cp.Message, cp.MediaURL, cp.Overrides, promptMessageID, checkpointPath, false, consumers...)
 }
 
 func (r *AgentRunner) resolveSessionID(ctx context.Context) string {
@@ -1466,16 +1487,39 @@ func (r *AgentRunner) buildRulesPreamble() string {
 
 // Stop cancels all in-flight prompts for this agent.
 func (r *AgentRunner) Stop() {
+	r.stop(StopCauseRunner)
+}
+
+// StopByUser cancels current work at an explicit user's request while leaving
+// the runner available for later prompts.
+func (r *AgentRunner) StopByUser() {
+	r.mu.Lock()
+	for _, run := range r.runs {
+		run.stop(StopCauseUser)
+	}
+	r.mu.Unlock()
+}
+
+func (r *AgentRunner) stop(cause StopCause) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if !r.canceled {
 		r.canceled = true
-		close(r.stopCh)
+		for _, run := range r.runs {
+			run.stop(cause)
+		}
 	}
 }
 
 // Wait blocks until all active prompts finish.
 func (r *AgentRunner) Wait() { r.active.Wait() }
+
+// Stopping reports whether this runner has closed admission.
+func (r *AgentRunner) Stopping() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.canceled
+}
 
 // Agent returns the domain agent.
 func (r *AgentRunner) Agent() *domain.Agent { return r.agent }

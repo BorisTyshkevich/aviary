@@ -30,9 +30,11 @@ type slackConnectionIntake struct {
 	stopped            bool
 	startOnce          sync.Once
 	workers            sync.WaitGroup
+	queued             sync.WaitGroup
 	postConnectWorkers sync.WaitGroup
 	postConnectSlots   chan struct{}
 	workerCtx          context.Context
+	workerCancel       context.CancelFunc
 	queues             [4]chan func()
 }
 
@@ -47,7 +49,9 @@ func (i *slackConnectionIntake) start(ctx context.Context) {
 		return
 	}
 	i.startOnce.Do(func() {
-		i.workerCtx = ctx
+		// Acknowledged intake work outlives the socket receive context until
+		// the ingress handoff barrier has drained it.
+		i.workerCtx, i.workerCancel = context.WithCancel(context.WithoutCancel(ctx))
 		i.postConnectSlots = make(chan struct{}, 4)
 		for n := range i.queues {
 			queue := make(chan func(), 16)
@@ -57,12 +61,11 @@ func (i *slackConnectionIntake) start(ctx context.Context) {
 				defer i.workers.Done()
 				for {
 					select {
-					case <-ctx.Done():
+					case <-i.workerCtx.Done():
 						return
 					case work := <-queue:
-						if ctx.Err() == nil {
-							work()
-						}
+						work()
+						i.queued.Done()
 					}
 				}
 			}()
@@ -74,6 +77,10 @@ func (i *slackConnectionIntake) wait() {
 	i.startMu.Lock()
 	i.stopped = true
 	i.startMu.Unlock()
+	i.queued.Wait()
+	if i.workerCancel != nil {
+		i.workerCancel()
+	}
 	i.workers.Wait()
 	i.postConnectWorkers.Wait()
 }
@@ -99,11 +106,13 @@ func (i *slackConnectionIntake) enqueue(key string, work func()) bool {
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(key))
 	queue := i.queues[h.Sum32()%uint32(len(i.queues))]
+	i.queued.Add(1)
 	i.startMu.Unlock()
 	select {
 	case queue <- work:
 		return true
 	default:
+		i.queued.Done()
 		i.channel.logf("slack: connection task queue full")
 		return false
 	}

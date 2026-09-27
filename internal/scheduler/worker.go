@@ -14,7 +14,10 @@ import (
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
+	"github.com/lsegal/aviary/internal/store"
 )
+
+var errUnadmittedJob = errors.New("scheduled agent run was not admitted")
 
 const pollInterval = 5 * time.Second
 
@@ -26,6 +29,7 @@ type WorkerPool struct {
 	wg       sync.WaitGroup
 	stopOnce sync.Once
 	stop     chan struct{}
+	claimMu  sync.Mutex
 	ctxMu    sync.RWMutex
 	ctx      context.Context
 	deliver  func(agentName, route, text string) error
@@ -38,6 +42,7 @@ type activeJob struct {
 	agentID   string
 	sessionID string
 	cancel    context.CancelFunc
+	userStop  bool
 }
 
 // NewWorkerPool creates a WorkerPool with n concurrent workers.
@@ -68,8 +73,16 @@ func (p *WorkerPool) Start(ctx context.Context) {
 
 // Stop signals all workers to exit and waits for them.
 func (p *WorkerPool) Stop() {
-	p.stopOnce.Do(func() { close(p.stop) })
+	p.StopClaims()
 	p.wg.Wait()
+}
+
+// StopClaims closes admission to the queue without canceling work already
+// claimed. The claim lock makes return from this method a claim barrier.
+func (p *WorkerPool) StopClaims() {
+	p.claimMu.Lock()
+	p.stopOnce.Do(func() { close(p.stop) })
+	p.claimMu.Unlock()
 }
 
 func (p *WorkerPool) run(ctx context.Context) {
@@ -83,7 +96,15 @@ func (p *WorkerPool) run(ctx context.Context) {
 		default:
 		}
 
+		p.claimMu.Lock()
+		select {
+		case <-p.stop:
+			p.claimMu.Unlock()
+			return
+		default:
+		}
 		job, err := p.queue.Claim()
+		p.claimMu.Unlock()
 		if err != nil {
 			slog.Warn("worker: claim error", "err", err)
 		}
@@ -120,16 +141,21 @@ func (p *WorkerPool) ExecuteNow(job *domain.Job) {
 }
 
 func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
+	defer releaseLiveJob(store.JobPath(job.AgentID, job.ID))
 	jobCtx, cancel := context.WithCancel(ctx)
 	p.registerActiveJob(job.ID, job.TaskID, job.AgentID, cancel)
 	defer p.unregisterActiveJob(job.ID)
 
 	stopHeartbeat := make(chan struct{})
 	defer close(stopHeartbeat)
-	go p.heartbeatJob(jobCtx, job.ID, stopHeartbeat)
+	go p.heartbeatJob(job.ID, stopHeartbeat)
 
 	slog.Info("executing job", "id", job.ID, "task", job.TaskID, "agent", job.AgentID)
 	if err := p.executeJob(jobCtx, job); err != nil {
+		if errors.Is(err, errUnadmittedJob) {
+			p.finishUnadmittedJob(job.ID)
+			return
+		}
 		if errors.Is(err, context.Canceled) {
 			if cancelErr := p.queue.Cancel(job.ID); cancelErr != nil {
 				slog.Warn("marking job canceled", "id", job.ID, "err", cancelErr)
@@ -147,7 +173,24 @@ func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
 	}
 }
 
-func (p *WorkerPool) heartbeatJob(ctx context.Context, jobID string, stop <-chan struct{}) {
+// finishUnadmittedJob serializes rejection with StopJobs. Shutdown also
+// cancels the worker context, so that context alone cannot identify a user
+// request to cancel this durable job.
+func (p *WorkerPool) finishUnadmittedJob(jobID string) {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	job := p.active[jobID]
+	if job.userStop {
+		if err := p.queue.Cancel(jobID); err != nil {
+			slog.Warn("marking job canceled", "id", jobID, "err", err)
+		}
+	} else if err := p.queue.RequeueUnadmitted(jobID); err != nil {
+		slog.Warn("requeueing unadmitted job", "id", jobID, "err", err)
+	}
+	delete(p.active, jobID)
+}
+
+func (p *WorkerPool) heartbeatJob(jobID string, stop <-chan struct{}) {
 	ticker := time.NewTicker(lockHeartbeat)
 	defer ticker.Stop()
 
@@ -158,8 +201,6 @@ func (p *WorkerPool) heartbeatJob(ctx context.Context, jobID string, stop <-chan
 				slog.Warn("job: heartbeat failed", "id", jobID, "err", err)
 			}
 		case <-stop:
-			return
-		case <-ctx.Done():
 			return
 		}
 	}
@@ -219,12 +260,11 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 		prompt = "Continue the unfinished scheduled task from this existing session. Complete any remaining work for the original request:\n\n" + job.Prompt
 	}
 
-	var lastErr error
 	var reply strings.Builder
 	var logs jobLogBuilder
 	startedAt := time.Now().UTC()
-	done := make(chan struct{}, 1)
-	runner.Prompt(ctx, prompt, func(e agent.StreamEvent) {
+	terminal := make(chan error, 1)
+	admission := runner.Prompt(ctx, prompt, func(e agent.StreamEvent) {
 		switch e.Type {
 		case agent.StreamEventText:
 			reply.WriteString(e.Text)
@@ -232,25 +272,38 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 			logs.Addf("media: %s", e.MediaURL)
 		case agent.StreamEventDone, agent.StreamEventStop:
 			if e.Type == agent.StreamEventStop {
-				logs.Addf("stopped")
-			}
-			select {
-			case done <- struct{}{}:
-			default:
+				logs.Addf("stopped: %s", e.StopCause)
+				if e.StopCause == agent.StopCauseUser {
+					terminal <- context.Canceled
+				} else {
+					terminal <- fmt.Errorf("scheduled agent run stopped: %s", e.StopCause)
+				}
+			} else {
+				terminal <- nil
 			}
 		case agent.StreamEventError:
-			lastErr = e.Err
 			logs.Addf("error: %v", e.Err)
-			select {
-			case done <- struct{}{}:
-			default:
-			}
+			terminal <- e.Err
 		}
 	})
+	if admission.Status == agent.AdmissionRejectedStopping {
+		return fmt.Errorf("%w: agent %q is stopping", errUnadmittedJob, job.AgentID)
+	}
+	var lastErr error
 	select {
-	case <-done:
+	case lastErr = <-terminal:
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case lastErr = <-terminal:
+		default:
+			if runner.Stopping() {
+				// A replacement server must not reclaim this job while the
+				// accepted run still owns its terminal callback.
+				lastErr = <-terminal
+				break
+			}
+			return ctx.Err()
+		}
 	}
 	if sessionID != "" {
 		sessionLogs, err := collectJobSessionToolLogs(job.AgentID, sessionID, startedAt, time.Now().UTC().Add(time.Second))
@@ -358,6 +411,8 @@ func (p *WorkerPool) StopJobs(matcher func(jobID, taskID string) bool) int {
 		if job.cancel != nil {
 			job.cancel()
 		}
+		job.userStop = true
+		p.active[jobID] = job
 		stopped++
 	}
 	return stopped

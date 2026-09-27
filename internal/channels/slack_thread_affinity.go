@@ -256,6 +256,22 @@ func ignoreClaimedSlackReply(owner *slackThreadOwner, candidates []slackRouteCan
 
 func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intake *slackConnectionIntake,
 	msgFn func(agentName, channelType, configuredID string, ch Channel, msg IncomingMessage)) {
+	m.routeSlackMessageFor(ch, msg, intake, "", msgFn)
+}
+
+// routeSlackMessageFor applies the ordinary route decision. expectedKey limits
+// reload revalidation to the originally selected route without choosing another.
+func (m *Manager) routeSlackMessageFor(ch *SlackChannel, msg IncomingMessage, intake *slackConnectionIntake, expectedKey string,
+	msgFn func(agentName, channelType, configuredID string, ch Channel, msg IncomingMessage)) {
+	emit := func(candidate slackRouteCandidate, routed IncomingMessage) {
+		if expectedKey != "" && channelKey(candidate.spec.agentName, "slack", candidate.spec.channelConfig.ID) != expectedKey {
+			return
+		}
+		if intake != nil {
+			intake.ensureSetup(candidate.spec.agentName, routed)
+		}
+		msgFn(candidate.spec.agentName, "slack", candidate.spec.channelConfig.ID, candidate.ch, routed)
+	}
 	candidates := m.slackCandidates()
 	if strings.HasPrefix(msg.Channel, "D") {
 		for _, candidate := range candidates {
@@ -263,8 +279,7 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 				continue
 			}
 			if routed, ok := routedSlackMessageOriginal(ch, candidate.spec, msg, false); ok {
-				intake.ensureSetup(candidate.spec.agentName, routed)
-				msgFn(candidate.spec.agentName, "slack", candidate.spec.channelConfig.ID, ch, routed)
+				emit(candidate, routed)
 			}
 		}
 		return
@@ -312,6 +327,9 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 		if selected.ch != ch {
 			return
 		}
+		if expectedKey != "" && channelKey(selected.spec.agentName, "slack", selected.spec.channelConfig.ID) != expectedKey {
+			return
+		}
 		if !msg.IsEdited && owner == nil && config.BoolOr(selected.spec.channelConfig.ReplyToReplies, true) {
 			_, err = m.affinity.claim(slackThreadOwner{TeamID: ch.teamID, ChannelID: msg.Channel,
 				RootTS: msg.ThreadTS, BotUserID: ch.botUserID, AgentName: selected.spec.agentName,
@@ -321,8 +339,7 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 				return
 			}
 		}
-		intake.ensureSetup(selected.spec.agentName, routed)
-		msgFn(selected.spec.agentName, "slack", selected.spec.channelConfig.ID, ch, routed)
+		emit(selected, routed)
 		return
 	}
 	if len(addressed) > 0 {
@@ -340,8 +357,7 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 				continue
 			}
 			if routed, ok := routedSlackMessageOriginal(ch, candidate.spec, msg, true); ok {
-				intake.ensureSetup(candidate.spec.agentName, routed)
-				msgFn(candidate.spec.agentName, "slack", candidate.spec.channelConfig.ID, ch, routed)
+				emit(candidate, routed)
 			}
 		}
 		return
@@ -356,8 +372,7 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 			continue
 		}
 		if routed, ok := routedSlackMessageOriginal(ch, candidate.spec, msg, false); ok {
-			intake.ensureSetup(candidate.spec.agentName, routed)
-			msgFn(candidate.spec.agentName, "slack", candidate.spec.channelConfig.ID, ch, routed)
+			emit(candidate, routed)
 		}
 	}
 }

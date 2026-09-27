@@ -207,6 +207,11 @@ func (c *DiscordChannel) discordBotUserID() string {
 	return c.session.State.User.ID
 }
 
+func (c *DiscordChannel) routeIncoming(msg IncomingMessage, botUserID string) (IncomingMessage, bool) {
+	result := checkAllowed(c.allowFrom, msg.From, msg.Channel, msg.Text, msg.IsGroup, botUserID, msg.WasMentioned)
+	return applyAllowedIncoming(msg, result, c.disabledTools, c.model, c.fallbacks)
+}
+
 func (c *DiscordChannel) handleMessage(msg *discordgo.Message, botUserID string) bool {
 	if msg == nil || msg.Author == nil || msg.Author.Bot || (strings.TrimSpace(msg.Content) == "" && len(msg.Attachments) == 0) {
 		return false
@@ -243,8 +248,9 @@ func (c *DiscordChannel) handleMessage(msg *discordgo.Message, botUserID string)
 		}
 	}
 
-	result := checkAllowed(c.allowFrom, msg.Author.ID, msg.ChannelID, msg.Content, isGroup, botUserID, wasMentioned)
-	if !result.allowed {
+	im, allowed := c.routeIncoming(IncomingMessage{Type: "discord", From: msg.Author.ID, SenderName: senderName,
+		Channel: msg.ChannelID, Text: msg.Content, ReceivedAt: receivedAt, IsGroup: isGroup, WasMentioned: wasMentioned}, botUserID)
+	if !allowed {
 		c.logf("discord: ignored message from=%s channel=%s", msg.Author.ID, msg.ChannelID)
 		return false
 	}
@@ -253,25 +259,7 @@ func (c *DiscordChannel) handleMessage(msg *discordgo.Message, botUserID string)
 	fn := c.handler
 	c.handlerMu.RUnlock()
 	if fn != nil {
-		im := IncomingMessage{
-			Type:          "discord",
-			From:          msg.Author.ID,
-			SenderName:    senderName,
-			Channel:       msg.ChannelID,
-			Text:          msg.Content,
-			MediaURL:      mediaURL,
-			ReceivedAt:    receivedAt,
-			RestrictTools: result.restrictTools,
-			DisabledTools: c.disabledTools,
-			Model:         result.model,
-			Fallbacks:     result.fallbacks,
-		}
-		if im.Model == "" {
-			im.Model = c.model
-		}
-		if len(im.Fallbacks) == 0 {
-			im.Fallbacks = c.fallbacks
-		}
+		im.MediaURL = mediaURL
 		fn(im)
 	} else {
 		c.logf("discord: no message handler registered for from=%s", msg.Author.ID)

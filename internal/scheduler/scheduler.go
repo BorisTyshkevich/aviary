@@ -24,6 +24,7 @@ type Scheduler struct {
 	watch     *FileWatcher
 	agents    *agent.Manager
 	mu        sync.Mutex
+	stopping  bool
 	tasks     map[string]config.TaskConfig // task name → config snapshot
 	onceFired map[string]bool
 	timers    map[string]*time.Timer
@@ -63,12 +64,25 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 // Stop halts all scheduling and waits for workers to finish.
 func (s *Scheduler) Stop() {
+	s.StopClaims()
 	if s.cancel != nil {
 		s.cancel()
 	}
+	s.pool.Stop()
+}
+
+// StopClaims prevents workers from taking another queued job while already
+// claimed work continues. Shutdown calls this before draining channel ingress.
+func (s *Scheduler) StopClaims() {
+	s.mu.Lock()
+	s.stopping = true
+	for _, timer := range s.timers {
+		timer.Stop()
+	}
+	s.mu.Unlock()
 	s.cron.Stop()
 	s.watch.Stop()
-	s.pool.Stop()
+	s.pool.StopClaims()
 }
 
 // Reconcile idempotently applies the scheduler configuration from cfg.
@@ -76,6 +90,9 @@ func (s *Scheduler) Stop() {
 func (s *Scheduler) Reconcile(cfg *config.Config) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopping {
+		return
+	}
 
 	desired := make(map[string]struct{})
 	for _, ac := range cfg.Agents {
@@ -103,6 +120,11 @@ func (s *Scheduler) Reconcile(cfg *config.Config) {
 			script := tc.Prompt
 
 			enqueue := func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				if s.stopping {
+					return
+				}
 				if _, err := s.queue.EnqueueWithType(taskID, taskType, agentID, prompt, script, tc.Target, 0, "", ""); err != nil {
 					slog.Warn("scheduler: enqueue failed", "task", taskID, "err", err)
 				}
@@ -232,6 +254,9 @@ func (s *Scheduler) ListTasks() []domain.ScheduledTask {
 func (s *Scheduler) Trigger(name string) (*domain.Job, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.stopping {
+		return nil, fmt.Errorf("scheduler is stopping")
+	}
 
 	for key, tc := range s.tasks {
 		if key != name && tc.Name != name {
@@ -269,6 +294,11 @@ func (s *Scheduler) SetTaskOutputDelivery(fn func(agentName, route, text string)
 // RunJobNow force-starts an existing pending job immediately, bypassing queue
 // scheduling and worker-pool concurrency limits.
 func (s *Scheduler) RunJobNow(jobID string) (*domain.Job, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopping {
+		return nil, fmt.Errorf("scheduler is stopping")
+	}
 	job, err := s.queue.ForceStart(jobID)
 	if err != nil {
 		return nil, err

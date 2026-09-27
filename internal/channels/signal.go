@@ -249,11 +249,11 @@ type SignalChannel struct {
 	replyToReplies   bool // respond to quoted replies targeting agent's messages
 	sendReadReceipts bool // send read receipts for messages the agent will respond to
 
-	// daemon is set in managed mode; nil in external mode.
-	// It is the shared subprocess for this phone number.
+	// daemon is set in managed mode; nil in external mode. addrMu protects
+	// publication to callers that inspect the channel while Start is running.
 	daemon *sharedDaemon
 
-	// addr and addrMu are used in external mode only.
+	// addrMu also protects the external address.
 	addrMu sync.RWMutex
 	addr   string
 
@@ -310,12 +310,13 @@ func (c *SignalChannel) SetLogSink(s *LogSink) {
 // getAddr returns the current daemon TCP address. In managed mode it reads
 // from the shared daemon; in external mode it reads from the channel's own addr.
 func (c *SignalChannel) getAddr() string {
-	if c.daemon != nil {
-		return c.daemon.getAddr()
-	}
 	c.addrMu.RLock()
-	defer c.addrMu.RUnlock()
-	return c.addr
+	daemon, addr := c.daemon, c.addr
+	c.addrMu.RUnlock()
+	if daemon != nil {
+		return daemon.getAddr()
+	}
+	return addr
 }
 
 // ShowTyping reports whether the typing-indicator feature is enabled for this channel.
@@ -701,7 +702,9 @@ func (c *SignalChannel) Start(ctx context.Context) error {
 
 	// Managed mode: share one signal-cli daemon per phone number.
 	d := globalDaemonHub.acquire(c.phone)
+	c.addrMu.Lock()
 	c.daemon = d
+	c.addrMu.Unlock()
 	d.addSub(c)
 	d.once.Do(func() {
 		dCtx, cancel := context.WithCancel(ctx)
@@ -735,16 +738,19 @@ func (c *SignalChannel) DaemonInfo() *DaemonInfo {
 	if c.initAddr != "" {
 		return &DaemonInfo{Addr: c.initAddr, External: true}
 	}
-	if c.daemon == nil {
+	c.addrMu.RLock()
+	daemon := c.daemon
+	c.addrMu.RUnlock()
+	if daemon == nil {
 		return nil
 	}
-	c.daemon.procMu.RLock()
-	pid := c.daemon.procPID
-	started := c.daemon.procStarted
-	c.daemon.procMu.RUnlock()
+	daemon.procMu.RLock()
+	pid := daemon.procPID
+	started := daemon.procStarted
+	daemon.procMu.RUnlock()
 	// Return a non-nil DaemonInfo even when PID==0 so the daemons handler can
 	// deduplicate entries for channels sharing the same managed daemon.
-	return &DaemonInfo{PID: pid, Addr: c.daemon.getAddr(), Started: started}
+	return &DaemonInfo{PID: pid, Addr: daemon.getAddr(), Started: started}
 }
 
 // runLoop runs the reconnect loop against a known daemon address.
@@ -960,12 +966,12 @@ func (c *SignalChannel) dispatch(line []byte) {
 		dataMessage = env.EditMessage.DataMessage
 	}
 
-	isReplyToSelf := c.replyToReplies && c.phone != "" &&
+	wasReplyToSelf := c.phone != "" &&
 		dataMessage != nil &&
 		dataMessage.Quote != nil &&
 		dataMessage.Quote.Author == c.phone
 
-	c.dispatchEnvelope(env.Source, env.Timestamp, c.isMentioned(dataMessage), isReplyToSelf, dataMessage)
+	c.dispatchEnvelope(env.Source, env.Timestamp, c.isMentioned(dataMessage), wasReplyToSelf, dataMessage)
 }
 
 // fetchUUID calls listAccounts on the signal-cli daemon to discover and store
@@ -1021,7 +1027,15 @@ func (c *SignalChannel) isMentioned(dataMessage *signalDataMessage) bool {
 	return false
 }
 
-func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasMentioned bool, isReplyToSelf bool, dataMessage *signalDataMessage) {
+func (c *SignalChannel) routeIncoming(msg IncomingMessage) (IncomingMessage, bool) {
+	result := checkAllowed(c.allowFrom, msg.From, msg.Channel, msg.Text, msg.IsGroup, "", msg.WasMentioned)
+	if msg.WasReplyToSelf && c.replyToReplies {
+		result = checkAllowedReplyContinuation(c.allowFrom, msg.From, msg.Channel, msg.IsGroup)
+	}
+	return applyAllowedIncoming(msg, result, c.disabledTools, c.model, c.fallbacks)
+}
+
+func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasMentioned bool, wasReplyToSelf bool, dataMessage *signalDataMessage) {
 	if dataMessage == nil || (dataMessage.Message == "" && len(dataMessage.Attachments) == 0) {
 		return
 	}
@@ -1069,11 +1083,9 @@ func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasM
 	// Replies to the agent's own messages must still match an allowFrom entry's
 	// sender and group scope; replyToReplies only relaxes mention gating so the
 	// user can continue the same allowed conversation without re-mentioning.
-	result := checkAllowed(c.allowFrom, source, channelID, msgText, isGroup, "", wasMentioned)
-	if isReplyToSelf {
-		result = checkAllowedReplyContinuation(c.allowFrom, source, channelID, isGroup)
-	}
-	if !result.allowed {
+	im, allowed := c.routeIncoming(IncomingMessage{Type: "signal", From: source, SenderName: source, Channel: channelID,
+		Text: msgText, ReceivedAt: receivedAt, IsGroup: isGroup, WasMentioned: wasMentioned, WasReplyToSelf: wasReplyToSelf})
+	if !allowed {
 		return
 	}
 
@@ -1082,19 +1094,7 @@ func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasM
 	c.handlerMu.RUnlock()
 
 	if fn != nil {
-		im := IncomingMessage{
-			Type:          "signal",
-			From:          source,
-			SenderName:    source,
-			Channel:       channelID,
-			Text:          msgText,
-			MediaURL:      c.firstSignalImageDataURL(dataMessage.Attachments, source, channelID, isGroup),
-			ReceivedAt:    receivedAt,
-			RestrictTools: result.restrictTools,
-			DisabledTools: c.disabledTools,
-			Model:         result.model,
-			Fallbacks:     result.fallbacks,
-		}
+		im.MediaURL = c.firstSignalImageDataURL(dataMessage.Attachments, source, channelID, isGroup)
 		if dataMessage.Quote != nil {
 			im.QuoteAuthor = dataMessage.Quote.Author
 			qtext := dataMessage.Quote.Text
@@ -1102,12 +1102,6 @@ func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasM
 				qtext = strings.ReplaceAll(qtext, "\uFFFC", repl)
 			}
 			im.QuoteText = qtext
-		}
-		if im.Model == "" {
-			im.Model = c.model
-		}
-		if len(im.Fallbacks) == 0 {
-			im.Fallbacks = c.fallbacks
 		}
 		fn(im)
 		// Send a read receipt only after the message has been handed off.

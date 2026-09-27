@@ -15,6 +15,23 @@ type allowResult struct {
 	fallbacks     []string
 }
 
+func applyAllowedIncoming(msg IncomingMessage, result allowResult, disabledTools []string, model string, fallbacks []string) (IncomingMessage, bool) {
+	if !result.allowed {
+		return IncomingMessage{}, false
+	}
+	msg.RestrictTools = result.restrictTools
+	msg.DisabledTools = disabledTools
+	msg.Model = result.model
+	msg.Fallbacks = result.fallbacks
+	if msg.Model == "" {
+		msg.Model = model
+	}
+	if len(msg.Fallbacks) == 0 {
+		msg.Fallbacks = fallbacks
+	}
+	return msg, true
+}
+
 // checkAllowed applies allowFrom rules to an incoming message and returns
 // whether the message should be forwarded, along with any per-entry tool
 // restrictions.

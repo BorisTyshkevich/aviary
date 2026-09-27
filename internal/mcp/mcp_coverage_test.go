@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/lsegal/aviary/internal/browser"
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/domain"
+	"github.com/lsegal/aviary/internal/llm"
 	"github.com/lsegal/aviary/internal/scheduler"
 	"github.com/lsegal/aviary/internal/store"
 )
@@ -91,7 +94,10 @@ func TestAgentStop_FoundAndStopped(t *testing.T) {
 
 	mgr := agent.NewManager(nil)
 	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "test/x"}}})
+	assert.NoError(t, mgr.Drain(context.Background()))
 	SetDeps(&Deps{Agents: mgr})
+	stale := store.CheckpointPath("bot", "old-run")
+	assert.NoError(t, store.WriteJSON(stale, agent.RunCheckpoint{AgentName: "bot", SessionID: "old-session", Message: "fake request"}))
 
 	d := NewDispatcher("https://localhost:16677", "")
 
@@ -99,6 +105,7 @@ func TestAgentStop_FoundAndStopped(t *testing.T) {
 	out, err := d.CallTool(context.Background(), "agent_stop", map[string]any{"name": "bot"})
 	assert.NoError(t, err)
 	assert.True(t, strings.Contains(out, "stopped"))
+	assert.NoFileExists(t, stale, "explicit agent stop must prevent stale request replay")
 
 	// stop unknown agent
 	toolCallContains(t, d, "agent_stop", map[string]any{"name": "unknown-agent"}, "not found")
@@ -1290,6 +1297,92 @@ func TestAgentRun_AgentNotFound(t *testing.T) {
 
 	d := NewDispatcher("https://localhost:16677", "")
 	toolCallContains(t, d, "agent_run", map[string]any{"name": "unknown", "message": "hello"}, "not found")
+}
+
+func TestAgentRun_StoppedRunnerReturnsWithoutWaiting(t *testing.T) {
+	old := GetDeps()
+	t.Cleanup(func() { SetDeps(old) })
+	prevChecker := checkServerRunning
+	t.Cleanup(func() { checkServerRunning = prevChecker })
+	SetServerChecker(func() bool { return false })
+
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "test/x"}}})
+	runner, ok := mgr.Get("bot")
+	require.True(t, ok)
+	runner.Stop()
+	SetDeps(&Deps{Agents: mgr})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, err := NewDispatcher("https://localhost:16677", "").CallTool(ctx, "agent_run", map[string]any{
+		"name": "bot", "message": "hello",
+	})
+	if err != nil {
+		require.ErrorContains(t, err, "restarting")
+	} else {
+		require.Contains(t, out, "restarting")
+	}
+	require.NoError(t, ctx.Err(), "rejected admission left MCP waiting for a callback")
+}
+
+func TestAgentRun_AcceptedRunnerStopDoesNotAskClientToRetry(t *testing.T) {
+	store.SetDataDir(t.TempDir())
+	t.Cleanup(func() { store.SetDataDir("") })
+	require.NoError(t, store.EnsureDirs())
+	old := GetDeps()
+	t.Cleanup(func() { SetDeps(old) })
+	started := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	defer close(releaseProvider)
+	providerServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(started)
+		select {
+		case <-request.Context().Done():
+		case <-releaseProvider:
+		}
+	}))
+	t.Cleanup(providerServer.Close)
+	factory := llm.NewFactory(func(string) (string, error) { return "", nil }).WithProviderOptionsResolver(func(provider string) (llm.ProviderOptions, bool) {
+		if provider != "vllm" {
+			return llm.ProviderOptions{}, false
+		}
+		return llm.ProviderOptions{BaseURI: providerServer.URL}, true
+	})
+	mgr := agent.NewManager(factory)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test-model"}}})
+	SetDeps(&Deps{Agents: mgr})
+	client, err := NewInProcessClient(context.Background(), NewServer())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	result := make(chan string, 1)
+	go func() {
+		response, callErr := client.CallTool(context.Background(), "agent_run", map[string]any{"name": "bot", "message": "fake request"})
+		if callErr != nil {
+			result <- callErr.Error()
+			return
+		}
+		result <- extractText(response)
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("accepted MCP run did not reach provider")
+	}
+	runner, ok := mgr.Get("bot")
+	require.True(t, ok)
+	runner.Stop()
+	select {
+	case outcome := <-result:
+		require.Contains(t, outcome, "recovery will resume the accepted request")
+		require.NotContains(t, outcome, "retry the request")
+	case <-time.After(3 * time.Second):
+		t.Fatal("MCP run did not report runner stop")
+	}
+	runner.Wait()
+	entries, err := os.ReadDir(store.CheckpointDir("bot"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "accepted run remains available for recovery")
 }
 
 // ── job_run_now with nil scheduler ────────────────────────────────────────────

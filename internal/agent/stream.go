@@ -56,6 +56,7 @@ type StreamEvent struct {
 	AlreadyAnswered bool             // StreamEventDone is a no-op for an already answered prompt
 	MediaURL        string           // set for StreamEventMedia (image data URL or remote URL)
 	Err             error            // set for StreamEventError
+	StopCause       StopCause        // set for StreamEventStop
 }
 
 // StreamConsumer receives StreamEvents.

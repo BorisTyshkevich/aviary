@@ -3,6 +3,9 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +17,7 @@ import (
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/domain"
+	"github.com/lsegal/aviary/internal/llm"
 	"github.com/lsegal/aviary/internal/store"
 )
 
@@ -169,6 +173,72 @@ func TestJobQueue_RecoverStuck_RecoversRecentInProgress(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, domain.JobStatusPending, recovered.Status)
 	assert.Nil(t, recovered.LockedAt)
+}
+
+func TestJobQueue_NewInstanceDoesNotRecoverLiveClaim(t *testing.T) {
+	setupSchedulerDataDir(t)
+	first := NewJobQueue()
+	job, err := first.Enqueue("alpha/daily", "alpha", "run", "", 3, "", "")
+	assert.NoError(t, err)
+	claimed, err := first.Claim()
+	assert.NoError(t, err)
+	assert.Equal(t, job.ID, claimed.ID)
+
+	second := NewJobQueue()
+	second.RecoverStuck()
+	saved, err := store.ReadJSON[domain.Job](store.JobPath(job.AgentID, job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusInProgress, saved.Status)
+	assert.Equal(t, 1, saved.Attempts)
+	duplicate, err := second.Claim()
+	assert.NoError(t, err)
+	assert.Nil(t, duplicate, "a second scheduler must not reclaim a live job")
+
+	assert.NoError(t, first.Fail(job.ID, errors.New("runner stopped")))
+	saved, err = store.ReadJSON[domain.Job](store.JobPath(job.AgentID, job.ID))
+	assert.NoError(t, err)
+	saved.NextRetryAt = nil
+	assert.NoError(t, store.WriteJSON(store.JobPath(job.AgentID, job.ID), &saved))
+	retried, err := second.Claim()
+	assert.NoError(t, err)
+	assert.Equal(t, job.ID, retried.ID)
+	assert.Equal(t, 2, retried.Attempts)
+	assert.NoError(t, second.Cancel(job.ID))
+}
+
+func TestWorkerPool_StopClaimsIsAdmissionBarrier(t *testing.T) {
+	setupSchedulerDataDir(t)
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("alpha/daily", "alpha", "run", "", 3, "", "")
+	assert.NoError(t, err)
+	pool := NewWorkerPool(queue, agent.NewManager(nil), 1)
+	pool.StopClaims()
+	pool.StopClaims()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pool.Start(ctx)
+	pool.Stop()
+	saved, err := store.ReadJSON[domain.Job](store.JobPath(job.AgentID, job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
+	assert.Zero(t, saved.Attempts)
+	assert.NoError(t, ctx.Err(), "quiescing claims does not cancel admitted work")
+}
+
+func TestScheduler_StopClaimsRejectsManualStarts(t *testing.T) {
+	setupSchedulerDataDir(t)
+	s, err := New(agent.NewManager(nil), 1)
+	assert.NoError(t, err)
+	job, err := s.Queue().Enqueue("alpha/daily", "alpha", "run", "", 3, "", "")
+	assert.NoError(t, err)
+	s.StopClaims()
+	_, err = s.RunJobNow(job.ID)
+	assert.ErrorContains(t, err, "stopping")
+	_, err = s.Trigger("alpha/daily")
+	assert.ErrorContains(t, err, "stopping")
+	saved, err := store.ReadJSON[domain.Job](store.JobPath(job.AgentID, job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
 }
 
 func TestJobQueue_RecoverStuck_ExhaustedJobFailsInsteadOfRequeueing(t *testing.T) {
@@ -536,6 +606,127 @@ func TestWorkerPool_ExecuteJob(t *testing.T) {
 	err = p.executeJob(context.Background(), &domain.Job{AgentID: "alpha", Prompt: "hello"})
 	assert.NoError(t, err)
 
+}
+
+func TestWorkerPool_RejectedRunnerDoesNotWaitForCallback(t *testing.T) {
+	setupSchedulerDataDir(t)
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	runner.Stop()
+	p := NewWorkerPool(NewJobQueue(), mgr, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := p.executeJob(ctx, &domain.Job{ID: "job_rejected", AgentID: "alpha", TaskID: "task/alpha", Prompt: "hello"})
+	assert.ErrorContains(t, err, "stopping")
+	assert.NoError(t, ctx.Err(), "rejected admission left the job waiting for a callback")
+}
+
+func TestWorkerPool_RejectedAdmissionDoesNotSpendRetry(t *testing.T) {
+	setupSchedulerDataDir(t)
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	runner.Stop()
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("task/alpha", "alpha", "hello", "", 1, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	assert.Equal(t, job.ID, claimed.ID)
+	assert.Equal(t, 1, claimed.Attempts)
+	p := NewWorkerPool(queue, mgr, 1)
+	p.processJob(context.Background(), claimed)
+	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
+	assert.Zero(t, saved.Attempts)
+	assert.NotNil(t, saved.NextRetryAt)
+}
+
+func TestWorkerPool_ShutdownCanceledParentRequeuesUnadmittedJob(t *testing.T) {
+	setupSchedulerDataDir(t)
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	runner.Stop()
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("task/alpha", "alpha", "hello", "", 1, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	NewWorkerPool(queue, mgr, 1).processJob(ctx, claimed)
+	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
+	assert.Zero(t, saved.Attempts)
+}
+
+func TestWorkerPool_ExplicitStopCancelsUnadmittedJob(t *testing.T) {
+	setupSchedulerDataDir(t)
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("task/alpha", "alpha", "hello", "", 1, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	pool := NewWorkerPool(queue, agent.NewManager(nil), 1)
+	pool.registerActiveJob(job.ID, claimed.TaskID, claimed.AgentID, func() {})
+	assert.Equal(t, 1, pool.StopJobs(nil))
+	pool.finishUnadmittedJob(job.ID)
+	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusCanceled, saved.Status)
+}
+
+func TestWorkerPool_AcceptedRunnerStopRetainsRetry(t *testing.T) {
+	setupSchedulerDataDir(t)
+	modelEntered := make(chan struct{}, 1)
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"id\":\"test\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n")
+		w.(http.Flusher).Flush()
+		modelEntered <- struct{}{}
+		<-r.Context().Done()
+	}))
+	defer model.Close()
+	mgr := agent.NewManager(llm.NewFactory(func(string) (string, error) { return "fake-token", nil }).WithProviderOptionsResolver(func(provider string) (llm.ProviderOptions, bool) {
+		return llm.ProviderOptions{BaseURI: model.URL}, provider == "vllm"
+	}))
+	mgr.Reconcile(&config.Config{
+		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+		Agents: []config.AgentConfig{{Name: "alpha", Model: "vllm/test"}},
+	})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("alpha/daily", "alpha", "run", "", 2, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	pool := NewWorkerPool(queue, mgr, 1)
+	done := make(chan struct{})
+	go func() { pool.processJob(context.Background(), claimed); close(done) }()
+	select {
+	case <-modelEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("accepted model request did not start")
+	}
+	runner.Stop()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stopped run did not settle its queue job")
+	}
+	saved, err := store.ReadJSON[domain.Job](store.JobPath(job.AgentID, job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
+	assert.Equal(t, 1, saved.Attempts)
+	assert.NotNil(t, saved.NextRetryAt)
 }
 
 func TestWorkerPool_ExecuteJob_RepliesToSessionDelivery(t *testing.T) {

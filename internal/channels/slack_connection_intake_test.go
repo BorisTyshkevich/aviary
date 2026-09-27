@@ -744,7 +744,7 @@ func TestSlackConnectionIntakeDoesNotBlockSocketEventLoop(t *testing.T) {
 	}
 }
 
-func TestClassifiedReplyLookupCancelsWithIntake(t *testing.T) {
+func TestClassifiedReplyLookupDrainsAfterSocketCancellation(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
@@ -755,7 +755,9 @@ func TestClassifiedReplyLookupCancelsWithIntake(t *testing.T) {
 		}
 	}))
 	defer server.Close()
-	defer close(release)
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
 	ch := NewSlackChannel("xapp-fake", "xoxb-fake", nil, "", nil)
 	ch.client = slack.New("xoxb-fake", slack.OptionAPIURL(server.URL+"/"))
 	intake := &slackConnectionIntake{channel: ch}
@@ -779,7 +781,13 @@ func TestClassifiedReplyLookupCancelsWithIntake(t *testing.T) {
 	go func() { intake.wait(); close(done) }()
 	select {
 	case <-done:
+		t.Fatal("acknowledged lookup was discarded before handoff")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("classified reply lookup delayed intake shutdown")
+		t.Fatal("classified reply lookup did not finish after release")
 	}
 }

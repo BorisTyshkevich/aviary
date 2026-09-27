@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -32,6 +33,9 @@ type ChannelStatus struct {
 // Manager manages channel lifecycle across all agents.
 type Manager struct {
 	mu                  sync.Mutex
+	reconcileMu         sync.Mutex
+	stopped             bool
+	quiescing           bool
 	channels            map[string]Channel // key: agentName+"/"+channelType+"/"+channelID
 	cancels             map[string]context.CancelFunc
 	startTimes          map[string]time.Time
@@ -46,6 +50,10 @@ type Manager struct {
 	credentialValidator func(context.Context, connections.Target, connections.Credential) error
 	postConnect         func(context.Context, connections.Target, connections.Principal, bool) (string, error)
 }
+
+// ErrSlackSocketOpen means a replacement Server must not open a new Socket Mode
+// connection yet; the old connection's close was not observed within budget.
+var ErrSlackSocketOpen = errors.New("old Slack socket closure unconfirmed")
 
 // SetConnectionService enables deterministic Slack connection setup. It must be
 // called before Reconcile starts channels.
@@ -116,8 +124,19 @@ func NewManager() *Manager {
 // The ch argument passed to msgFn is the channel the message arrived on; it may
 // implement optional interfaces such as TypingSender.
 func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(agentName, channelType, configuredID string, ch Channel, msg IncomingMessage)) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if m.stopped || m.quiescing {
+		m.mu.Unlock()
+		return
+	}
+	type pendingSlackStart struct {
+		key   string
+		specs []channelSpec
+	}
+	retiringSlack := make(map[string]*sharedSlackChannel)
+	var pendingSlack []pendingSlackStart
 
 	state, err := store.ReadAppState()
 	if err != nil {
@@ -187,7 +206,7 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 
 	for connKey, specs := range desiredSlack {
 		existing := m.slack[connKey]
-		if existing != nil && reflect.DeepEqual(existing.specs, specs) {
+		if existing != nil && existing.ch.ingressOpen() && reflect.DeepEqual(existing.specs, specs) {
 			for _, spec := range specs {
 				key := channelKey(spec.agentName, spec.channelConfig.Type, spec.channelConfig.ID)
 				m.channels[key] = existing.ch
@@ -198,17 +217,14 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 			continue
 		}
 		if existing != nil {
-			m.stopSharedSlackLocked(connKey)
+			retiringSlack[connKey] = existing
 		}
-		if err := m.startSharedSlackLocked(ctx, connKey, specs, msgFn); err != nil {
-			slog.Warn("channel start failed", "key", connKey, "err", err)
-		}
+		pendingSlack = append(pendingSlack, pendingSlackStart{connKey, specs})
 	}
 
 	for connKey := range m.slack {
 		if _, ok := desiredSlack[connKey]; !ok {
-			m.stopSharedSlackLocked(connKey)
-			slog.Info("channel stopped", "key", connKey)
+			retiringSlack[connKey] = m.slack[connKey]
 		}
 	}
 
@@ -216,11 +232,7 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 	for key := range m.channels {
 		if _, ok := desired[key]; !ok {
 			if _, isSlackAlias := m.slackAlias[key]; isSlackAlias {
-				delete(m.channels, key)
-				delete(m.sinks, key)
-				delete(m.startTimes, key)
-				delete(m.errors, key)
-				delete(m.slackAlias, key)
+				// Keep the old route until acknowledged handlers finish handoff.
 				continue
 			}
 			m.stopChannelLocked(key)
@@ -228,23 +240,79 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 			slog.Info("channel stopped", "key", key)
 		}
 	}
+	m.mu.Unlock()
+	for _, shared := range retiringSlack {
+		shared.ch.Stop()
+	}
+	waitCtx, waitCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+	defer waitCancel()
+	ready := make(map[string]bool, len(retiringSlack))
+	failures := make(map[string]error)
+	for connKey, shared := range retiringSlack {
+		if err := shared.ch.WaitSocketClosed(waitCtx); err != nil {
+			failures[connKey] = fmt.Errorf("old Slack socket did not close: %w", err)
+			continue
+		}
+		if err := shared.ch.WaitIngress(waitCtx); err != nil {
+			failures[connKey] = fmt.Errorf("slack ingress handoff incomplete: %w", err)
+			continue
+		}
+		ready[connKey] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped || m.quiescing {
+		return
+	}
+	for connKey, shared := range retiringSlack {
+		if !ready[connKey] {
+			err := failures[connKey]
+			slog.Warn("channel: Slack replacement deferred", "key", connKey, "err", err)
+			for _, key := range shared.keys {
+				m.errors[key] = err.Error()
+			}
+			continue
+		}
+		m.stopSharedSlackLocked(connKey)
+		if _, desired := desiredSlack[connKey]; !desired {
+			slog.Info("channel stopped", "key", connKey)
+		}
+	}
+	for _, pending := range pendingSlack {
+		if _, failed := failures[pending.key]; failed {
+			continue
+		}
+		if err := m.startSharedSlackLocked(ctx, pending.key, pending.specs, msgFn); err != nil {
+			slog.Warn("channel start failed", "key", pending.key, "err", err)
+		}
+	}
 }
 
 // Stop halts all channels.
 func (m *Manager) Stop() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.quiescing = true
+	m.stopped = true
+	channels := make([]Channel, 0, len(m.channels))
+	cancels := make([]context.CancelFunc, 0, len(m.cancels))
 	stopped := map[Channel]struct{}{}
 	for key, ch := range m.channels {
+		if cancel := m.cancels[key]; cancel != nil {
+			cancels = append(cancels, cancel)
+		}
 		if _, ok := stopped[ch]; ok {
 			continue
 		}
 		stopped[ch] = struct{}{}
-		ch.Stop()
-		if cancel := m.cancels[key]; cancel != nil {
-			cancel()
+		channels = append(channels, ch)
+	}
+	m.mu.Unlock()
+	for _, ch := range channels {
+		if _, ok := ch.(*SlackChannel); ok {
+			ch.Stop() // close the acknowledgement gate before clearing routes
 		}
 	}
+	m.mu.Lock()
 	m.channels = make(map[string]Channel)
 	m.cancels = make(map[string]context.CancelFunc)
 	m.startTimes = make(map[string]time.Time)
@@ -253,6 +321,44 @@ func (m *Manager) Stop() {
 	m.specs = make(map[string]channelSpec)
 	m.slack = make(map[string]*sharedSlackChannel)
 	m.slackAlias = make(map[string]string)
+	m.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, ch := range channels {
+		ch.Stop()
+	}
+}
+
+// QuiesceSlack closes Socket Mode first, then waits for acknowledged handlers
+// to finish handing work to the runner. Outgoing Web API clients stay usable.
+func (m *Manager) QuiesceSlack(ctx context.Context) error {
+	m.mu.Lock()
+	m.quiescing = true
+	seen := make(map[*SlackChannel]struct{})
+	channels := make([]*SlackChannel, 0, len(m.slack))
+	for _, shared := range m.slack {
+		if _, ok := seen[shared.ch]; ok {
+			continue
+		}
+		seen[shared.ch] = struct{}{}
+		channels = append(channels, shared.ch)
+	}
+	m.mu.Unlock()
+	for _, ch := range channels {
+		ch.Stop()
+	}
+	for _, ch := range channels {
+		if err := ch.WaitSocketClosed(ctx); err != nil {
+			return fmt.Errorf("%w: %v", ErrSlackSocketOpen, err)
+		}
+	}
+	for _, ch := range channels {
+		if err := ch.WaitIngress(ctx); err != nil {
+			return fmt.Errorf("slack ingress handoff: %w", err)
+		}
+	}
+	return nil
 }
 
 // SubscribeLogs returns a log subscription for the given daemon key.
@@ -271,7 +377,13 @@ func (m *Manager) SubscribeLogs(key string) (history []string, live <-chan strin
 
 // Restart recreates and restarts a configured channel instance in place.
 func (m *Manager) Restart(ctx context.Context, key string, msgFn func(agentName, channelType, configuredID string, ch Channel, msg IncomingMessage)) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
 	m.mu.Lock()
+	if m.stopped || m.quiescing {
+		m.mu.Unlock()
+		return fmt.Errorf("channels are stopping")
+	}
 	spec, ok := m.specs[key]
 	if !ok {
 		m.mu.Unlock()
@@ -284,6 +396,32 @@ func (m *Manager) Restart(ctx context.Context, key string, msgFn func(agentName,
 			return fmt.Errorf("configured channel %q not active", key)
 		}
 		specs := append([]channelSpec{}, shared.specs...)
+		old := shared.ch
+		m.mu.Unlock()
+		old.Stop()
+		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+		defer cancel()
+		if err := old.WaitSocketClosed(waitCtx); err != nil {
+			m.mu.Lock()
+			for _, alias := range shared.keys {
+				m.errors[alias] = err.Error()
+			}
+			m.mu.Unlock()
+			return fmt.Errorf("closing old Slack socket: %w", err)
+		}
+		if err := old.WaitIngress(waitCtx); err != nil {
+			m.mu.Lock()
+			for _, alias := range shared.keys {
+				m.errors[alias] = err.Error()
+			}
+			m.mu.Unlock()
+			return fmt.Errorf("slack ingress handoff incomplete: %w", err)
+		}
+		m.mu.Lock()
+		if m.stopped || m.quiescing {
+			m.mu.Unlock()
+			return fmt.Errorf("channels are stopping")
+		}
 		m.stopSharedSlackLocked(connKey)
 		err := m.startSharedSlackLocked(ctx, connKey, specs, msgFn)
 		m.mu.Unlock()
@@ -581,14 +719,9 @@ func (m *Manager) stopSharedSlackLocked(connKey string) {
 // RouteDelivery sends text to channelID via any running channel of channelType.
 // It tries all matching channels and returns on the first success.
 func (m *Manager) RouteDelivery(channelType, channelID, text string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	channels := m.snapshotChannelsOfType(channelType)
 	var lastErr error
-	for key, ch := range m.channels {
-		parts := strings.SplitN(key, "/", 3)
-		if len(parts) != 3 || parts[1] != channelType {
-			continue
-		}
+	for _, ch := range channels {
 		if err := ch.Send(channelID, text); err != nil {
 			lastErr = err
 		} else {
@@ -601,14 +734,27 @@ func (m *Manager) RouteDelivery(channelType, channelID, text string) error {
 	return fmt.Errorf("no active channel of type %q", channelType)
 }
 
+func (m *Manager) snapshotChannelsOfType(channelType string) []Channel {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var channels []Channel
+	for key, ch := range m.channels {
+		parts := strings.SplitN(key, "/", 3)
+		if len(parts) != 3 || parts[1] != channelType {
+			continue
+		}
+		channels = append(channels, ch)
+	}
+	return channels
+}
+
 // SendOnConfiguredChannel sends text using a specific configured channel
 // instance identified by agentName/channelType/configuredID.
 func (m *Manager) SendOnConfiguredChannel(agentName, channelType, configuredID, channelID, text string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	key := channelKey(agentName, channelType, configuredID)
 	ch, ok := m.channels[key]
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("configured channel %q not active", key)
 	}
@@ -619,10 +765,9 @@ func (m *Manager) SendOnConfiguredChannel(agentName, channelType, configuredID, 
 // specific configured channel instance.
 func (m *Manager) SendThreadOnConfiguredChannel(agentName, channelType, configuredID, channelID, threadTS, text string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	key := channelKey(agentName, channelType, configuredID)
 	ch, ok := m.channels[key]
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("configured channel %q not active", key)
 	}
@@ -634,14 +779,64 @@ func (m *Manager) SendThreadOnConfiguredChannel(agentName, channelType, configur
 	return err
 }
 
+// RevalidateRoutedMessage checks the selected route once after a runner
+// rejected admission during config reload. It never selects a different agent.
+func (m *Manager) RevalidateRoutedMessage(agentName, channelType, configuredID string, msg IncomingMessage) (Channel, IncomingMessage, bool) {
+	key := channelKey(agentName, channelType, configuredID)
+	m.mu.Lock()
+	spec, configured := m.specs[key]
+	ch := m.channels[key]
+	m.mu.Unlock()
+	if !configured || ch == nil || !shouldProcessIncomingMessage(spec.metadata, msg) {
+		return nil, IncomingMessage{}, false
+	}
+	switch channelType {
+	case "signal":
+		signalCh, ok := ch.(*SignalChannel)
+		if !ok {
+			return nil, IncomingMessage{}, false
+		}
+		routed, allowed := signalCh.routeIncoming(msg)
+		return ch, routed, allowed
+	case "discord":
+		discordCh, ok := ch.(*DiscordChannel)
+		if !ok {
+			return nil, IncomingMessage{}, false
+		}
+		routed, allowed := discordCh.routeIncoming(msg, discordCh.discordBotUserID())
+		return ch, routed, allowed
+	case "slack":
+		// The full Slack selector below checks ownership, mention paths,
+		// reply policy and ambiguity against every current route.
+	default:
+		return nil, IncomingMessage{}, false
+	}
+	slackCh, ok := ch.(*SlackChannel)
+	if !ok {
+		return nil, IncomingMessage{}, false
+	}
+	botID, teamID := slackCh.affinityIdentity()
+	if botID == "" || teamID == "" || botID != msg.InstallationID || teamID != msg.WorkspaceID {
+		return nil, IncomingMessage{}, false
+	}
+	var routed IncomingMessage
+	allowed := false
+	m.routeSlackMessageFor(slackCh, msg, nil, key, func(_, _, _ string, _ Channel, selected IncomingMessage) {
+		routed, allowed = selected, true
+	})
+	if !allowed {
+		return nil, IncomingMessage{}, false
+	}
+	return ch, routed, true
+}
+
 // SendMediaOnConfiguredChannel sends a media file using a specific configured
 // channel instance identified by agentName/channelType/configuredID.
 func (m *Manager) SendMediaOnConfiguredChannel(agentName, channelType, configuredID, channelID, caption, filePath string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	key := channelKey(agentName, channelType, configuredID)
 	ch, ok := m.channels[key]
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("configured channel %q not active", key)
 	}
@@ -656,14 +851,9 @@ func (m *Manager) SendMediaOnConfiguredChannel(agentName, channelType, configure
 // of channelType that implements MediaSender. Returns an error if no matching
 // channel supports media or all attempts fail.
 func (m *Manager) RouteMediaDelivery(channelType, channelID, caption, filePath string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	channels := m.snapshotChannelsOfType(channelType)
 	var lastErr error
-	for key, ch := range m.channels {
-		parts := strings.SplitN(key, "/", 3)
-		if len(parts) != 3 || parts[1] != channelType {
-			continue
-		}
+	for _, ch := range channels {
 		ms, ok := ch.(MediaSender)
 		if !ok {
 			continue

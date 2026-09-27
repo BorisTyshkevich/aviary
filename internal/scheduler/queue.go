@@ -32,6 +32,21 @@ type JobQueue struct {
 	mu sync.Mutex
 }
 
+// Job queues are file-backed and more than one Scheduler can exist during a
+// same-process restart. Keep an in-memory owner from claim until the worker
+// settles the job so startup recovery cannot reset work still finishing in
+// the old server. Process exit clears this registry and keeps crash recovery.
+var liveJobs = struct {
+	sync.Mutex
+	paths map[string]struct{}
+}{paths: make(map[string]struct{})}
+
+func releaseLiveJob(path string) {
+	liveJobs.Lock()
+	delete(liveJobs.paths, path)
+	liveJobs.Unlock()
+}
+
 // NewJobQueue creates a JobQueue.
 func NewJobQueue() *JobQueue { return &JobQueue{} }
 
@@ -93,11 +108,14 @@ func (q *JobQueue) StartImmediate(taskID, agentID, prompt, outputChannel string,
 func (q *JobQueue) StartImmediateWithType(taskID, taskType, agentID, prompt, script, outputChannel string, replyAgentID, replySessionID string) (*domain.Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	liveJobs.Lock()
+	defer liveJobs.Unlock()
 
 	job := q.newJob(taskID, taskType, agentID, prompt, script, outputChannel, domain.JobStatusInProgress, 1, nil, replyAgentID, replySessionID)
 	if err := store.WriteJSON(store.JobPath(agentID, job.ID), job); err != nil {
 		return nil, fmt.Errorf("start immediate job: %w", err)
 	}
+	liveJobs.paths[store.JobPath(agentID, job.ID)] = struct{}{}
 	slog.Info("job started immediately", "id", job.ID, "task", taskID)
 	return job, nil
 }
@@ -107,6 +125,8 @@ func (q *JobQueue) StartImmediateWithType(taskID, taskType, agentID, prompt, scr
 func (q *JobQueue) ForceStart(id string) (*domain.Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	liveJobs.Lock()
+	defer liveJobs.Unlock()
 
 	path := store.FindJobPath(id)
 	if path == "" {
@@ -132,6 +152,7 @@ func (q *JobQueue) ForceStart(id string) (*domain.Job, error) {
 	if err := store.WriteJSON(path, &job); err != nil {
 		return nil, fmt.Errorf("force starting job %s: %w", id, err)
 	}
+	liveJobs.paths[path] = struct{}{}
 	slog.Info("job force-started", "id", job.ID, "task", job.TaskID)
 	return &job, nil
 }
@@ -141,6 +162,8 @@ func (q *JobQueue) ForceStart(id string) (*domain.Job, error) {
 func (q *JobQueue) Claim() (*domain.Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	liveJobs.Lock()
+	defer liveJobs.Unlock()
 
 	var jobs []domain.Job
 	for _, dir := range store.AllJobDirs() {
@@ -154,6 +177,10 @@ func (q *JobQueue) Claim() (*domain.Job, error) {
 	now := time.Now()
 	for i := range jobs {
 		j := &jobs[i]
+		path := store.JobPath(j.AgentID, j.ID)
+		if _, owned := liveJobs.paths[path]; owned {
+			continue
+		}
 		switch {
 		case j.Status == domain.JobStatusPending:
 			// Ready to claim.
@@ -184,9 +211,10 @@ func (q *JobQueue) Claim() (*domain.Job, error) {
 		j.Attempts++
 		j.LockedAt = &now
 		j.UpdatedAt = now
-		if err := store.WriteJSON(store.JobPath(j.AgentID, j.ID), j); err != nil {
+		if err := store.WriteJSON(path, j); err != nil {
 			return nil, fmt.Errorf("claiming job %s: %w", j.ID, err)
 		}
+		liveJobs.paths[path] = struct{}{}
 		return j, nil
 	}
 	return nil, nil
@@ -202,6 +230,37 @@ func (q *JobQueue) Cancel(id string) error {
 	return q.updateStatus(id, domain.JobStatusCanceled)
 }
 
+// RequeueUnadmitted returns a claimed job to pending without spending a retry.
+// No runner took ownership, so the queue claim is the only attempt to undo.
+func (q *JobQueue) RequeueUnadmitted(id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	path := store.FindJobPath(id)
+	if path == "" {
+		return fmt.Errorf("job %s not found", id)
+	}
+	job, err := store.ReadJSON[domain.Job](path)
+	if err != nil {
+		return fmt.Errorf("reading job %s: %w", id, err)
+	}
+	if job.Status != domain.JobStatusInProgress {
+		return fmt.Errorf("job %s is no longer in progress", id)
+	}
+	if job.Attempts > 0 {
+		job.Attempts--
+	}
+	next := time.Now().Add(time.Second)
+	job.Status = domain.JobStatusPending
+	job.LockedAt = nil
+	job.NextRetryAt = &next
+	job.UpdatedAt = time.Now()
+	if err := store.WriteJSON(path, &job); err != nil {
+		return err
+	}
+	releaseLiveJob(path)
+	return nil
+}
+
 // Fail marks a job as failed and schedules a retry if attempts remain.
 func (q *JobQueue) Fail(id string, cause error) error {
 	q.mu.Lock()
@@ -214,6 +273,10 @@ func (q *JobQueue) Fail(id string, cause error) error {
 	job, err := store.ReadJSON[domain.Job](path)
 	if err != nil {
 		return fmt.Errorf("reading job %s: %w", id, err)
+	}
+	if job.Status == domain.JobStatusCanceled {
+		releaseLiveJob(path)
+		return nil
 	}
 
 	now := time.Now()
@@ -235,7 +298,11 @@ func (q *JobQueue) Fail(id string, cause error) error {
 		slog.Info("job will retry", "id", id, "at", next, "err", cause)
 	}
 
-	return store.WriteJSON(path, &job)
+	if err := store.WriteJSON(path, &job); err != nil {
+		return err
+	}
+	releaseLiveJob(path)
+	return nil
 }
 
 // EnqueueAt writes a new pending job that will not be claimed until at.
@@ -284,6 +351,8 @@ func (q *JobQueue) List(taskID string) ([]domain.Job, error) {
 func (q *JobQueue) RecoverStuck() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	liveJobs.Lock()
+	defer liveJobs.Unlock()
 
 	var jobs []domain.Job
 	for _, dir := range store.AllJobDirs() {
@@ -297,6 +366,9 @@ func (q *JobQueue) RecoverStuck() {
 	now := time.Now()
 	for i := range jobs {
 		j := &jobs[i]
+		if _, owned := liveJobs.paths[store.JobPath(j.AgentID, j.ID)]; owned {
+			continue
+		}
 		if j.Status == domain.JobStatusInProgress {
 			if j.Attempts >= j.MaxRetries {
 				j.Status = domain.JobStatusFailed
@@ -385,8 +457,16 @@ func (q *JobQueue) updateStatus(id string, status domain.JobStatus) error {
 	if err != nil {
 		return fmt.Errorf("reading job %s: %w", id, err)
 	}
+	if job.Status == domain.JobStatusCanceled && status != domain.JobStatusCanceled {
+		releaseLiveJob(path)
+		return nil
+	}
 	job.Status = status
 	job.LockedAt = nil
 	job.UpdatedAt = time.Now()
-	return store.WriteJSON(path, &job)
+	if err := store.WriteJSON(path, &job); err != nil {
+		return err
+	}
+	releaseLiveJob(path)
+	return nil
 }

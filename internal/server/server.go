@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -39,27 +40,32 @@ var ErrRestartRequired = errors.New("server restart required")
 
 // Server wraps an HTTPS server with token auth, MCP routing, and agent management.
 type Server struct {
-	cfg               *config.Config
-	token             string
-	mux               *http.ServeMux
-	httpSrv           *http.Server
-	runCtx            context.Context
-	agents            *agent.Manager
-	llmFactory        *llm.Factory
-	sched             *scheduler.Scheduler
-	channels          *channels.Manager
-	connections       *connections.Service
-	preparation       *preparation.Engine
-	startupErr        error
-	connectionPolicy  atomic.Pointer[config.ConnectionPolicyConfig]
-	brw               *browser.Manager
-	sampler           *ProcSampler
-	watcher           *config.Watcher
-	skillsWatcher     *skills.Watcher
-	listenerRestartCh chan struct{}
-	hardRestartCh     chan struct{}
-	upgradeCh         chan struct{}
-	msgFn             func(agentName, channelType, configuredID string, ch channels.Channel, msg channels.IncomingMessage)
+	cfg                   *config.Config
+	token                 string
+	mux                   *http.ServeMux
+	httpSrv               *http.Server
+	runCtx                context.Context
+	executionCancel       context.CancelFunc
+	nonSlackIngressClosed atomic.Bool
+	terminalDrainUntil    atomic.Int64
+	agents                *agent.Manager
+	llmFactory            *llm.Factory
+	sched                 *scheduler.Scheduler
+	channels              *channels.Manager
+	connections           *connections.Service
+	preparation           *preparation.Engine
+	startupErr            error
+	connectionPolicy      atomic.Pointer[config.ConnectionPolicyConfig]
+	brw                   *browser.Manager
+	sampler               *ProcSampler
+	watcher               *config.Watcher
+	skillsWatcher         *skills.Watcher
+	listenerRestartCh     chan struct{}
+	hardRestartCh         chan struct{}
+	upgradeCh             chan struct{}
+	msgFn                 func(agentName, channelType, configuredID string, ch channels.Channel, msg channels.IncomingMessage)
+	routerReady           chan struct{}
+	routerReadyOnce       sync.Once
 }
 
 // New creates a new Server with the given config and auth token.
@@ -71,6 +77,7 @@ func New(cfg *config.Config, token string) *Server {
 		listenerRestartCh: make(chan struct{}, 1),
 		hardRestartCh:     make(chan struct{}, 1),
 		upgradeCh:         make(chan struct{}, 1),
+		routerReady:       make(chan struct{}),
 	}
 	s.connectionPolicy.Store(cfg.Connections)
 	// Create auth store first — needed for both MCP deps and LLM token refresh.
@@ -276,7 +283,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if s.startupErr != nil {
 		return s.startupErr
 	}
-	s.runCtx = ctx
+	// Keep channel transports and their outgoing dependencies alive through
+	// terminal drain even when the process signal cancels ctx.
+	channelCtx, channelCancel := context.WithCancel(context.WithoutCancel(ctx))
+	defer channelCancel()
+	s.runCtx = channelCtx
+	// Channel runs already admitted by Socket Mode must outlive socket/root
+	// cancellation long enough to select and deliver a terminal outcome.
+	executionCtx, executionCancel := context.WithCancel(context.WithoutCancel(ctx))
+	s.executionCancel = executionCancel
+	defer executionCancel()
 
 	// Start config watcher in background.
 	go func() {
@@ -292,7 +308,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	// Start scheduler.
 	if s.sched != nil {
-		s.sched.Start(ctx)
+		s.sched.Start(executionCtx)
 	}
 
 	// Start process sampler — periodically collects CPU/RSS for all daemon PIDs.
@@ -317,9 +333,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 
 	// Start channel integrations and route messages to agents.
 	s.msgFn = func(agentName, channelType, configuredID string, ch channels.Channel, msg channels.IncomingMessage) {
-		s.handleIncomingChannelMessage(ctx, agentName, channelType, configuredID, ch, msg)
+		s.handleIncomingChannelMessage(executionCtx, agentName, channelType, configuredID, ch, msg)
 	}
-	s.channels.Reconcile(ctx, s.cfg, s.msgFn)
+	s.routerReadyOnce.Do(func() { close(s.routerReady) })
+	s.channels.Reconcile(channelCtx, s.cfg, s.msgFn)
 	s.loadSessionDeliveries()
 
 	for {
@@ -352,21 +369,67 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			return err
 		}
 
-		_ = s.httpSrv.Shutdown(context.Background())
-		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
-			return err
-		}
 		if listenerRestart {
+			shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+			_ = s.httpSrv.Shutdown(shutdownCtx)
+			cancel()
+			if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
 			continue
 		}
 
+		drainCtx, drainCancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
+		if deadline, ok := drainCtx.Deadline(); ok {
+			s.terminalDrainUntil.Store(deadline.UnixNano())
+		}
 		s.watcher.Stop()
 		s.skillsWatcher.Stop()
-		s.channels.Stop()
 		if s.sched != nil {
-			s.sched.Stop()
+			s.sched.StopClaims()
 		}
+		// Shutdown closes the HTTP listener immediately, but waiting for active
+		// requests must not postpone Socket Mode ingress quiescence.
+		httpStopped := make(chan error, 1)
+		go func() { httpStopped <- s.httpSrv.Shutdown(drainCtx) }()
+		var socketCloseErr error
+		if err := s.channels.QuiesceSlack(drainCtx); err != nil {
+			slog.Warn("server: Slack ingress handoff incomplete", "err", err)
+			if errors.Is(err, channels.ErrSlackSocketOpen) {
+				socketCloseErr = err
+			}
+		}
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Warn("server: HTTP listener stopped with error", "err", err)
+		}
+		s.nonSlackIngressClosed.Store(true)
 		s.agents.Stop()
+		if s.sched != nil {
+			stopped := make(chan struct{})
+			go func() { s.sched.Stop(); close(stopped) }()
+			select {
+			case <-stopped:
+			case <-drainCtx.Done():
+				slog.Warn("server: scheduler stop incomplete", "err", drainCtx.Err())
+			}
+		}
+		if err := s.agents.Drain(drainCtx); err != nil {
+			slog.Warn("server: agent terminal drain incomplete", "err", err)
+		}
+		s.channels.Stop()
+		channelCancel()
+		select {
+		case err := <-httpStopped:
+			if err != nil {
+				slog.Warn("server: HTTP shutdown incomplete", "err", err)
+			}
+		case <-drainCtx.Done():
+			_ = s.httpSrv.Close()
+		}
+		drainCancel()
+		if hardRestart && socketCloseErr != nil {
+			return fmt.Errorf("cannot restart while old Slack socket may remain open: %w", socketCloseErr)
+		}
 
 		if hardRestart {
 			return ErrRestartRequired
@@ -375,9 +438,30 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 }
 
+// terminalContext preserves run values but gives terminal callbacks a bounded
+// lifetime independent of user or process cancellation. During shutdown, the
+// shared drain deadline caps each operation's normal budget.
+func (s *Server) terminalContext(runCtx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	deadline := time.Now().Add(budget)
+	if drain := s.terminalDrainUntil.Load(); drain > 0 {
+		if end := time.Unix(0, drain); end.Before(deadline) {
+			deadline = end
+		}
+	}
+	return context.WithDeadline(context.WithoutCancel(runCtx), deadline)
+}
+
 func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, channelType, configuredID string, ch channels.Channel, msg channels.IncomingMessage) {
+	if channelType != "slack" && s.nonSlackIngressClosed.Load() {
+		s.sendAdmissionResendNotice(ch, msg)
+		return
+	}
+	originalChannel, originalMessage := ch, msg
 	runner, ok := s.agents.Get(agentName)
 	if !ok {
+		if _, _, valid := s.channels.RevalidateRoutedMessage(agentName, channelType, configuredID, msg); valid {
+			s.sendAdmissionResendNotice(originalChannel, originalMessage)
+		}
 		return
 	}
 	msgCtx := agent.WithChannelSession(ctx, channelType, configuredID, msg.Channel)
@@ -393,49 +477,31 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				WorkspaceID: msg.WorkspaceID, UserID: msg.From},
 		})
 	}
-	channelCfg, _ := s.findChannelConfig(agentName, channelType, configuredID)
-	sessionName := channelSessionNameForIncoming(agentID, channelCfg, msg)
-	if sess, err := agent.NewSessionManager().GetOrCreateNamed(agentID, sessionName); err == nil && sess != nil {
-		msgCtx = agent.WithSessionID(msgCtx, sess.ID)
-		target := store.SessionChannel{
-			Type:         msg.Type,
-			ConfiguredID: configuredID,
-			ID:           msg.Channel,
-			ThreadTS:     strings.TrimSpace(msg.ThreadTS),
-		}
-		sessiontarget.Register(agentID, agentName, sess.ID, target, s.channels)
-		if err := store.EnsureSessionChannelTarget(agentID, sess.ID, target); err != nil {
-			slog.Warn("server: failed to update session channels config", "session", sess.ID, "err", err)
-		}
-	}
-
-	var stopTyping context.CancelFunc
-	if ts, ok := ch.(channels.TypingSender); ok && ts.ShowTyping() {
-		_ = ts.SendTyping(msg.Channel, false)
-		typingCtx, cancel := context.WithCancel(ctx)
-		stopTyping = cancel
-		go func() {
-			ticker := time.NewTicker(10 * time.Second)
-			defer ticker.Stop()
-			defer ts.SendTyping(msg.Channel, true) //nolint:errcheck
-			for {
-				select {
-				case <-typingCtx.Done():
-					return
-				case <-ticker.C:
-					_ = ts.SendTyping(msg.Channel, false)
-				}
+	baseMsgCtx := msgCtx
+	attachSession := func(cc config.ChannelConfig, incoming channels.IncomingMessage) context.Context {
+		turnCtx := baseMsgCtx
+		sessionName := channelSessionNameForIncoming(agentID, cc, incoming)
+		if sess, err := agent.NewSessionManager().GetOrCreateNamed(agentID, sessionName); err == nil && sess != nil {
+			turnCtx = agent.WithSessionID(turnCtx, sess.ID)
+			target := store.SessionChannel{Type: incoming.Type, ConfiguredID: configuredID,
+				ID: incoming.Channel, ThreadTS: strings.TrimSpace(incoming.ThreadTS)}
+			sessiontarget.Register(agentID, agentName, sess.ID, target, s.channels)
+			if err := store.EnsureSessionChannelTarget(agentID, sess.ID, target); err != nil {
+				slog.Warn("server: failed to update session channels config", "session", sess.ID, "err", err)
 			}
-		}()
-	}
-
-	var assistantStatus *slackRunStatus
-	if channelType == "slack" && config.BoolOr(channelCfg.ShowTyping, true) && strings.TrimSpace(msg.ThreadTS) != "" {
-		if as, ok := ch.(channels.AssistantStatusSender); ok {
-			assistantStatus = newSlackRunStatus(as, msg.Channel, msg.ThreadTS)
-			assistantStatus.Start()
 		}
+		return turnCtx
 	}
+	channelCfg, _ := s.findChannelConfig(agentName, channelType, configuredID)
+	msgCtx = attachSession(channelCfg, msg)
+
+	var stateMu sync.Mutex
+	var terminalSelected bool
+	var statusStarted bool
+	var stopTyping context.CancelFunc
+	var startTyping func()
+	var assistantStatus *slackRunStatus
+	var presenter *slackPresenter
 
 	rOpts := agent.RunOverrides{
 		Model:         msg.Model,
@@ -444,85 +510,189 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		DisabledTools: msg.DisabledTools,
 	}
 
-	// If this message quotes another message, include the quoted author/text
-	// in the message text so it becomes part of the prompt/session history.
+	// Quoted context is part of the admitted prompt on either accepted attempt.
 	if strings.TrimSpace(msg.QuoteAuthor) != "" && strings.TrimSpace(msg.QuoteText) != "" {
-		// Prefix the incoming user text with the quoted line and author.
 		msg.Text = fmt.Sprintf("%s: %s\n\n%s", msg.QuoteAuthor, msg.QuoteText, msg.Text)
 	}
 
-	var presenter *slackPresenter
-	if channelType == "slack" && strings.TrimSpace(msg.ThreadTS) != "" {
-		if sender, ok := ch.(slackPresenterSender); ok {
-			presenter = newSlackPresenter(sender, msg.Channel, msg.ThreadTS, config.BoolOr(channelCfg.ToolProgress, false))
-			presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {
-				return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+	configureRun := func(candidate channels.Channel, cc config.ChannelConfig, incoming channels.IncomingMessage) {
+		startTyping = nil
+		stopTyping = nil
+		assistantStatus = nil
+		statusStarted = false
+		presenter = nil
+		if ts, ok := candidate.(channels.TypingSender); ok {
+			enabled := ts.ShowTyping()
+			if channelType == "slack" {
+				enabled = config.BoolOr(cc.ShowTyping, true)
+			}
+			if enabled {
+				startTyping = func() {
+					_ = ts.SendTyping(incoming.Channel, false)
+					typingCtx, cancel := context.WithCancel(ctx)
+					stopTyping = cancel
+					go func() {
+						ticker := time.NewTicker(10 * time.Second)
+						defer ticker.Stop()
+						defer ts.SendTyping(incoming.Channel, true) //nolint:errcheck
+						for {
+							select {
+							case <-typingCtx.Done():
+								return
+							case <-ticker.C:
+								_ = ts.SendTyping(incoming.Channel, false)
+							}
+						}
+					}()
+				}
 			}
 		}
+		if channelType == "slack" && config.BoolOr(cc.ShowTyping, true) && strings.TrimSpace(incoming.ThreadTS) != "" {
+			if sender, ok := candidate.(channels.AssistantStatusSender); ok {
+				assistantStatus = newSlackRunStatus(sender, incoming.Channel, incoming.ThreadTS)
+				statusCtx := msgCtx
+				assistantStatus.contextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+					return s.terminalContext(statusCtx, budget)
+				}
+			}
+		}
+		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
+			if sender, ok := candidate.(slackPresenterSender); ok {
+				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, config.BoolOr(cc.ToolProgress, false))
+				presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {
+					return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+				}
+			}
+		}
+		rOpts.SuppressDelivery = presenter != nil
+		rOpts.DeferAnswerPersistence = false
+		if presenter != nil {
+			execution, _ := connections.ExecutionFromContext(msgCtx)
+			rOpts.DeferAnswerPersistence = execution.Personal()
+		}
 	}
-	if presenter != nil {
-		rOpts.SuppressDelivery = true
-		execution, _ := connections.ExecutionFromContext(msgCtx)
-		rOpts.DeferAnswerPersistence = execution.Personal()
-	}
+	configureRun(ch, channelCfg, msg)
 
-	runner.PromptMediaWithOverrides(msgCtx, msg.Text, msg.MediaURL, rOpts, func(e agent.StreamEvent) {
-		switch e.Type {
-		case agent.StreamEventToolProgress:
+	consumer := func(e agent.StreamEvent) {
+		if e.Type == agent.StreamEventToolProgress {
 			if presenter != nil && !e.Private && e.PublicTool != nil {
 				presenter.Tool(e.PublicTool.Name, e.PublicTool.InvocationID, string(e.PublicTool.State))
 			}
-		case agent.StreamEventError:
-			if presenter != nil {
-				_, _ = presenter.Terminal(assistantStatus, "error", "", "", false)
-				if stopTyping != nil {
-					stopTyping()
-				}
-				return
+			return
+		}
+		if e.Type != agent.StreamEventDone && e.Type != agent.StreamEventStop && e.Type != agent.StreamEventError {
+			return
+		}
+		stateMu.Lock()
+		if terminalSelected {
+			stateMu.Unlock()
+			return
+		}
+		terminalSelected = true
+		activeStatus := (*slackRunStatus)(nil)
+		if statusStarted {
+			activeStatus = assistantStatus
+		}
+		stopActivity := stopTyping
+		stopTyping = nil
+		selectedPresenter := presenter
+		selectedCtx := msgCtx
+		deferPersistence := rOpts.DeferAnswerPersistence
+		stateMu.Unlock()
+		if stopActivity != nil {
+			stopActivity()
+		}
+		if selectedPresenter == nil {
+			if activeStatus != nil {
+				activeStatus.Finish(false)
 			}
-			if assistantStatus != nil {
-				assistantStatus.Finish(false)
-			}
-			if stopTyping != nil {
-				stopTyping()
-			}
+			return
+		}
+		selectedPresenter.terminalContextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+			return s.terminalContext(selectedCtx, budget)
+		}
+		kind := "done"
+		switch e.Type {
 		case agent.StreamEventStop:
-			if presenter != nil {
-				_, _ = presenter.Terminal(assistantStatus, "stop", "", "", false)
-				if stopTyping != nil {
-					stopTyping()
+			kind = "stop"
+		case agent.StreamEventError:
+			kind = "error"
+		}
+		result, first := selectedPresenter.Terminal(activeStatus, kind, e.Model, e.Text, e.AlreadyAnswered)
+		if first && result.Outcome == slackOutcomeAnswer && deferPersistence {
+			if sessionID, ok := agent.SessionIDFromContext(selectedCtx); ok {
+				if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {
+					slog.Warn("server: failed to record delivered answer")
 				}
-				return
-			}
-			if assistantStatus != nil {
-				assistantStatus.Finish(false)
-			}
-			if stopTyping != nil {
-				stopTyping()
-			}
-		case agent.StreamEventDone:
-			if presenter != nil {
-				result, first := presenter.Terminal(assistantStatus, "done", e.Model, e.Text, e.AlreadyAnswered)
-				if first && result.Outcome == slackOutcomeAnswer && rOpts.DeferAnswerPersistence {
-					if sessionID, ok := agent.SessionIDFromContext(msgCtx); ok {
-						if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {
-							slog.Warn("server: failed to record delivered answer")
-						}
-					}
-				}
-				if stopTyping != nil {
-					stopTyping()
-				}
-				return
-			}
-			if assistantStatus != nil {
-				assistantStatus.Finish(false)
-			}
-			if stopTyping != nil {
-				stopTyping()
 			}
 		}
-	})
+	}
+	submit := func(candidate *agent.AgentRunner) agent.RunAdmission {
+		return candidate.PromptMediaWithOverrides(msgCtx, msg.Text, msg.MediaURL, rOpts, consumer)
+	}
+	admission := submit(runner)
+	if admission.Status == agent.AdmissionRejectedStopping {
+		// Only rejected handoff is retried. An accepted run owns its outcome.
+		if currentCh, routed, valid := s.channels.RevalidateRoutedMessage(agentName, channelType, configuredID, originalMessage); valid {
+			if replacement, exists := s.agents.Get(agentName); exists {
+				ch = currentCh
+				msg.Model, msg.Fallbacks = routed.Model, routed.Fallbacks
+				msg.RestrictTools, msg.DisabledTools = routed.RestrictTools, routed.DisabledTools
+				rOpts.Model, rOpts.Fallbacks = routed.Model, routed.Fallbacks
+				rOpts.RestrictTools, rOpts.DisabledTools = routed.RestrictTools, routed.DisabledTools
+				channelCfg, _ = s.findChannelConfig(agentName, channelType, configuredID)
+				msgCtx = attachSession(channelCfg, routed)
+				configureRun(ch, channelCfg, routed)
+				admission = submit(replacement)
+			}
+		}
+		if admission.Status == agent.AdmissionRejectedStopping {
+			s.sendAdmissionResendNotice(originalChannel, originalMessage)
+			return
+		}
+	}
+	// The accepted callback can arrive before Prompt returns. Serialize optional
+	// activity startup with terminal selection so it never starts afterward.
+	stateMu.Lock()
+	if !terminalSelected {
+		if startTyping != nil {
+			startTyping()
+		}
+		if assistantStatus != nil {
+			statusStarted = true
+			assistantStatus.Start()
+		}
+	}
+	stateMu.Unlock()
+}
+
+func (s *Server) sendAdmissionResendNotice(ch channels.Channel, msg channels.IncomingMessage) {
+	ctx, cancel := s.terminalContext(context.Background(), 5*time.Second)
+	defer cancel()
+	const notice = "Restarting; please resend your request."
+	if sender, ok := ch.(channels.ContextThreadMessageSender); ok {
+		if err := sender.SendThreadPlainTextContext(ctx, msg.Channel, msg.ThreadTS, notice); err != nil {
+			slog.Warn("server: could not send rejected-admission notice", "err", err)
+		}
+		return
+	}
+	done := make(chan error, 1)
+	go func() {
+		if sender, ok := ch.(channels.ThreadMessageSender); ok && msg.ThreadTS != "" {
+			_, err := sender.SendThreadMessageAndGetID(msg.Channel, msg.ThreadTS, notice)
+			done <- err
+			return
+		}
+		done <- ch.Send(msg.Channel, notice)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			slog.Warn("server: could not send rejected-admission notice", "err", err)
+		}
+	case <-ctx.Done():
+		slog.Warn("server: rejected-admission notice timed out", "err", ctx.Err())
+	}
 }
 
 func (s *Server) findChannelConfig(agentName, channelType, configuredID string) (config.ChannelConfig, bool) {

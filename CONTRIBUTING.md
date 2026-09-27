@@ -121,6 +121,9 @@ For direct connection fixtures and preparation/MCP smoke coverage, see
 For Slack status checks and runner teardown test ordering, see
 [Slack lifecycle verification](docs/testing/slack-lifecycle.md).
 
+For prompt admission, shutdown ordering, and recovery limits, see
+[Runner lifecycle and shutdown](docs/testing/runner-lifecycle.md).
+
 ## Linting
 
 ```shell

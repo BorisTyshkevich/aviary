@@ -35,6 +35,7 @@ type SlackChannel struct {
 
 	client          *slack.Client
 	sm              *socketmode.Client
+	ackEnvelope     func(context.Context, *socketmode.Request) error
 	handler         func(IncomingMessage)
 	groupLogHandler func(IncomingMessage)
 	handlerMu       sync.RWMutex
@@ -47,6 +48,12 @@ type SlackChannel struct {
 	seenMessages    map[string]time.Time
 	stopOnce        sync.Once
 	cancel          context.CancelFunc
+	ingressMu       sync.Mutex
+	ingressClosed   bool
+	ingressStarted  bool
+	ingressActive   sync.WaitGroup
+	socketDone      chan struct{}
+	dispatchDone    chan struct{}
 	logSinkMu       sync.RWMutex
 	logSink         *LogSink
 	intake          func(slackIngress) bool
@@ -70,13 +77,15 @@ func NewSlackChannel(appToken, botToken string, allowFrom []config.AllowFromEntr
 	api := slack.New(botToken, slack.OptionAppLevelToken(appToken), slack.OptionHTTPClient(slackStatusHTTPClient{base: http.DefaultClient}))
 	sm := socketmode.New(api)
 	return &SlackChannel{
-		appToken:  appToken,
-		botToken:  botToken,
-		allowFrom: allowFrom,
-		model:     model,
-		fallbacks: fallbacks,
-		client:    api,
-		sm:        sm,
+		appToken:     appToken,
+		botToken:     botToken,
+		allowFrom:    allowFrom,
+		model:        model,
+		fallbacks:    fallbacks,
+		client:       api,
+		sm:           sm,
+		socketDone:   make(chan struct{}),
+		dispatchDone: make(chan struct{}),
 	}
 }
 
@@ -158,6 +167,11 @@ func (c *SlackChannel) SendThreadMessageAndGetID(channel, threadTS, text string)
 func (c *SlackChannel) SendThreadPlainText(channel, threadTS, text string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	return c.SendThreadPlainTextContext(ctx, channel, threadTS, text)
+}
+
+// SendThreadPlainTextContext bounds admission-fallback and terminal replies.
+func (c *SlackChannel) SendThreadPlainTextContext(ctx context.Context, channel, threadTS, text string) error {
 	_, err := c.PostThreadTextContext(ctx, channel, threadTS, text)
 	return err
 }
@@ -204,7 +218,29 @@ func (c *SlackChannel) SendAssistantStatusContext(ctx context.Context, channel, 
 // Start connects via Socket Mode and blocks until ctx is cancelled.
 func (c *SlackChannel) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
+	c.ingressMu.Lock()
+	if c.ingressClosed {
+		c.ingressMu.Unlock()
+		cancel()
+		return nil
+	}
 	c.cancel = cancel
+	c.ingressStarted = true
+	c.ingressMu.Unlock()
+	socketClosed := false
+	defer func() {
+		c.Stop()
+		if !socketClosed {
+			close(c.socketDone)
+		}
+		if c.intakeWait != nil {
+			go func() {
+				c.ingressActive.Wait()
+				c.intakeWait()
+			}()
+		}
+	}()
+	defer cancel()
 	c.logf("slack: starting socket mode session")
 
 	// Fetch the bot's own user ID so we can detect direct @mentions in groups.
@@ -234,6 +270,7 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 	}
 
 	go func() {
+		defer close(c.dispatchDone)
 		for {
 			select {
 			case <-ctx.Done():
@@ -254,24 +291,79 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 	} else {
 		c.logf("slack: socket mode stopped")
 	}
-	cancel()
-	if c.intakeWait != nil {
-		c.intakeWait()
-	}
+	close(c.socketDone)
+	socketClosed = true
+	c.Stop()
+	<-c.dispatchDone
 	return err
 }
 
-// Stop disconnects from Slack.
+// Stop closes inbound Socket Mode without retiring the outgoing Web API client.
 func (c *SlackChannel) Stop() {
 	c.stopOnce.Do(func() {
 		c.logf("slack: stop requested")
+		c.ingressMu.Lock()
+		c.ingressClosed = true
 		if c.cancel != nil {
 			c.cancel()
 		}
+		c.ingressMu.Unlock()
+	})
+}
+
+func (c *SlackChannel) ingressOpen() bool {
+	c.ingressMu.Lock()
+	defer c.ingressMu.Unlock()
+	return !c.ingressClosed
+}
+
+// WaitSocketClosed ensures the old Socket Mode connection has closed before a
+// replacement opens. Acknowledged dispatch handlers drain through WaitIngress.
+func (c *SlackChannel) WaitSocketClosed(ctx context.Context) error {
+	c.ingressMu.Lock()
+	started := c.ingressStarted
+	c.ingressMu.Unlock()
+	if !started {
+		return nil // Start will observe the closed gate if it runs later.
+	}
+	select {
+	case <-c.socketDone:
+		return nil
+	default:
+	}
+	select {
+	case <-c.socketDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// WaitIngress waits for already acknowledged envelopes and deferred intake
+// work to finish their handoff. Stop must be called first.
+func (c *SlackChannel) WaitIngress(ctx context.Context) error {
+	if err := c.WaitSocketClosed(ctx); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go func() {
+		c.ingressActive.Wait()
 		if c.intakeWait != nil {
 			c.intakeWait()
 		}
-	})
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (c *SlackChannel) dispatch(evt socketmode.Event) {
@@ -290,8 +382,30 @@ func (c *SlackChannel) dispatch(evt socketmode.Event) {
 	if evt.Type != socketmode.EventTypeEventsAPI {
 		return
 	}
-	if err := c.sm.Ack(*evt.Request); err != nil {
+	c.ingressMu.Lock()
+	if c.ingressClosed {
+		c.ingressMu.Unlock()
+		return
+	}
+	c.ingressActive.Add(1)
+	if evt.Request == nil {
+		c.ingressMu.Unlock()
+		c.ingressActive.Done()
+		c.logf("slack: missing envelope request")
+		return
+	}
+	ack := c.ackEnvelope
+	if ack == nil {
+		ack = func(ctx context.Context, req *socketmode.Request) error { return c.sm.AckCtx(ctx, req.EnvelopeID, nil) }
+	}
+	ackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := ack(ackCtx, evt.Request)
+	cancel()
+	c.ingressMu.Unlock()
+	defer c.ingressActive.Done()
+	if err != nil {
 		c.logf("slack: failed to ack event: %v", err)
+		return
 	}
 
 	eventsAPI, ok := evt.Data.(slackevents.EventsAPIEvent)

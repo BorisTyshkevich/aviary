@@ -340,7 +340,7 @@ func registerAgentTools(s *sdkmcp.Server) {
 		done := make(chan error, 1)
 		history := resolveAgentRunHistory(args)
 
-		runner.PromptMediaWithOverrides(ctx, args.Message, args.MediaURL, agent.RunOverrides{
+		admission := runner.PromptMediaWithOverrides(ctx, args.Message, args.MediaURL, agent.RunOverrides{
 			Bare:    args.Bare,
 			History: &history,
 		}, func(e agent.StreamEvent) {
@@ -385,7 +385,11 @@ func registerAgentTools(s *sdkmcp.Server) {
 			case agent.StreamEventDone:
 				done <- nil
 			case agent.StreamEventStop:
-				done <- context.Canceled
+				if e.StopCause == agent.StopCauseRunner {
+					done <- fmt.Errorf("agent %q run was interrupted by restart; recovery will resume the accepted request", agentName)
+				} else {
+					done <- context.Canceled
+				}
 			case agent.StreamEventError:
 				if errors.Is(e.Err, context.Canceled) {
 					done <- context.Canceled
@@ -394,6 +398,9 @@ func registerAgentTools(s *sdkmcp.Server) {
 				done <- e.Err
 			}
 		})
+		if admission.Status == agent.AdmissionRejectedStopping {
+			return nil, struct{}{}, fmt.Errorf("agent %q is restarting; retry the request", agentName)
+		}
 		if err := <-done; err != nil {
 			if errors.Is(err, context.Canceled) {
 				return text(buf.String())
@@ -435,53 +442,23 @@ func registerAgentTools(s *sdkmcp.Server) {
 		}
 
 		if sid != "" {
-			// Stop only the specified session (does nothing if no active work).
+			// Stop active work and suppress any older replayable checkpoint for
+			// this session. The second cancellation closes the recovery handoff
+			// race between checkpoint retirement and run registration.
 			stopped := agent.StopSession(args.Name, sid)
-			if stopped == 0 {
-				// Still attempt to delete matching checkpoints even if nothing was running.
-				slog.Info("mcp: agent_stop - no active runs for session", "agent", args.Name, "session", sid)
+			if err := agent.RetireCheckpointsForUserStop(args.Name, sid); err != nil {
+				return nil, struct{}{}, fmt.Errorf("retiring stopped session checkpoints: %w", err)
 			}
-			// Delete checkpoints matching this session ID.
-			dir := store.CheckpointDir(args.Name)
-			entries, err := os.ReadDir(dir)
-			if err == nil {
-				for _, e := range entries {
-					if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-						continue
-					}
-					p := filepath.Join(dir, e.Name())
-					v, rerr := store.ReadJSON[agent.RunCheckpoint](p)
-					if rerr == nil {
-						if v.SessionID == sid {
-							if derr := store.DeleteJSON(p); derr != nil {
-								slog.Warn("mcp: failed to delete checkpoint", "agent", args.Name, "path", p, "err", derr)
-							}
-						}
-					} else {
-						// Couldn't read checkpoint — try to delete to avoid leaving corrupt files.
-						if derr := store.DeleteJSON(p); derr != nil {
-							slog.Warn("mcp: failed to delete unreadable checkpoint", "agent", args.Name, "path", p, "err", derr)
-						}
-					}
-				}
+			agent.StopSession(args.Name, sid)
+			if stopped == 0 {
+				slog.Info("mcp: agent_stop - no active runs for session", "agent", args.Name, "session", sid)
 			}
 			return text(fmt.Sprintf("agent %q stopped (session %s)", args.Name, sid))
 		}
 
-		// No session specified: stop whole agent and delete all checkpoints.
-		runner.Stop()
-		dir := store.CheckpointDir(args.Name)
-		entries, err := os.ReadDir(dir)
-		if err == nil {
-			for _, e := range entries {
-				if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
-					continue
-				}
-				p := filepath.Join(dir, e.Name())
-				if err := store.DeleteJSON(p); err != nil {
-					slog.Warn("mcp: failed to delete checkpoint", "agent", args.Name, "path", p, "err", err)
-				}
-			}
+		runner.StopByUser()
+		if err := agent.RetireCheckpointsForUserStop(args.Name, ""); err != nil {
+			return nil, struct{}{}, fmt.Errorf("retiring stopped agent checkpoints: %w", err)
 		}
 		return text(fmt.Sprintf("agent %q stopped", args.Name))
 	})
