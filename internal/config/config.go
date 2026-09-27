@@ -184,6 +184,16 @@ func (e *AllowFromEntry) UnmarshalJSON(b []byte) error {
 	return json.Unmarshal(b, (*plain)(e))
 }
 
+// Slack progress defaults and limits keep each temporary page within Slack's message size.
+const (
+	DefaultToolProgressMaxCalls = 100
+	DefaultToolProgressMaxChars = 2800
+	MinToolProgressMaxCalls     = 1
+	MaxToolProgressMaxCalls     = 1000
+	MinToolProgressMaxChars     = 500
+	MaxToolProgressMaxChars     = 3900
+)
+
 // ChannelConfig describes a communication channel for an agent.
 type ChannelConfig struct {
 	Enabled *bool  `yaml:"enabled,omitempty"         json:"enabled,omitempty"`
@@ -202,9 +212,13 @@ type ChannelConfig struct {
 	// ShowTyping controls Signal typing and generic Slack assistant status while
 	// the agent processes a message. Defaults to true on supported channels.
 	ShowTyping *bool `yaml:"show_typing,omitempty"     json:"show_typing,omitempty"`
-	// ToolProgress enables temporary, generic tool-state messages for Slack runs.
+	// ToolProgress enables temporary tool-state messages for Slack runs.
 	// It defaults to false and is valid only for Slack channels.
 	ToolProgress *bool `yaml:"tool_progress,omitempty" json:"tool_progress,omitempty"`
+	// ToolProgressMaxCalls limits tool invocations shown across progress messages.
+	ToolProgressMaxCalls *int `yaml:"tool_progress_max_calls,omitempty" json:"tool_progress_max_calls,omitempty"`
+	// ToolProgressMaxChars limits the size of a progress message.
+	ToolProgressMaxChars *int `yaml:"tool_progress_max_chars,omitempty" json:"tool_progress_max_chars,omitempty"`
 	// SeparateTopLevelSessions controls Slack channel session naming. When true,
 	// every top-level Slack message gets its own session keyed by the Slack
 	// thread/root timestamp, so all replies in that Slack thread share a session.

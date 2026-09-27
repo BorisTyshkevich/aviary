@@ -71,9 +71,20 @@ type SlackCheckpoint struct {
 	ChannelID       string           `json:"channel_id"`
 	RootThreadTS    string           `json:"root_thread_ts"`
 	ProgressTS      string           `json:"progress_ts,omitempty"`
+	ProgressExtraTS []string         `json:"progress_extra_ts,omitempty"`
 	Disposition     SlackDisposition `json:"disposition"`
 	CleanupPending  bool             `json:"cleanup_pending,omitempty"`
 	NoticeAttempted bool             `json:"notice_attempted,omitempty"`
+}
+
+// ProgressTimestamps returns accepted progress pages in their creation order.
+func (meta *SlackCheckpoint) ProgressTimestamps() []string {
+	if meta == nil || meta.ProgressTS == "" {
+		return nil
+	}
+	result := make([]string, 0, 1+len(meta.ProgressExtraTS))
+	result = append(result, meta.ProgressTS)
+	return append(result, meta.ProgressExtraTS...)
 }
 
 // CheckpointHandle serializes updates to one run's existing checkpoint file.
@@ -141,6 +152,7 @@ func (h *CheckpointHandle) update(change func(*SlackCheckpoint) error) error {
 	}
 	next := h.checkpoint
 	meta := *next.Slack
+	meta.ProgressExtraTS = append([]string(nil), meta.ProgressExtraTS...)
 	if err := change(&meta); err != nil {
 		return err
 	}
@@ -152,13 +164,22 @@ func (h *CheckpointHandle) update(change func(*SlackCheckpoint) error) error {
 	return nil
 }
 
-// RecordProgressTimestamp persists the one accepted progress message ID.
+// RecordProgressTimestamp persists an accepted progress message ID in page order.
 func (h *CheckpointHandle) RecordProgressTimestamp(ts string) error {
 	return h.update(func(meta *SlackCheckpoint) error {
-		if ts == "" || (meta.ProgressTS != "" && meta.ProgressTS != ts) {
+		if ts == "" {
 			return errors.New("invalid Slack progress timestamp")
 		}
-		meta.ProgressTS = ts
+		if meta.ProgressTS == "" {
+			meta.ProgressTS = ts
+		} else if meta.ProgressTS != ts {
+			for _, existing := range meta.ProgressExtraTS {
+				if existing == ts {
+					return nil
+				}
+			}
+			meta.ProgressExtraTS = append(meta.ProgressExtraTS, ts)
+		}
 		meta.CleanupPending = true
 		return nil
 	})
@@ -176,21 +197,46 @@ func (h *CheckpointHandle) RecordNoticeAttempt() error {
 	})
 }
 
-// RecordTerminal atomically saves the known progress timestamp, whether a
-// standalone notice may have landed, and terminal cleanup state. A handled
-// outcome can never be downgraded.
-func (h *CheckpointHandle) RecordTerminal(disposition SlackDisposition, cleanupPending bool, progressTS string, noticeAttempted bool) error {
+// RecordTerminal atomically merges known progress pages and terminal state.
+// A page promoted into a confirmed fixed notice is removed from cleanup
+// ownership in the same write. A handled outcome can never be downgraded.
+func (h *CheckpointHandle) RecordTerminal(disposition SlackDisposition, cleanupPending bool, progressTimestamps []string, promotedProgressTS string, noticeAttempted bool) error {
 	return h.update(func(meta *SlackCheckpoint) error {
 		switch disposition {
 		case SlackDispositionPending, SlackDispositionHandled, SlackDispositionUnconfirmed:
 		default:
 			return errors.New("invalid Slack terminal disposition")
 		}
-		if progressTS != "" {
-			if meta.ProgressTS != "" && meta.ProgressTS != progressTS {
-				return errors.New("conflicting Slack progress timestamp")
+		if meta.Disposition == SlackDispositionHandled && disposition != SlackDispositionHandled {
+			return nil
+		}
+		seen := make(map[string]bool, len(progressTimestamps)+1+len(meta.ProgressExtraTS))
+		merged := make([]string, 0, len(progressTimestamps)+1+len(meta.ProgressExtraTS))
+		for _, ts := range append(append([]string(nil), progressTimestamps...), meta.ProgressTimestamps()...) {
+			if ts == "" {
+				return errors.New("invalid Slack progress timestamp")
 			}
-			meta.ProgressTS = progressTS
+			if seen[ts] {
+				continue
+			}
+			merged = append(merged, ts)
+			seen[ts] = true
+		}
+		if disposition == SlackDispositionHandled && promotedProgressTS != "" {
+			if !seen[promotedProgressTS] {
+				return errors.New("promoted Slack progress timestamp is unknown")
+			}
+			kept := merged[:0]
+			for _, ts := range merged {
+				if ts != promotedProgressTS {
+					kept = append(kept, ts)
+				}
+			}
+			merged = kept
+		}
+		meta.ProgressTS, meta.ProgressExtraTS = "", nil
+		if len(merged) > 0 {
+			meta.ProgressTS, meta.ProgressExtraTS = merged[0], merged[1:]
 		}
 		if cleanupPending && meta.ProgressTS == "" {
 			return errors.New("slack cleanup is pending without a progress timestamp")

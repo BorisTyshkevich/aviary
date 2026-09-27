@@ -123,6 +123,18 @@
 								},
 								"show_typing": { "type": "boolean" },
 								"tool_progress": { "type": "boolean", "default": false },
+								"tool_progress_max_calls": {
+									"type": "integer",
+									"minimum": 1,
+									"maximum": 1000,
+									"default": 100
+								},
+								"tool_progress_max_chars": {
+									"type": "integer",
+									"minimum": 500,
+									"maximum": 3900,
+									"default": 2800
+								},
 								"separate_top_level_sessions": { "type": "boolean" },
 								"reply_to_replies": { "type": "boolean" },
 								"ignore_other_user_mentions": { "type": "boolean" },
@@ -176,7 +188,13 @@
 						},
 						"allOf": [
 							{
-								"if": { "required": ["tool_progress"] },
+								"if": {
+									"anyOf": [
+										{ "required": ["tool_progress"] },
+										{ "required": ["tool_progress_max_calls"] },
+										{ "required": ["tool_progress_max_chars"] }
+									]
+								},
 								"then": { "properties": { "type": { "const": "slack" } } }
 							}
 						]

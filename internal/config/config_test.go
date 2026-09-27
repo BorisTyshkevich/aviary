@@ -929,6 +929,56 @@ func TestToolProgressSlackOnlyAndDefaultsOff(t *testing.T) {
 	assert.Error(t, json.Unmarshal([]byte(`{"type":"slack","tool_progress":"true"}`), &fromJSON))
 }
 
+func TestToolProgressCapsValidationAndRoundTrip(t *testing.T) {
+	calls, chars := 100, 2800
+	channel := ChannelConfig{Type: "slack", ToolProgressMaxCalls: &calls, ToolProgressMaxChars: &chars}
+	cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{channel}}}}
+	assert.False(t, hasIssue(Validate(&cfg, nil), "tool_progress_max"))
+
+	yamlData, err := yaml.Marshal(channel)
+	assert.NoError(t, err)
+	var fromYAML ChannelConfig
+	assert.NoError(t, yaml.Unmarshal(yamlData, &fromYAML))
+	assert.Equal(t, channel.ToolProgressMaxCalls, fromYAML.ToolProgressMaxCalls)
+	assert.Equal(t, channel.ToolProgressMaxChars, fromYAML.ToolProgressMaxChars)
+
+	jsonData, err := json.Marshal(channel)
+	assert.NoError(t, err)
+	var fromJSON ChannelConfig
+	assert.NoError(t, json.Unmarshal(jsonData, &fromJSON))
+	assert.Equal(t, channel.ToolProgressMaxCalls, fromJSON.ToolProgressMaxCalls)
+	assert.Equal(t, channel.ToolProgressMaxChars, fromJSON.ToolProgressMaxChars)
+
+	for _, tc := range []struct {
+		field string
+		value int
+	}{
+		{"tool_progress_max_calls", 0},
+		{"tool_progress_max_calls", MaxToolProgressMaxCalls + 1},
+		{"tool_progress_max_chars", MinToolProgressMaxChars - 1},
+		{"tool_progress_max_chars", MaxToolProgressMaxChars + 1},
+	} {
+		t.Run(tc.field+strconv.Itoa(tc.value), func(t *testing.T) {
+			invalid := channel
+			if tc.field == "tool_progress_max_calls" {
+				invalid.ToolProgressMaxCalls = &tc.value
+			} else {
+				invalid.ToolProgressMaxChars = &tc.value
+			}
+			cfg.Agents[0].Channels[0] = invalid
+			assert.True(t, hasIssue(Validate(&cfg, nil), tc.field+" must be between"))
+		})
+	}
+
+	for _, typ := range []string{"signal", "discord"} {
+		cfg.Agents[0].Channels[0] = channel
+		cfg.Agents[0].Channels[0].Type = typ
+		issues := Validate(&cfg, nil)
+		assert.True(t, hasIssue(issues, "tool_progress_max_calls is only supported for Slack channels"))
+		assert.True(t, hasIssue(issues, "tool_progress_max_chars is only supported for Slack channels"))
+	}
+}
+
 func TestValidate_StdioModelMissingCommand(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentConfig{{

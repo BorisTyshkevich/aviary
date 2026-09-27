@@ -565,6 +565,12 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
 			if sender, ok := candidate.(slackPresenterSender); ok {
 				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, config.BoolOr(cc.ToolProgress, false))
+				if cc.ToolProgressMaxCalls != nil {
+					presenter.maxCalls = *cc.ToolProgressMaxCalls
+				}
+				if cc.ToolProgressMaxChars != nil {
+					presenter.maxChars = *cc.ToolProgressMaxChars
+				}
 				presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {
 					return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
 				}
@@ -576,10 +582,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				presenter.hooks.ProgressCreated = handle.RecordProgressTimestamp
 				presenter.hooks.NoticeAttempting = handle.RecordNoticeAttempt
 				presenter.hooks.TerminalAccepted = func(result slackTerminalResult) error {
-					return handle.RecordTerminal(agent.SlackDispositionHandled, result.CleanupPending, result.ProgressTimestamp, result.NoticeAttempted)
+					return handle.RecordTerminal(agent.SlackDispositionHandled, result.CleanupPending, result.ProgressTimestamps, result.PromotedProgressTS, result.NoticeAttempted)
 				}
 				presenter.hooks.TerminalFinalized = func(result slackTerminalResult) {
-					if err := handle.RecordTerminal(agent.SlackDisposition(result.Disposition), result.CleanupPending, result.ProgressTimestamp, result.NoticeAttempted); err != nil {
+					if err := handle.RecordTerminal(agent.SlackDisposition(result.Disposition), result.CleanupPending, result.ProgressTimestamps, result.PromotedProgressTS, result.NoticeAttempted); err != nil {
 						slog.Warn("server: Slack terminal checkpoint update failed")
 					}
 				}
@@ -598,7 +604,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	consumer := func(e agent.StreamEvent) {
 		if e.Type == agent.StreamEventToolProgress {
 			if presenter != nil && !e.Private && e.PublicTool != nil {
-				presenter.Tool(e.PublicTool.Name, e.PublicTool.InvocationID, string(e.PublicTool.State))
+				presenter.Tool(*e.PublicTool)
 			}
 			return
 		}

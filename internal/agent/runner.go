@@ -1205,13 +1205,18 @@ func (r *AgentRunner) executeToolCall(
 ) (string, bool) {
 	args = normalizeSessionToolArguments(name, sessionID, args)
 	streamRec.Args = args
+	startedAt := time.Now()
 	emitToolState := func(state ToolState, result, errorText string) {
 		emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{
 			Name: streamRec.Name, InvocationID: invocationID, State: state,
 			Args: streamRec.Args, Result: result, Error: errorText,
 		}})
 		if !privateConnectionTurn(promptCtx) {
-			if public, ok := projectPublicToolEvent(registeredNames, name, invocationID, state); ok {
+			duration := time.Duration(0)
+			if state != ToolStateStarted {
+				duration = time.Since(startedAt)
+			}
+			if public, ok := projectPublicToolEvent(registeredNames, name, invocationID, state, args, duration); ok {
 				emit(StreamEvent{Type: StreamEventToolProgress, PublicTool: &public})
 			}
 		}
@@ -1246,7 +1251,7 @@ func (r *AgentRunner) executeToolCall(
 
 // projectPublicToolEvent uses the runner's filtered registration snapshot, not
 // a model-provided label or a raw tool event, to construct channel progress.
-func projectPublicToolEvent(registeredNames map[string]string, proposedName, invocationID string, state ToolState) (PublicToolEvent, bool) {
+func projectPublicToolEvent(registeredNames map[string]string, proposedName, invocationID string, state ToolState, args map[string]any, duration time.Duration) (PublicToolEvent, bool) {
 	switch state {
 	case ToolStateStarted, ToolStateSucceeded, ToolStateFailed:
 	default:
@@ -1256,7 +1261,11 @@ func projectPublicToolEvent(registeredNames map[string]string, proposedName, inv
 	if !ok || name == "" || invocationID == "" {
 		return PublicToolEvent{}, false
 	}
-	return PublicToolEvent{Name: name, InvocationID: invocationID, State: state}, true
+	if state == ToolStateStarted {
+		duration = 0
+	}
+	return PublicToolEvent{Name: name, InvocationID: invocationID, State: state,
+		Detail: publicToolDetail(name, args), Duration: duration}, true
 }
 
 func normalizeSessionToolArguments(toolName, sessionID string, args map[string]any) map[string]any {

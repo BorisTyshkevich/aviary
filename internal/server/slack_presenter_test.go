@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/channels"
 )
 
@@ -29,6 +31,27 @@ type presenterTestSender struct {
 	editRelease chan struct{}
 	postStarted chan struct{}
 	postRelease chan struct{}
+}
+
+type preDispatchRejectSender struct {
+	*presenterTestSender
+	started chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	first   bool
+}
+
+func (s *preDispatchRejectSender) PostThreadTextContext(ctx context.Context, channel, threadTS, body string) (string, error) {
+	s.mu.Lock()
+	first := !s.first
+	s.first = true
+	s.mu.Unlock()
+	if first {
+		close(s.started)
+		<-s.release
+		return "", &channels.SlackDeliveryError{Cause: context.Canceled, Rejected: true}
+	}
+	return s.presenterTestSender.PostThreadTextContext(ctx, channel, threadTS, body)
 }
 
 func (s *presenterTestSender) PostThreadTextContext(ctx context.Context, _, _, body string) (string, error) {
@@ -134,21 +157,82 @@ func presenterForTest(sender *presenterTestSender, progress bool) *slackPresente
 	return p
 }
 
-func TestSlackPresenterFastRunDoesNotPostProgress(t *testing.T) {
+func TestSlackPresenterFastRunFlushesProgressBeforeFinal(t *testing.T) {
 	sender := &presenterTestSender{}
 	p := newSlackPresenter(sender, "C123", "1710000000.123456", true)
-	p.Tool("web_search", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "web_search", InvocationID: "id-1", State: agent.ToolState("started")})
 	result, first := p.Terminal(nil, "done", "", "final", false)
 	require.True(t, first)
 	require.Equal(t, slackOutcomeAnswer, result.Outcome)
-	posts, _, _, _ := sender.snapshot()
-	require.Equal(t, []string{"final"}, posts)
+	posts, _, deletes, _ := sender.snapshot()
+	require.Equal(t, []string{"Tool progress\n• 1. web_search started", "final"}, posts)
+	require.Equal(t, []string{"ts-1"}, deletes)
+}
+
+func TestSlackPresenterRetriesDefinitelyRejectedPreDispatchProgressAtTerminal(t *testing.T) {
+	sender := &preDispatchRejectSender{presenterTestSender: &presenterTestSender{},
+		started: make(chan struct{}), release: make(chan struct{})}
+	p := newSlackPresenter(sender, "C123", "1710000000.123456", true)
+	p.delay = time.Millisecond
+	p.editGap = time.Millisecond
+	p.Tool(agent.PublicToolEvent{Name: "web_search", InvocationID: "id-1", State: agent.ToolStateStarted})
+	select {
+	case <-sender.started:
+	case <-time.After(time.Second):
+		t.Fatal("progress post did not reach pre-dispatch boundary")
+	}
+	p.progressCancel()
+	close(sender.release)
+	result, _ := p.Terminal(nil, "done", "", "final", false)
+	require.Equal(t, slackOutcomeAnswer, result.Outcome)
+	posts, _, deletes, _ := sender.snapshot()
+	require.Equal(t, []string{"Tool progress\n• 1. web_search started", "final"}, posts)
+	require.Equal(t, []string{"ts-1"}, deletes)
+}
+
+func TestSlackPresenterFastRunFlushesAllQueuedPages(t *testing.T) {
+	sender := &presenterTestSender{}
+	p := presenterForTest(sender, true)
+	p.delay = time.Second
+	p.maxChars = 500
+	for i := range 20 {
+		p.Tool(agent.PublicToolEvent{Name: "clickhouse_query", InvocationID: fmt.Sprintf("call-%d", i),
+			State: agent.ToolStateStarted, Detail: "SQL: SELECT count() FROM events WHERE tenant = ? AND day = ?"})
+	}
+	result, _ := p.Terminal(nil, "done", "", "final", false)
+	posts, _, deletes, _ := sender.snapshot()
+	require.Greater(t, len(posts), 2)
+	require.Equal(t, "final", posts[len(posts)-1])
+	require.Len(t, deletes, len(result.ProgressTimestamps))
+	allProgress := strings.Join(posts[:len(posts)-1], "\n")
+	for i := 1; i <= 20; i++ {
+		require.Contains(t, allProgress, fmt.Sprintf("• %d. clickhouse_query", i))
+	}
+}
+
+func TestSlackPresenterTerminalFlushIsBounded(t *testing.T) {
+	sender := &presenterTestSender{}
+	p := newSlackPresenter(sender, "C123", "1710000000.123456", true)
+	p.delay = time.Second
+	p.maxChars = 500
+	p.flushBudget = 20 * time.Millisecond
+	for i := range 20 {
+		p.Tool(agent.PublicToolEvent{Name: "clickhouse_query", InvocationID: fmt.Sprintf("call-%d", i),
+			State: agent.ToolStateStarted, Detail: "SQL: SELECT count() FROM events WHERE tenant = ? AND day = ?"})
+	}
+	start := time.Now()
+	result, _ := p.Terminal(nil, "done", "", "final", false)
+	require.Less(t, time.Since(start), time.Second)
+	require.Equal(t, slackOutcomeAnswer, result.Outcome)
+	posts, _, deletes, _ := sender.snapshot()
+	require.Len(t, posts, 2, "terminal budget limits queued progress before final answer")
+	require.Len(t, deletes, 1)
 }
 
 func TestSlackPresenterProgressOffIgnoresToolEvents(t *testing.T) {
 	sender := &presenterTestSender{}
 	p := presenterForTest(sender, false)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	result, _ := p.Terminal(nil, "done", "", "final", false)
 	require.Equal(t, slackOutcomeAnswer, result.Outcome)
 	posts, edits, deletes, _ := sender.snapshot()
@@ -162,8 +246,8 @@ func TestSlackPresenterProgressCoalescesAndCleansUp(t *testing.T) {
 	p := presenterForTest(sender, true)
 	for i := range 10 {
 		id := "id-" + string(rune('a'+i))
-		p.Tool("registered_tool", id, "started")
-		p.Tool("registered_tool", id, "succeeded")
+		p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: id, State: agent.ToolState("started")})
+		p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: id, State: agent.ToolState("succeeded")})
 	}
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "done", "", "final", false)
@@ -171,19 +255,61 @@ func TestSlackPresenterProgressCoalescesAndCleansUp(t *testing.T) {
 	posts, _, deletes, _ := sender.snapshot()
 	require.Len(t, posts, 2)
 	require.Contains(t, posts[0], "registered_tool")
-	require.Contains(t, posts[0], "2 more")
-	require.NotContains(t, posts[0], "10 more")
+	require.Contains(t, posts[0], "10. registered_tool succeeded")
+	require.NotContains(t, posts[0], "additional calls beyond configured cap")
 	require.LessOrEqual(t, len(posts[0]), slackProgressMaxText)
 	require.Equal(t, []string{"ts-1"}, deletes)
+}
+
+func TestSlackPresenterPaginatesOneHundredCallsAndDeletesEveryPage(t *testing.T) {
+	sender := &presenterTestSender{}
+	p := presenterForTest(sender, true)
+	p.maxCalls, p.maxChars = 100, 500
+	for i := range 100 {
+		p.Tool(agent.PublicToolEvent{Name: "clickhouse_query", InvocationID: fmt.Sprintf("call-%03d", i),
+			State: agent.ToolStateStarted, Detail: "SQL: SELECT count() FROM events WHERE tenant = ? AND day = ?"})
+	}
+	p.mu.Lock()
+	wantPages := len(p.pages)
+	p.mu.Unlock()
+	require.Greater(t, wantPages, 1)
+	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == wantPages },
+		5*time.Second, time.Millisecond)
+	result, _ := p.Terminal(nil, "done", "", "final", false)
+	require.Equal(t, slackOutcomeAnswer, result.Outcome)
+	require.Len(t, result.ProgressTimestamps, wantPages)
+	posts, _, deletes, _ := sender.snapshot()
+	require.Len(t, deletes, wantPages)
+	allProgress := strings.Join(posts[:len(posts)-1], "\n")
+	for i := 1; i <= 100; i++ {
+		require.Contains(t, allProgress, fmt.Sprintf("• %d. clickhouse_query", i))
+	}
+	for _, post := range posts[:len(posts)-1] {
+		require.LessOrEqual(t, len(post), p.maxChars)
+	}
+}
+
+func TestSlackPresenterConfiguredCallCapReportsOverflow(t *testing.T) {
+	sender := &presenterTestSender{}
+	p := presenterForTest(sender, true)
+	p.maxCalls = 3
+	for i := range 5 {
+		p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: fmt.Sprintf("call-%d", i), State: agent.ToolStateStarted})
+	}
+	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
+	posts, _, _, _ := sender.snapshot()
+	require.Contains(t, posts[0], "3. registered_tool")
+	require.Contains(t, posts[0], "2 additional calls beyond configured cap")
+	p.Terminal(nil, "done", "", "final", false)
 }
 
 func TestSlackPresenterProgressEditRespectsMinimumGap(t *testing.T) {
 	sender := &presenterTestSender{}
 	p := presenterForTest(sender, true)
 	p.editGap = 35 * time.Millisecond
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
-	p.Tool("registered_tool", "id-1", "succeeded")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("succeeded")})
 	require.Eventually(t, func() bool { _, edits, _, _ := sender.snapshot(); return len(edits) == 1 }, time.Second, time.Millisecond)
 	p.Terminal(nil, "done", "", "final", false)
 	sender.mu.Lock()
@@ -195,10 +321,10 @@ func TestSlackPresenterProgressEditRespectsMinimumGap(t *testing.T) {
 func TestSlackPresenterFailedCreationIsNeverRepeated(t *testing.T) {
 	sender := &presenterTestSender{postErrors: []error{errors.New("synthetic uncertain post")}}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
-	p.Tool("registered_tool", "id-1", "succeeded")
-	p.Tool("registered_tool", "id-2", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("succeeded")})
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-2", State: agent.ToolState("started")})
 	result, _ := p.Terminal(nil, "done", "", "NO_REPLY", false)
 	require.Equal(t, slackOutcomeSilence, result.Outcome)
 	posts, _, _, _ := sender.snapshot()
@@ -293,7 +419,7 @@ func TestSlackPresenterPartialAnswerWithProgressPostsNoticeAfterParts(t *testing
 	sender := &presenterTestSender{fileError: &channels.SlackFileShareError{Cause: errors.New("synthetic allocation rejection"), SafeFallback: true},
 		postErrors: []error{nil, nil, rejected}}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "done", "", answer, false)
 	require.Equal(t, slackOutcomePartial, result.Outcome)
@@ -311,7 +437,7 @@ func TestSlackPresenterPartialAnswerKeepsPromotedNoticeWhenPostFails(t *testing.
 	sender := &presenterTestSender{fileError: &channels.SlackFileShareError{Cause: errors.New("synthetic allocation rejection"), SafeFallback: true},
 		postErrors: []error{nil, nil, rejected, rejected}}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "done", "", answer, false)
 	require.Equal(t, slackOutcomePartial, result.Outcome)
@@ -326,7 +452,7 @@ func TestSlackPresenterPartialAnswerKeepsPromotedNoticeWhenPostFails(t *testing.
 func TestSlackPresenterFailedAnswerPromotesKnownProgress(t *testing.T) {
 	sender := &presenterTestSender{postErrors: []error{nil, errors.New("synthetic uncertain answer")}}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "done", "", "final", false)
 	require.Equal(t, slackOutcomeUnconfirmed, result.Outcome)
@@ -378,12 +504,12 @@ func TestSlackPresenterUncertainAnswerKeepsDispositionAfterRejectedNotice(t *tes
 func TestSlackPresenterKnownProgressRetainedWhenNoticeEditFails(t *testing.T) {
 	sender := &presenterTestSender{postErrors: []error{nil, errors.New("synthetic uncertain answer")}, editError: errors.New("synthetic uncertain edit")}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "done", "", "answer", false)
 	require.Equal(t, slackOutcomeUnconfirmed, result.Outcome)
 	require.Equal(t, slackDispositionUnconfirmed, result.Disposition)
-	require.Equal(t, "ts-1", result.ProgressTimestamp)
+	require.Equal(t, "ts-1", result.ProgressTimestamps[0])
 	require.True(t, result.CleanupPending)
 	posts, edits, deletes, _ := sender.snapshot()
 	require.Len(t, posts, 2)
@@ -395,7 +521,7 @@ func TestSlackPresenterRejectedNoticeEditPostsFixedNotice(t *testing.T) {
 	rejected := &channels.SlackDeliveryError{Cause: errors.New("synthetic rejected edit"), Rejected: true}
 	sender := &presenterTestSender{editError: rejected}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "error", "", "", false)
 	require.Equal(t, slackOutcomeNotice, result.Outcome)
@@ -425,7 +551,7 @@ func TestSlackPresenterPersistenceHooksBracketWrites(t *testing.T) {
 	var finalized slackTerminalResult
 	p.hooks.ProgressCreated = func(ts string) error { createdCh <- ts; return nil }
 	p.hooks.TerminalFinalized = func(result slackTerminalResult) { finalized = result }
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	var created string
 	select {
 	case created = <-createdCh:
@@ -436,7 +562,7 @@ func TestSlackPresenterPersistenceHooksBracketWrites(t *testing.T) {
 	require.Equal(t, "ts-1", created)
 	require.Equal(t, result, finalized)
 	posts, _, deletes, _ := sender.snapshot()
-	require.Equal(t, []string{"Tool progress\n• registered_tool started", "final"}, posts)
+	require.Equal(t, []string{"Tool progress\n• 1. registered_tool started", "final"}, posts)
 	require.Equal(t, []string{"ts-1"}, deletes)
 }
 
@@ -454,7 +580,7 @@ func TestSlackPresenterNoticeHookFailurePreventsUntrackedPost(t *testing.T) {
 func TestSlackPresenterProgressCleanupFailureRemainsPending(t *testing.T) {
 	sender := &presenterTestSender{deleteError: errors.New("synthetic cleanup denial")}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
 	result, _ := p.Terminal(nil, "done", "", "final", false)
 	require.Equal(t, slackDispositionHandled, result.Disposition)
@@ -466,9 +592,9 @@ func TestSlackPresenterProgressCleanupFailureRemainsPending(t *testing.T) {
 func TestSlackPresenterDrainsInFlightEditBeforeFinal(t *testing.T) {
 	sender := &presenterTestSender{editStarted: make(chan struct{}), editRelease: make(chan struct{})}
 	p := presenterForTest(sender, true)
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	require.Eventually(t, func() bool { posts, _, _, _ := sender.snapshot(); return len(posts) == 1 }, time.Second, time.Millisecond)
-	p.Tool("registered_tool", "id-1", "succeeded")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("succeeded")})
 	select {
 	case <-sender.editStarted:
 	case <-time.After(time.Second):
@@ -485,15 +611,15 @@ func TestSlackPresenterDrainsInFlightEditBeforeFinal(t *testing.T) {
 	result := <-resultCh
 	require.Equal(t, slackOutcomeAnswer, result.Outcome)
 	posts, edits, _, _ := sender.snapshot()
-	require.Equal(t, []string{"Tool progress\n• registered_tool started", "final"}, posts)
-	require.Equal(t, []string{"Tool progress\n• registered_tool succeeded"}, edits)
+	require.Equal(t, []string{"Tool progress\n• 1. registered_tool started", "final"}, posts)
+	require.Equal(t, []string{"Tool progress\n• 1. registered_tool succeeded"}, edits)
 }
 
 func TestSlackPresenterDrainsInFlightCreationAndCleansItUp(t *testing.T) {
 	sender := &presenterTestSender{postStarted: make(chan struct{}), postRelease: make(chan struct{})}
 	p := presenterForTest(sender, true)
 	started := sender.postStarted
-	p.Tool("registered_tool", "id-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "registered_tool", InvocationID: "id-1", State: agent.ToolState("started")})
 	select {
 	case <-started:
 	case <-time.After(time.Second):
@@ -510,6 +636,6 @@ func TestSlackPresenterDrainsInFlightCreationAndCleansItUp(t *testing.T) {
 	result := <-resultCh
 	require.Equal(t, slackOutcomeAnswer, result.Outcome)
 	posts, _, deletes, _ := sender.snapshot()
-	require.Equal(t, []string{"Tool progress\n• registered_tool started", "final"}, posts)
+	require.Equal(t, []string{"Tool progress\n• 1. registered_tool started", "final"}, posts)
 	require.Equal(t, []string{"ts-1"}, deletes)
 }

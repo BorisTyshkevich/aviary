@@ -14,13 +14,14 @@ import (
 )
 
 const (
-	slackProgressDelay     = time.Second
-	slackProgressEditGap   = 2 * time.Second
-	slackProgressTimeout   = 5 * time.Second
-	slackTerminalTimeout   = 45 * time.Second
-	slackAnswerCallTimeout = 15 * time.Second
-	slackProgressMaxCalls  = 8
-	slackProgressMaxText   = 2800
+	slackProgressDelay       = time.Second
+	slackProgressEditGap     = 2 * time.Second
+	slackProgressTimeout     = 5 * time.Second
+	slackProgressFlushBudget = 10 * time.Second
+	slackTerminalTimeout     = 45 * time.Second
+	slackAnswerCallTimeout   = 15 * time.Second
+	slackProgressMaxCalls    = 100
+	slackProgressMaxText     = 2800
 )
 
 type slackPresenterSender interface {
@@ -31,7 +32,17 @@ type slackPresenterSender interface {
 }
 
 type slackPublicCall struct {
-	name, id, state string
+	name, id, state, detail string
+	duration                time.Duration
+	page                    int
+}
+
+type slackProgressPage struct {
+	calls     []int
+	ts        string
+	attempted bool
+	sentBody  string
+	version   int
 }
 
 type slackTerminalOutcome string
@@ -58,11 +69,12 @@ const (
 
 // slackTerminalResult records delivery certainty and temporary-message cleanup.
 type slackTerminalResult struct {
-	Outcome           slackTerminalOutcome
-	Disposition       slackTerminalDisposition
-	ConfirmedNewReply bool
-	ProgressTimestamp string
-	CleanupPending    bool
+	Outcome            slackTerminalOutcome
+	Disposition        slackTerminalDisposition
+	ConfirmedNewReply  bool
+	ProgressTimestamps []string
+	PromotedProgressTS string
+	CleanupPending     bool
 	// NoticeAttempted is the durable uncertainty marker for a standalone post.
 	// A definite rejection clears it even though an HTTP attempt occurred.
 	NoticeAttempted bool
@@ -82,58 +94,85 @@ type slackPresenter struct {
 	channel                string
 	threadTS               string
 	progressOn             bool
+	maxCalls               int
+	maxChars               int
 	summarize              func(context.Context, string, string) (string, error)
 	terminalContextFactory func(time.Duration) (context.Context, context.CancelFunc)
 	delay                  time.Duration
 	editGap                time.Duration
 	terminalTimeout        time.Duration
+	flushBudget            time.Duration
 
-	mu              sync.Mutex
-	calls           []slackPublicCall
-	more            int
-	version         int
-	progressTS      string
-	creationAttempt bool
-	closed          bool
-	terminalSet     bool
-	terminalDone    chan struct{}
-	result          slackTerminalResult
-	wake            chan struct{}
-	progressCancel  context.CancelFunc
-	progressDone    chan struct{}
-	hooks           slackPresenterHooks
+	mu                sync.Mutex
+	calls             []slackPublicCall
+	pages             []slackProgressPage
+	more              int
+	progressFailed    bool
+	lastProgressWrite time.Time
+	closed            bool
+	terminalSet       bool
+	terminalDone      chan struct{}
+	result            slackTerminalResult
+	wake              chan struct{}
+	progressCancel    context.CancelFunc
+	progressDone      chan struct{}
+	hooks             slackPresenterHooks
 }
 
 func newSlackPresenter(sender slackPresenterSender, channel, threadTS string, progressOn bool) *slackPresenter {
 	return &slackPresenter{sender: sender, channel: channel, threadTS: threadTS,
-		progressOn: progressOn, delay: slackProgressDelay, editGap: slackProgressEditGap,
-		terminalTimeout: slackTerminalTimeout,
-		wake:            make(chan struct{}, 1)}
+		progressOn: progressOn, maxCalls: slackProgressMaxCalls, maxChars: slackProgressMaxText,
+		delay: slackProgressDelay, editGap: slackProgressEditGap,
+		terminalTimeout: slackTerminalTimeout, flushBudget: slackProgressFlushBudget,
+		wake: make(chan struct{}, 1)}
 }
 
-func (p *slackPresenter) Tool(name, id, state string) {
-	if p == nil || !p.progressOn || name == "" || id == "" || (state != "started" && state != "succeeded" && state != "failed") {
+func (p *slackPresenter) Tool(event agent.PublicToolEvent) {
+	if p == nil || !p.progressOn || event.Name == "" || event.InvocationID == "" ||
+		(event.State != agent.ToolStateStarted && event.State != agent.ToolStateSucceeded && event.State != agent.ToolStateFailed) {
 		return
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.closed {
+	if p.closed || p.progressFailed {
 		return
 	}
 	for i := range p.calls {
-		if p.calls[i].id == id {
-			p.calls[i].state = state
-			p.version++
+		if p.calls[i].id == event.InvocationID {
+			p.calls[i].state = string(event.State)
+			p.calls[i].duration = event.Duration
+			p.pages[p.calls[i].page].version++
 			p.signal()
 			return
 		}
 	}
-	if len(p.calls) < slackProgressMaxCalls {
-		p.calls = append(p.calls, slackPublicCall{name: name, id: id, state: state})
-	} else if state == "started" {
-		p.more++
+	if len(p.calls) >= p.maxCalls {
+		if event.State == agent.ToolStateStarted {
+			p.more++
+			if len(p.pages) > 0 {
+				p.pages[len(p.pages)-1].version++
+				p.signal()
+			}
+		}
+		return
 	}
-	p.version++
+	call := slackPublicCall{
+		name: trimSlackProgress(slackEscapeToolName(event.Name), 180), id: event.InvocationID,
+		state: string(event.State), detail: trimSlackProgress(slackEscapeToolName(event.Detail), min(1000, max(0, p.maxChars-350))),
+		duration: event.Duration,
+	}
+	if len(p.pages) == 0 {
+		p.pages = append(p.pages, slackProgressPage{})
+	}
+	page := len(p.pages) - 1
+	if len(p.pages[page].calls) > 0 && p.pageBudgetLocked(page)+p.callBudget(call, len(p.calls)+1) > p.maxChars {
+		p.pages = append(p.pages, slackProgressPage{})
+		page++
+	}
+	call.page = page
+	p.calls = append(p.calls, call)
+	p.pages[page].calls = append(p.pages[page].calls, len(p.calls)-1)
+	p.pages[page].version++
 	if p.progressDone == nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		p.progressCancel = cancel
@@ -158,23 +197,60 @@ func slackEscapeToolName(name string) string {
 	return name
 }
 
-func (p *slackPresenter) progressBodyLocked() string {
+func trimSlackProgress(value string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(value) <= maxBytes {
+		return value
+	}
 	var b strings.Builder
-	b.WriteString("Tool progress")
-	for _, call := range p.calls {
-		line := fmt.Sprintf("\n• %s %s", slackEscapeToolName(call.name), call.state)
-		if b.Len()+len(line) > slackProgressMaxText {
+	for _, r := range value {
+		if b.Len()+len(string(r))+3 > maxBytes {
 			break
 		}
-		b.WriteString(line)
+		b.WriteRune(r)
 	}
-	if p.more > 0 {
-		line := fmt.Sprintf("\n… %d more", p.more)
-		if b.Len()+len(line) <= slackProgressMaxText {
-			b.WriteString(line)
-		}
-	}
+	b.WriteString("...")
 	return b.String()
+}
+
+func (p *slackPresenter) progressLine(call slackPublicCall, number int) string {
+	line := fmt.Sprintf("\n• %d. %s %s", number, call.name, call.state)
+	if call.duration > 0 && call.state != string(agent.ToolStateStarted) {
+		line += " (" + call.duration.Round(time.Millisecond).String() + ")"
+	}
+	if call.detail != "" {
+		line += "\n  " + call.detail
+	}
+	return line
+}
+
+func (p *slackPresenter) callBudget(call slackPublicCall, number int) int {
+	return len(p.progressLine(call, number)) + 40 // reserve for a later state and duration
+}
+
+func (p *slackPresenter) pageBudgetLocked(page int) int {
+	size := len("Tool progress (continued)") + 70 // reserve the configured-cap notice
+	for _, i := range p.pages[page].calls {
+		size += p.callBudget(p.calls[i], i+1)
+	}
+	return size
+}
+
+func (p *slackPresenter) progressBodyLocked(page int) string {
+	var b strings.Builder
+	b.WriteString("Tool progress")
+	if page > 0 {
+		b.WriteString(" (continued)")
+	}
+	for _, i := range p.pages[page].calls {
+		b.WriteString(p.progressLine(p.calls[i], i+1))
+	}
+	if p.more > 0 && page == len(p.pages)-1 {
+		fmt.Fprintf(&b, "\n… %d additional calls beyond configured cap", p.more)
+	}
+	return trimSlackProgress(b.String(), p.maxChars)
 }
 
 func (p *slackPresenter) runProgress(ctx context.Context) {
@@ -186,74 +262,163 @@ func (p *slackPresenter) runProgress(ctx context.Context) {
 		return
 	case <-timer.C:
 	}
-	var sentVersion int
 	var lastWrite time.Time
 	for {
 		p.mu.Lock()
-		if p.closed {
+		if p.closed || p.progressFailed {
 			p.mu.Unlock()
 			return
 		}
-		version, body, ts, attempted := p.version, p.progressBodyLocked(), p.progressTS, p.creationAttempt
-		if !attempted {
-			p.creationAttempt = true
+		pageIndex := -1
+		for i := range p.pages {
+			if !p.pages[i].attempted || p.pages[i].version > 0 && p.progressBodyLocked(i) != p.pages[i].sentBody {
+				pageIndex = i
+				break
+			}
 		}
+		if pageIndex < 0 {
+			p.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.wake:
+				continue
+			}
+		}
+		body := p.progressBodyLocked(pageIndex)
+		ts, attempted := p.pages[pageIndex].ts, p.pages[pageIndex].attempted
 		p.mu.Unlock()
+		if wait := time.Until(lastWrite.Add(p.editGap)); wait > 0 {
+			timer.Reset(wait)
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+			}
+		}
+		if ctx.Err() != nil {
+			return
+		}
 		if !attempted {
 			// A dispatched write must finish before terminal delivery. Canceling
 			// the scheduling context stops future writes, not this HTTP call.
 			if ctx.Err() != nil {
 				return
 			}
+			p.mu.Lock()
+			p.pages[pageIndex].attempted = true
+			p.mu.Unlock()
 			callCtx, cancel := context.WithTimeout(channels.WithSlackPreDispatchStop(context.Background(), ctx.Done()), slackProgressTimeout)
 			created, err := p.sender.PostThreadTextContext(callCtx, p.channel, p.threadTS, body)
 			cancel()
-			p.mu.Lock()
-			if err == nil {
-				p.progressTS = created
-			}
-			p.mu.Unlock()
 			if err != nil {
+				p.mu.Lock()
+				// The stop gate can reject a queued request after we mark it
+				// attempted. No write reached Slack, so terminal flush may try it.
+				if ctx.Err() != nil && slackErrorDisposition(err) == slackDispositionPending {
+					p.pages[pageIndex].attempted = false
+				} else {
+					p.progressFailed = true
+				}
+				p.mu.Unlock()
 				return
 			}
+			p.mu.Lock()
+			p.pages[pageIndex].ts = created
+			p.pages[pageIndex].sentBody = body
+			p.lastProgressWrite = time.Now()
+			p.mu.Unlock()
 			if p.hooks.ProgressCreated != nil {
 				if err := p.hooks.ProgressCreated(created); err != nil {
 					slog.Warn("server: Slack progress checkpoint update failed")
+					p.mu.Lock()
+					p.progressFailed = true
+					p.mu.Unlock()
 					return
 				}
 			}
-			sentVersion, lastWrite = version, time.Now()
+			lastWrite = time.Now()
 			continue
 		}
-		if ts == "" {
+		callCtx, cancel := context.WithTimeout(channels.WithSlackPreDispatchStop(context.Background(), ctx.Done()), slackProgressTimeout)
+		err := p.sender.EditThreadTextContext(callCtx, p.channel, ts, body)
+		cancel()
+		if err != nil {
+			slog.Debug("server: Slack progress edit unavailable")
+		}
+		p.mu.Lock()
+		p.pages[pageIndex].sentBody = body // retry only after a subsequent tool event
+		p.lastProgressWrite = time.Now()
+		p.mu.Unlock()
+		lastWrite = time.Now()
+	}
+}
+
+// flushTerminalProgress gives queued pages a finite chance to appear before
+// the final reply. An attempted page is never posted again after uncertainty.
+func (p *slackPresenter) flushTerminalProgress() {
+	if !p.progressOn {
+		return
+	}
+	budgetCtx, budgetCancel := p.operationContext(p.flushBudget)
+	defer budgetCancel()
+	for {
+		p.mu.Lock()
+		if p.progressFailed {
+			p.mu.Unlock()
 			return
 		}
-		if version > sentVersion {
-			if wait := time.Until(lastWrite.Add(p.editGap)); wait > 0 {
-				timer.Reset(wait)
-				select {
-				case <-ctx.Done():
-					return
-				case <-timer.C:
-				}
-				continue
+		index := -1
+		for i := range p.pages {
+			if !p.pages[i].attempted {
+				index = i
+				break
 			}
-			if ctx.Err() != nil {
+		}
+		if index < 0 {
+			p.mu.Unlock()
+			return
+		}
+		body := p.progressBodyLocked(index)
+		lastWrite := p.lastProgressWrite
+		p.mu.Unlock()
+		if wait := time.Until(lastWrite.Add(min(time.Second, p.editGap))); wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-budgetCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+		if budgetCtx.Err() != nil {
+			return
+		}
+		p.mu.Lock()
+		p.pages[index].attempted = true
+		p.mu.Unlock()
+		callCtx, cancel := context.WithTimeout(channels.WithSlackPreDispatchStop(budgetCtx, budgetCtx.Done()), slackProgressTimeout)
+		ts, err := p.sender.PostThreadTextContext(callCtx, p.channel, p.threadTS, body)
+		cancel()
+		if err != nil {
+			p.mu.Lock()
+			p.progressFailed = true
+			p.mu.Unlock()
+			return
+		}
+		p.mu.Lock()
+		p.pages[index].ts = ts
+		p.pages[index].sentBody = body
+		p.lastProgressWrite = time.Now()
+		p.mu.Unlock()
+		if p.hooks.ProgressCreated != nil {
+			if err := p.hooks.ProgressCreated(ts); err != nil {
+				slog.Warn("server: Slack progress checkpoint update failed")
+				p.mu.Lock()
+				p.progressFailed = true
+				p.mu.Unlock()
 				return
 			}
-			callCtx, cancel := context.WithTimeout(channels.WithSlackPreDispatchStop(context.Background(), ctx.Done()), slackProgressTimeout)
-			err := p.sender.EditThreadTextContext(callCtx, p.channel, ts, body)
-			cancel()
-			if err != nil {
-				slog.Debug("server: Slack progress edit unavailable")
-			}
-			sentVersion, lastWrite = version, time.Now()
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-p.wake:
 		}
 	}
 }
@@ -280,10 +445,14 @@ func (p *slackPresenter) beforeTerminal(status *slackRunStatus) bool {
 	if done != nil {
 		<-done
 	}
+	p.flushTerminalProgress()
 	return true
 }
 
 func (p *slackPresenter) finishStatus(status *slackRunStatus, result slackTerminalResult) slackTerminalResult {
+	if result.ProgressTimestamps == nil {
+		result.ProgressTimestamps = p.progressTimestamps()
+	}
 	if p.hooks.TerminalFinalized != nil {
 		p.hooks.TerminalFinalized(result)
 	}
@@ -300,7 +469,24 @@ func (p *slackPresenter) finishStatus(status *slackRunStatus, result slackTermin
 func (p *slackPresenter) progressTimestamp() string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.progressTS
+	for i := len(p.pages) - 1; i >= 0; i-- {
+		if p.pages[i].ts != "" {
+			return p.pages[i].ts
+		}
+	}
+	return ""
+}
+
+func (p *slackPresenter) progressTimestamps() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var timestamps []string
+	for _, page := range p.pages {
+		if page.ts != "" {
+			timestamps = append(timestamps, page.ts)
+		}
+	}
+	return timestamps
 }
 
 func (p *slackPresenter) operationContext(budget time.Duration) (context.Context, context.CancelFunc) {
@@ -310,22 +496,43 @@ func (p *slackPresenter) operationContext(budget time.Duration) (context.Context
 	return context.WithTimeout(context.Background(), budget)
 }
 
-func (p *slackPresenter) cleanup() bool {
-	ts := p.progressTimestamp()
-	if ts == "" {
+func (p *slackPresenter) cleanup(skip string) bool {
+	timestamps := p.progressTimestamps()
+	if len(timestamps) == 0 {
 		return false
 	}
-	callCtx, cancel := p.operationContext(slackProgressTimeout)
-	defer cancel()
-	if err := p.sender.DeleteThreadMessageContext(callCtx, p.channel, ts); err != nil {
-		slog.Warn("server: Slack progress cleanup remains pending")
-		return true
+	budgetCtx, budgetCancel := p.operationContext(slackTerminalTimeout)
+	defer budgetCancel()
+	pending := false
+	for _, ts := range timestamps {
+		if ts == skip {
+			continue
+		}
+		if budgetCtx.Err() != nil {
+			pending = true
+			break
+		}
+		callCtx, cancel := context.WithTimeout(budgetCtx, slackProgressTimeout)
+		err := p.sender.DeleteThreadMessageContext(callCtx, p.channel, ts)
+		cancel()
+		if err != nil {
+			slog.Warn("server: Slack progress cleanup remains pending")
+			pending = true
+		}
 	}
-	return false
+	return pending
 }
 
 func (p *slackPresenter) accepted(result slackTerminalResult, cleanupProgress bool) slackTerminalResult {
-	result.CleanupPending = cleanupProgress && result.ProgressTimestamp != ""
+	result.ProgressTimestamps = p.progressTimestamps()
+	if cleanupProgress || result.PromotedProgressTS != "" {
+		for _, ts := range result.ProgressTimestamps {
+			if ts != result.PromotedProgressTS {
+				result.CleanupPending = true
+				break
+			}
+		}
+	}
 	if p.hooks.TerminalAccepted != nil {
 		if err := p.hooks.TerminalAccepted(result); err != nil {
 			slog.Warn("server: Slack accepted terminal checkpoint update failed")
@@ -333,7 +540,7 @@ func (p *slackPresenter) accepted(result slackTerminalResult, cleanupProgress bo
 		}
 	}
 	if result.CleanupPending {
-		result.CleanupPending = p.cleanup()
+		result.CleanupPending = p.cleanup(result.PromotedProgressTS)
 	}
 	return result
 }
@@ -346,7 +553,7 @@ func (p *slackPresenter) post(ctx context.Context, body string) error {
 }
 
 func (p *slackPresenter) standaloneNotice(body string, outcome slackTerminalOutcome) slackTerminalResult {
-	result := slackTerminalResult{Outcome: outcome, ProgressTimestamp: p.progressTimestamp()}
+	result := slackTerminalResult{Outcome: outcome, ProgressTimestamps: p.progressTimestamps()}
 	if p.hooks.NoticeAttempting != nil {
 		if err := p.hooks.NoticeAttempting(); err != nil {
 			slog.Warn("server: Slack notice checkpoint update failed")
@@ -375,16 +582,16 @@ func (p *slackPresenter) editNotice(body string, outcome slackTerminalOutcome) s
 	err := p.sender.EditThreadTextContext(ctx, p.channel, ts, body)
 	cancel()
 	if err == nil {
-		return p.accepted(slackTerminalResult{Outcome: outcome, Disposition: slackDispositionHandled, ProgressTimestamp: ts}, false)
+		return p.accepted(slackTerminalResult{Outcome: outcome, Disposition: slackDispositionHandled, PromotedProgressTS: ts}, false)
 	}
 	if slackErrorDisposition(err) == slackDispositionPending {
 		result := p.standaloneNotice(body, outcome)
 		if !result.ConfirmedNewReply {
-			result.CleanupPending = true
+			result.CleanupPending = len(result.ProgressTimestamps) > 0
 		}
 		return result
 	}
-	return slackTerminalResult{Outcome: outcome, Disposition: slackDispositionUnconfirmed, ProgressTimestamp: ts, CleanupPending: true}
+	return slackTerminalResult{Outcome: outcome, Disposition: slackDispositionUnconfirmed, ProgressTimestamps: p.progressTimestamps(), CleanupPending: true}
 }
 
 func slackErrorDisposition(err error) slackTerminalDisposition {
@@ -406,9 +613,9 @@ func (p *slackPresenter) Terminal(status *slackRunStatus, kind, model, answer st
 	var result slackTerminalResult
 	switch {
 	case alreadyAnswered:
-		result = p.accepted(slackTerminalResult{Outcome: slackOutcomeAlreadyDone, Disposition: slackDispositionHandled, ProgressTimestamp: p.progressTimestamp()}, true)
+		result = p.accepted(slackTerminalResult{Outcome: slackOutcomeAlreadyDone, Disposition: slackDispositionHandled}, true)
 	case kind == "done" && strings.TrimSpace(answer) != "" && !agent.ShouldDeliverReply(answer):
-		result = p.accepted(slackTerminalResult{Outcome: slackOutcomeSilence, Disposition: slackDispositionHandled, ProgressTimestamp: p.progressTimestamp()}, true)
+		result = p.accepted(slackTerminalResult{Outcome: slackOutcomeSilence, Disposition: slackDispositionHandled}, true)
 	case kind == "done" && strings.TrimSpace(answer) != "":
 		result = p.answer(ctx, model, answer)
 	default:
@@ -468,8 +675,7 @@ func (p *slackPresenter) answer(ctx context.Context, model, answer string) slack
 	if deliveryErr != nil {
 		return p.failedAnswer(ctx, deliveredParts, deliveryErr)
 	}
-	return p.accepted(slackTerminalResult{Outcome: slackOutcomeAnswer, Disposition: slackDispositionHandled, ConfirmedNewReply: true,
-		ProgressTimestamp: p.progressTimestamp()}, true)
+	return p.accepted(slackTerminalResult{Outcome: slackOutcomeAnswer, Disposition: slackDispositionHandled, ConfirmedNewReply: true}, true)
 }
 
 func deadlineOf(ctx context.Context) time.Time { deadline, _ := ctx.Deadline(); return deadline }
@@ -504,6 +710,7 @@ func (p *slackPresenter) failedAnswer(_ context.Context, deliveredParts int, err
 			result.CleanupPending = editErr != nil
 			if editErr == nil {
 				result.Disposition = slackDispositionHandled
+				result.PromotedProgressTS = ts
 				result = p.accepted(result, false)
 			}
 		}

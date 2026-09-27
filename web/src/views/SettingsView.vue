@@ -1609,7 +1609,16 @@ function hydrateDraftConfig(config: AppConfig): AppConfig {
 			if (ch.show_typing === undefined) ch.show_typing = true;
 			if (ch.type === "slack" && ch.tool_progress === undefined)
 				ch.tool_progress = false;
-			if (ch.type !== "slack") delete ch.tool_progress;
+			if (ch.type === "slack") {
+				if (ch.tool_progress_max_calls === undefined)
+					ch.tool_progress_max_calls = 100;
+				if (ch.tool_progress_max_chars === undefined)
+					ch.tool_progress_max_chars = 2800;
+			} else {
+				delete ch.tool_progress;
+				delete ch.tool_progress_max_calls;
+				delete ch.tool_progress_max_chars;
+			}
 			if (ch.reply_to_replies === undefined) ch.reply_to_replies = true;
 			if (ch.ignore_other_user_mentions === undefined)
 				ch.ignore_other_user_mentions = false;
@@ -2763,6 +2772,10 @@ function normalizedDraftConfig(): AppConfig {
 			show_typing: ch.show_typing === false ? false : undefined,
 			tool_progress:
 				ch.type === "slack" && ch.tool_progress === true ? true : undefined,
+			tool_progress_max_calls:
+				ch.type === "slack" ? ch.tool_progress_max_calls : undefined,
+			tool_progress_max_chars:
+				ch.type === "slack" ? ch.tool_progress_max_chars : undefined,
 			separate_top_level_sessions:
 				ch.separate_top_level_sessions === true ? true : undefined,
 			reply_to_replies: ch.reply_to_replies === false ? false : undefined,

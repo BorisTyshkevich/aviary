@@ -1,6 +1,8 @@
 // Package agent manages agent lifecycle, sessions, and LLM prompting.
 package agent
 
+import "time"
+
 // StreamEventType identifies the kind of event in a streaming response.
 type StreamEventType string
 
@@ -32,6 +34,9 @@ type PublicToolEvent struct {
 	Name         string
 	InvocationID string
 	State        ToolState
+	// Detail is a bounded projection of explicitly allowed input fields.
+	Detail   string
+	Duration time.Duration // populated only after the invocation finishes
 }
 
 // ToolEvent carries structured tool execution details for debug-oriented UIs.

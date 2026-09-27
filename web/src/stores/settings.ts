@@ -38,6 +38,8 @@ export interface AgentChannel {
 	allow_from?: AllowFromEntry[];
 	show_typing?: boolean;
 	tool_progress?: boolean;
+	tool_progress_max_calls?: number;
+	tool_progress_max_chars?: number;
 	separate_top_level_sessions?: boolean;
 	reply_to_replies?: boolean;
 	ignore_other_user_mentions?: boolean;
@@ -211,7 +213,11 @@ function parseConfigPayload(raw: string): Partial<AppConfig> {
 
 function channelForType(channel: AgentChannel): AgentChannel {
 	const safe = { ...channel };
-	if (safe.type !== "slack") delete safe.tool_progress;
+	if (safe.type !== "slack") {
+		delete safe.tool_progress;
+		delete safe.tool_progress_max_calls;
+		delete safe.tool_progress_max_chars;
+	}
 	return safe;
 }
 
@@ -244,7 +250,11 @@ export const useSettingsStore = defineStore("settings", () => {
 						// Default these to true when absent.
 						show_typing: ch.show_typing !== false,
 						...(ch.type === "slack"
-							? { tool_progress: ch.tool_progress === true }
+							? {
+									tool_progress: ch.tool_progress === true,
+									tool_progress_max_calls: ch.tool_progress_max_calls ?? 100,
+									tool_progress_max_chars: ch.tool_progress_max_chars ?? 2800,
+								}
 							: {}),
 						reply_to_replies: ch.reply_to_replies !== false,
 						react_to_emoji: ch.react_to_emoji !== false,

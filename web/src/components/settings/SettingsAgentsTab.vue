@@ -730,8 +730,19 @@
 											Show tool progress
 										</label>
 										<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-											Off by default. Shows temporary registered tool names and generic states, without arguments, results, or errors. Independent of Slack's native assistant status.
+											Off by default. Shows temporary tool details, including safe inputs and redacted SQL, then deletes progress after the final answer. Raw results and errors stay private.
 										</p>
+										<div class="mt-2 grid grid-cols-2 gap-2">
+											<label class="text-xs text-gray-600 dark:text-gray-400">
+												Max tool calls
+												<input v-model.number="ch.tool_progress_max_calls" type="number" min="1" max="1000" step="1" class="field-input mt-1" />
+											</label>
+											<label class="text-xs text-gray-600 dark:text-gray-400">
+												Max UTF-8 bytes
+												<input v-model.number="ch.tool_progress_max_chars" type="number" min="500" max="3900" step="1" class="field-input mt-1" />
+											</label>
+										</div>
+										<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Defaults: 100 calls across progress messages, 2,800 UTF-8 bytes per message. More messages appear while the run is active; terminal delivery has a bounded ten-second flush. Calls over the cap are counted.</p>
 									</div>
 									<label class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
 										<input type="checkbox" v-model="ch.reply_to_replies"
