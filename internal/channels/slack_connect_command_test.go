@@ -17,9 +17,17 @@ func TestParseSlackConnectionCommand(t *testing.T) {
 		{"<@BOT> connect https://cluster.example:8443", "clickhouse", "https://cluster.example:8443", "", true, false, false},
 		{"<@BOT> connect <https://cluster.example:8443>", "clickhouse", "https://cluster.example:8443", "", true, false, false},
 		{"<@BOT> connect <https://cluster.example:8443|https://cluster.example:8443>", "clickhouse", "https://cluster.example:8443", "", true, false, false},
+		{"<@BOT> connect <https://cluster.example:8443|cluster.example>", "clickhouse", "https://cluster.example:8443", "", true, false, false},
+		{"<@BOT> connect <https://cluster.example:8443|Production database cluster>", "clickhouse", "https://cluster.example:8443", "", true, false, false},
+		{"<@BOT> connect <https://cluster.example:8443|mcp.example>", "clickhouse", "https://cluster.example:8443", "", true, false, false},
+		{"<@BOT> connect <https://cluster.example:8443/a&amp;b|Production database cluster> reader&amp;team", "clickhouse", "https://cluster.example:8443/a&b", "reader&team", true, false, false},
+		{"<@BOT> connect clickhouse <https://cluster.example:8443|Production database cluster> reader_1", "clickhouse", "https://cluster.example:8443", "reader_1", true, false, false},
+		{"connect mcp <https://cluster.example:8443|MCP gateway> reader_1", "mcp", "https://cluster.example:8443", "reader_1", true, false, true},
 		{"<@BOT> connect https://CLUSTER.EXAMPLE:443/", "clickhouse", "https://cluster.example", "", true, false, false},
 		{"<@BOT> connect https://CLUSTER.EXAMPLE:8443/a%2Fb", "clickhouse", "https://cluster.example:8443/a%2Fb", "", true, false, false},
 		{"<@BOT> connect <https://cluster.example:8443> reader_1", "clickhouse", "https://cluster.example:8443", "reader_1", true, false, false},
+		{"<@BOT> connect <https://cluster.example:8443> <http://reader.team.io|reader.team.io>", "clickhouse", "https://cluster.example:8443", "reader.team.io", true, false, false},
+		{"<@BOT> connect <https://cluster.example:8443> <https://reader.team.io|reader.team.io>", "clickhouse", "https://cluster.example:8443", "reader.team.io", true, false, false},
 		{"<@BOT> connect clickhouse https://cluster.example:8443 aviary_reader", "clickhouse", "https://cluster.example:8443", "aviary_reader", true, false, false},
 		{"<@BOT> connect https://cluster.example:8443 研究/reader:prod", "clickhouse", "https://cluster.example:8443", "研究/reader:prod", true, false, false},
 		{"<@BOT> connect https://cluster.example:8443 <mailto:reader@example.test|reader@example.test>", "clickhouse", "https://cluster.example:8443", "reader@example.test", true, false, false},
@@ -33,12 +41,27 @@ func TestParseSlackConnectionCommand(t *testing.T) {
 		{"connect clickhouse https://mcp.example", "clickhouse", "https://mcp.example", "", true, false, true},
 		{"connect mcp https://cluster.example", "mcp", "https://cluster.example", "", true, false, true},
 		{"connect https://user:fake-secret@cluster.example", "", "", "", true, true, true},
+		{"connect <http://cluster.example|https://cluster.example>", "", "", "", true, true, true},
+		{"connect <https://user:fake-secret@cluster.example|cluster.example>", "", "", "", true, true, true},
+		{"connect <https://cluster.example?token=fake|cluster.example>", "", "", "", true, true, true},
+		{"connect <https://cluster.example#fragment|cluster.example>", "", "", "", true, true, true},
+		{"connect <https://cluster.example?token=fake&amp;more=fake|cluster.example>", "", "", "", true, true, true},
+		{"connect <https://user&amp;team@cluster.example|cluster.example>", "", "", "", true, true, true},
+		{"connect <https://cluster.example|safe> reader&lt;admin", "", "", "", true, true, true},
+		{"connect <https://cluster.example|Production database cluster> extra another", "", "", "", true, true, true},
+		{"connect <https://cluster.example|Production database cluster> reader extra", "", "", "", true, true, true},
+		{"connect <https://cluster.example|Production <database> cluster>", "", "", "", true, true, true},
+		{"connect <https://cluster.example|Production|database>", "", "", "", true, true, true},
+		{"connect <https://cluster.example|Production database", "", "", "", true, true, true},
+		{"connect <https://cluster.example|Production database>suffix", "", "", "", true, true, true},
 		{"connect https://cluster.example extra another", "", "", "", true, true, true},
 		{"connect clickhouse https://cluster.example reader extra", "", "", "", true, true, true},
 		{"connect https://cluster.example user:reader", "clickhouse", "https://cluster.example", "user:reader", true, false, true},
 		{"connect https://cluster.example pass=guess", "", "", "", true, true, true},
 		{"connect https://cluster.example password=guess", "", "", "", true, true, true},
 		{"connect https://cluster.example <@U123>", "", "", "", true, true, true},
+		{"connect https://cluster.example <http://other.team.io|reader.team.io>", "", "", "", true, true, true},
+		{"connect https://cluster.example <https://reader.team.io/path|reader.team.io>", "", "", "", true, true, true},
 		{"connect https://cluster.example <mailto:reader@example.test|another@example.test>", "", "", "", true, true, true},
 		{"status extra", "", "", "", true, true, true},
 		{"disconnect", "", "", "", false, false, false},
@@ -54,6 +77,71 @@ func TestParseSlackConnectionCommand(t *testing.T) {
 				t.Fatalf("transport=%q endpoint=%q username=%q", got.transport, got.endpoint, got.username)
 			}
 		})
+	}
+}
+
+func TestSlackEventConnectUsesLinkDestination(t *testing.T) {
+	richBlocks := slack.Blocks{BlockSet: []slack.Block{slack.NewRichTextBlock("", slack.NewRichTextSection(
+		slack.NewRichTextSectionUserElement("BOT", nil),
+		slack.NewRichTextSectionTextElement(" connect ", nil),
+		slack.NewRichTextSectionLinkElement("https://cluster.example:8443", "cluster.example", nil),
+	))}}
+	for _, tt := range []struct {
+		name   string
+		blocks slack.Blocks
+	}{
+		{"rich text", richBlocks},
+		{"raw fallback", slack.Blocks{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := &SlackChannel{botUserID: "BOT"}
+			called := false
+			ch.intake = func(in slackIngress) bool {
+				called = true
+				cmd, recognized, err := parseSlackConnectionCommand(in.CommandText, "BOT", in.IsDM)
+				if !recognized || err != nil {
+					t.Fatalf("command rejected: recognized=%v err=%v text=%q", recognized, err, in.Text)
+				}
+				if cmd.endpoint != "https://cluster.example:8443" || cmd.transport != "clickhouse" {
+					t.Fatalf("display label changed target: %#v", cmd)
+				}
+				return true
+			}
+			ch.handleMessageEvent(&slackevents.MessageEvent{
+				User: "U1", Channel: "C1", TimeStamp: "100.000001",
+				Text: "<@BOT> connect <https://cluster.example:8443|cluster.example>", Blocks: tt.blocks,
+			})
+			if !called {
+				t.Fatal("connection command did not reach intake")
+			}
+		})
+	}
+}
+
+func TestSlackEventWithoutRawTextCannotConnectFromLinkLabel(t *testing.T) {
+	ch := &SlackChannel{botUserID: "BOT"}
+	intake := &slackConnectionIntake{channel: ch}
+	called := false
+	ch.intake = func(in slackIngress) bool {
+		called = true
+		if in.CommandText != "" || in.Text != "<@BOT> connect https://safe.example" {
+			t.Fatalf("unexpected command views: raw=%q visible=%q", in.CommandText, in.Text)
+		}
+		if intake.handle(in) {
+			t.Fatal("visible link label was parsed as a connection command")
+		}
+		return false
+	}
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		User: "U1", Channel: "C1", TimeStamp: "100.000001",
+		Blocks: slack.Blocks{BlockSet: []slack.Block{slack.NewRichTextBlock("", slack.NewRichTextSection(
+			slack.NewRichTextSectionUserElement("BOT", nil),
+			slack.NewRichTextSectionTextElement(" connect ", nil),
+			slack.NewRichTextSectionLinkElement("https://cluster.example", "https://safe.example", nil),
+		))}},
+	})
+	if !called {
+		t.Fatal("event did not reach command intake")
 	}
 }
 
