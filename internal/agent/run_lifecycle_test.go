@@ -258,6 +258,40 @@ func TestStoppedManagerWakeCannotReplaceActiveRecovery(t *testing.T) {
 	require.NoError(t, newManager.Drain(context.Background()))
 }
 
+func TestCurrentManagerRetriesAfterStaleRecoveryRejects(t *testing.T) {
+	setTestDataDir(t)
+	const agentID = "stale-recovery-winner"
+	path := store.CheckpointPath(agentID, "run-1")
+	require.NoError(t, store.WriteJSON(path, RunCheckpoint{
+		AgentName: agentID, SessionID: "session", Message: "request", CreatedAt: time.Now(),
+	}))
+	old := NewManager(nil)
+	oldRunner := newTestRunner(old, agentID, agentID, &sequenceProvider{})
+	current := NewManager(nil)
+	provider := &sequenceProvider{}
+	currentRunner := newTestRunner(current, agentID, agentID, provider)
+
+	oldRelease, claimed := ClaimCheckpointRecovery(path, nil)
+	require.True(t, claimed)
+	// The current manager loses the first wake to a stale recovery claim.
+	current.wakeCheckpointRecovery(currentRunner, "run-1.json", path, time.Hour)
+	oldRunner.Stop()
+	old.recoverCheckpoint(oldRunner, "run-1.json", path, time.Hour)
+	require.FileExists(t, path, "rejected stale handoff must preserve the checkpoint")
+	oldRelease()
+
+	deadline := time.After(2 * time.Second)
+	for provider.callCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("current manager was not woken after stale handoff rejected")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	currentRunner.Wait()
+	require.NoError(t, current.Drain(context.Background()))
+}
+
 func TestConcurrentRecoveryWakesQuiesceOnRetainedCheckpoint(t *testing.T) {
 	setTestDataDir(t)
 	const agentID = "retained-wake"

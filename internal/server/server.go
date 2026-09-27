@@ -128,6 +128,9 @@ func New(cfg *config.Config, token string) *Server {
 	}
 
 	s.channels = channels.NewManager()
+	s.channels.SetSlackAuthenticatedHook(func(route channels.SlackAuthenticatedRoute) {
+		go s.recoverSlackForRoute(context.Background(), route)
+	})
 	s.channels.SetConnectionService(s.connections)
 	s.channels.SetConnectionValidator(func(_ context.Context, transport, endpoint string) error {
 		policy := s.connectionPolicy.Load()
@@ -337,6 +340,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 	s.routerReadyOnce.Do(func() { close(s.routerReady) })
 	s.channels.Reconcile(channelCtx, s.cfg, s.msgFn)
+	go s.RecoverSlackCheckpoints(context.Background())
 	s.loadSessionDeliveries()
 
 	for {
@@ -502,6 +506,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	var startTyping func()
 	var assistantStatus *slackRunStatus
 	var presenter *slackPresenter
+	var checkpoint *agent.CheckpointHandle
 
 	rOpts := agent.RunOverrides{
 		Model:         msg.Model,
@@ -521,6 +526,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		assistantStatus = nil
 		statusStarted = false
 		presenter = nil
+		checkpoint = nil
 		if ts, ok := candidate.(channels.TypingSender); ok {
 			enabled := ts.ShowTyping()
 			if channelType == "slack" {
@@ -550,6 +556,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		if channelType == "slack" && config.BoolOr(cc.ShowTyping, true) && strings.TrimSpace(incoming.ThreadTS) != "" {
 			if sender, ok := candidate.(channels.AssistantStatusSender); ok {
 				assistantStatus = newSlackRunStatus(sender, incoming.Channel, incoming.ThreadTS)
+				statusCtx := msgCtx
+				assistantStatus.contextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+					return s.terminalContext(statusCtx, budget)
+				}
 			}
 		}
 		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
@@ -558,9 +568,25 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {
 					return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
 				}
+				checkpoint = agent.NewSlackCheckpointHandle(agent.SlackCheckpoint{
+					InstallationID: incoming.InstallationID, WorkspaceID: incoming.WorkspaceID,
+					ConfiguredID: configuredID, ChannelID: incoming.Channel, RootThreadTS: incoming.ThreadTS,
+				})
+				handle := checkpoint
+				presenter.hooks.ProgressCreated = handle.RecordProgressTimestamp
+				presenter.hooks.NoticeAttempting = handle.RecordNoticeAttempt
+				presenter.hooks.TerminalAccepted = func(result slackTerminalResult) error {
+					return handle.RecordTerminal(agent.SlackDispositionHandled, result.CleanupPending, result.ProgressTimestamp)
+				}
+				presenter.hooks.TerminalFinalized = func(result slackTerminalResult) {
+					if err := handle.RecordTerminal(agent.SlackDisposition(result.Disposition), result.CleanupPending, result.ProgressTimestamp); err != nil {
+						slog.Warn("server: Slack terminal checkpoint update failed")
+					}
+				}
 			}
 		}
 		rOpts.SuppressDelivery = presenter != nil
+		rOpts.Checkpoint = checkpoint
 		rOpts.DeferAnswerPersistence = false
 		if presenter != nil {
 			execution, _ := connections.ExecutionFromContext(msgCtx)
@@ -592,6 +618,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		stopActivity := stopTyping
 		stopTyping = nil
 		selectedPresenter := presenter
+		selectedCheckpoint := checkpoint
 		selectedCtx := msgCtx
 		deferPersistence := rOpts.DeferAnswerPersistence
 		stateMu.Unlock()
@@ -604,17 +631,35 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 			return
 		}
-		terminalCtx, cancel := s.terminalContext(selectedCtx, slackTerminalTimeout)
-		selectedPresenter.terminalContext = terminalCtx
+		if e.Type == agent.StreamEventError && selectedCheckpoint != nil && !selectedCheckpoint.Initialized() {
+			// The run never executed or posted progress. There is no durable
+			// marker yet, so make one bounded fixed reply to its original target.
+			noticeCtx, noticeCancel := s.terminalContext(selectedCtx, slackAnswerCallTimeout)
+			_, noticeErr := selectedPresenter.sender.PostThreadTextContext(noticeCtx, selectedPresenter.channel,
+				selectedPresenter.threadTS, "Unable to complete this request.")
+			noticeCancel()
+			if noticeErr != nil {
+				slog.Warn("server: initial Slack checkpoint failure notice unavailable")
+			}
+			if activeStatus != nil {
+				activeStatus.Finish(noticeErr == nil)
+			}
+			return
+		}
+		selectedPresenter.terminalContextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+			return s.terminalContext(selectedCtx, budget)
+		}
 		kind := "done"
 		switch e.Type {
 		case agent.StreamEventStop:
 			kind = "stop"
+			if e.StopCause == agent.StopCauseRunner {
+				kind = "interrupted"
+			}
 		case agent.StreamEventError:
 			kind = "error"
 		}
 		result, first := selectedPresenter.Terminal(activeStatus, kind, e.Model, e.Text, e.AlreadyAnswered)
-		cancel()
 		if first && result.Outcome == slackOutcomeAnswer && deferPersistence {
 			if sessionID, ok := agent.SessionIDFromContext(selectedCtx); ok {
 				if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {

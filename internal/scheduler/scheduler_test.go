@@ -646,7 +646,7 @@ func TestWorkerPool_RejectedAdmissionDoesNotSpendRetry(t *testing.T) {
 	assert.NotNil(t, saved.NextRetryAt)
 }
 
-func TestWorkerPool_CanceledUnadmittedJobDoesNotRequeue(t *testing.T) {
+func TestWorkerPool_ShutdownCanceledParentRequeuesUnadmittedJob(t *testing.T) {
 	setupSchedulerDataDir(t)
 	mgr := agent.NewManager(nil)
 	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
@@ -661,6 +661,23 @@ func TestWorkerPool_CanceledUnadmittedJobDoesNotRequeue(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	NewWorkerPool(queue, mgr, 1).processJob(ctx, claimed)
+	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
+	assert.Zero(t, saved.Attempts)
+}
+
+func TestWorkerPool_ExplicitStopCancelsUnadmittedJob(t *testing.T) {
+	setupSchedulerDataDir(t)
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("task/alpha", "alpha", "hello", "", 1, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	pool := NewWorkerPool(queue, agent.NewManager(nil), 1)
+	pool.registerActiveJob(job.ID, claimed.TaskID, claimed.AgentID, func() {})
+	assert.Equal(t, 1, pool.StopJobs(nil))
+	pool.finishUnadmittedJob(job.ID)
 	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
 	assert.NoError(t, err)
 	assert.Equal(t, domain.JobStatusCanceled, saved.Status)

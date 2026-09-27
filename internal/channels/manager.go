@@ -49,6 +49,105 @@ type Manager struct {
 	connectionValidator func(context.Context, string, string) error
 	credentialValidator func(context.Context, connections.Target, connections.Credential) error
 	postConnect         func(context.Context, connections.Target, connections.Principal, bool) (string, error)
+	slackAuthenticated  func(SlackAuthenticatedRoute)
+}
+
+// SlackRecoverySender sends fixed notices and cleans temporary messages.
+type SlackRecoverySender interface {
+	PostThreadTextContext(context.Context, string, string, string) (string, error)
+	EditThreadTextContext(context.Context, string, string, string) error
+	DeleteThreadMessageContext(context.Context, string, string) error
+}
+
+// SlackAuthenticatedRoute is a generation-bound outgoing route for checkpoint
+// recovery. The authenticated client remains usable for live work after Stop.
+type SlackAuthenticatedRoute struct {
+	AgentName, ConfiguredID, InstallationID, WorkspaceID string
+	Channel                                              SlackRecoverySender
+	StopBeforeDispatch                                   <-chan struct{}
+	CurrentCheck                                         func() bool
+}
+
+// Current reports whether this authenticated route is still published.
+func (r SlackAuthenticatedRoute) Current() bool { return r.CurrentCheck != nil && r.CurrentCheck() }
+
+// PreDispatchStop closes when recovery must start no further Slack requests.
+func (r SlackAuthenticatedRoute) PreDispatchStop() <-chan struct{} { return r.StopBeforeDispatch }
+
+// SetSlackAuthenticatedHook receives route readiness immediately after auth.test.
+// The hook must return promptly; recovery work belongs in a separate goroutine.
+func (m *Manager) SetSlackAuthenticatedHook(hook func(SlackAuthenticatedRoute)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.slackAuthenticated = hook
+}
+
+func (m *Manager) publishSlackAuthentication(connKey string, shared *sharedSlackChannel, userID, teamID string) {
+	m.mu.Lock()
+	if m.stopped || m.quiescing || m.slack[connKey] != shared || !shared.ch.ingressOpen() || userID == "" || teamID == "" {
+		m.mu.Unlock()
+		return
+	}
+	select {
+	case <-shared.recoveryStop:
+		m.mu.Unlock()
+		return
+	default:
+	}
+	shared.recoveryReady, shared.userID, shared.teamID = true, userID, teamID
+	hook := m.slackAuthenticated
+	routes := m.authenticatedRoutesLocked(connKey, shared)
+	m.mu.Unlock()
+	if hook != nil {
+		for _, route := range routes {
+			hook(route)
+		}
+	}
+}
+
+func (m *Manager) authenticatedRoutesLocked(connKey string, shared *sharedSlackChannel) []SlackAuthenticatedRoute {
+	routes := make([]SlackAuthenticatedRoute, 0, len(shared.specs))
+	for _, spec := range shared.specs {
+		route := SlackAuthenticatedRoute{AgentName: spec.agentName, ConfiguredID: spec.channelConfig.ID,
+			InstallationID: shared.userID, WorkspaceID: shared.teamID, Channel: shared.ch, StopBeforeDispatch: shared.recoveryStop}
+		userID, teamID := shared.userID, shared.teamID
+		route.CurrentCheck = func() bool {
+			m.mu.Lock()
+			valid := !m.stopped && !m.quiescing && m.slack[connKey] == shared && shared.recoveryReady &&
+				shared.userID == userID && shared.teamID == teamID && shared.ch.ingressOpen()
+			m.mu.Unlock()
+			return valid
+		}
+		routes = append(routes, route)
+	}
+	return routes
+}
+
+// AuthenticatedSlackRoutes snapshots currently ready configured routes.
+func (m *Manager) AuthenticatedSlackRoutes() []SlackAuthenticatedRoute {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopped || m.quiescing {
+		return nil
+	}
+	var routes []SlackAuthenticatedRoute
+	for connKey, shared := range m.slack {
+		if shared.recoveryReady && shared.ch.ingressOpen() {
+			routes = append(routes, m.authenticatedRoutesLocked(connKey, shared)...)
+		}
+	}
+	return routes
+}
+
+func (shared *sharedSlackChannel) invalidateRecovery() {
+	shared.recoveryReady = false
+	shared.stopRecoveryDispatch()
+}
+
+func (shared *sharedSlackChannel) stopRecoveryDispatch() {
+	if shared.recoveryStop != nil {
+		shared.recoveryStopOnce.Do(func() { close(shared.recoveryStop) })
+	}
 }
 
 // ErrSlackSocketOpen means a replacement Server must not open a new Socket Mode
@@ -94,14 +193,18 @@ type channelSpec struct {
 }
 
 type sharedSlackChannel struct {
-	connKey string
-	keys    []string
-	specs   []channelSpec
-	ch      *SlackChannel
-	cancel  context.CancelFunc
-	sink    *LogSink
-	started time.Time
-	err     string
+	connKey          string
+	keys             []string
+	specs            []channelSpec
+	ch               *SlackChannel
+	cancel           context.CancelFunc
+	sink             *LogSink
+	started          time.Time
+	err              string
+	recoveryStop     chan struct{}
+	recoveryStopOnce sync.Once
+	recoveryReady    bool
+	userID, teamID   string
 }
 
 // NewManager creates a channel Manager.
@@ -240,6 +343,9 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 			slog.Info("channel stopped", "key", key)
 		}
 	}
+	for _, shared := range retiringSlack {
+		shared.invalidateRecovery()
+	}
 	m.mu.Unlock()
 	for _, shared := range retiringSlack {
 		shared.ch.Stop()
@@ -293,6 +399,9 @@ func (m *Manager) Stop() {
 	m.mu.Lock()
 	m.quiescing = true
 	m.stopped = true
+	for _, shared := range m.slack {
+		shared.invalidateRecovery()
+	}
 	channels := make([]Channel, 0, len(m.channels))
 	cancels := make([]context.CancelFunc, 0, len(m.cancels))
 	stopped := map[Channel]struct{}{}
@@ -335,6 +444,9 @@ func (m *Manager) Stop() {
 func (m *Manager) QuiesceSlack(ctx context.Context) error {
 	m.mu.Lock()
 	m.quiescing = true
+	for _, shared := range m.slack {
+		shared.invalidateRecovery()
+	}
 	seen := make(map[*SlackChannel]struct{})
 	channels := make([]*SlackChannel, 0, len(m.slack))
 	for _, shared := range m.slack {
@@ -397,6 +509,7 @@ func (m *Manager) Restart(ctx context.Context, key string, msgFn func(agentName,
 		}
 		specs := append([]channelSpec{}, shared.specs...)
 		old := shared.ch
+		shared.invalidateRecovery()
 		m.mu.Unlock()
 		old.Stop()
 		waitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
@@ -576,12 +689,19 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	cctx, cancel := context.WithCancel(ctx)
 	started := time.Now()
 	shared := &sharedSlackChannel{
-		connKey: connKey,
-		specs:   append([]channelSpec{}, specs...),
-		ch:      ch,
-		cancel:  cancel,
-		sink:    sink,
-		started: started,
+		connKey:      connKey,
+		specs:        append([]channelSpec{}, specs...),
+		ch:           ch,
+		cancel:       cancel,
+		sink:         sink,
+		started:      started,
+		recoveryStop: make(chan struct{}),
+	}
+	ch.onAuthenticated = func(userID, teamID string) { m.publishSlackAuthentication(connKey, shared, userID, teamID) }
+	ch.onIngressClosed = shared.stopRecoveryDispatch
+	ch.onReconnected = func() {
+		userID, teamID := ch.affinityIdentity()
+		m.publishSlackAuthentication(connKey, shared, userID, teamID)
 	}
 	for _, spec := range specs {
 		key := channelKey(spec.agentName, spec.channelConfig.Type, spec.channelConfig.ID)
@@ -594,22 +714,28 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	}
 	m.slack[connKey] = shared
 
-	go func(c *sharedSlackChannel) {
-		if err := c.ch.Start(cctx); cctx.Err() == nil {
-			slog.Warn("channel error", "key", connKey, "err", err)
-			m.mu.Lock()
-			c.err = err.Error()
-			for _, key := range c.keys {
-				m.errors[key] = err.Error()
-			}
-			m.mu.Unlock()
-		}
-	}(shared)
+	go m.runSharedSlack(cctx, connKey, shared)
 
 	for _, key := range shared.keys {
 		slog.Info("channel started", "key", key, "type", "slack")
 	}
 	return nil
+}
+
+func (m *Manager) runSharedSlack(ctx context.Context, connKey string, shared *sharedSlackChannel) {
+	err := shared.ch.Start(ctx)
+	m.mu.Lock()
+	shared.invalidateRecovery()
+	if ctx.Err() == nil && err != nil && m.slack[connKey] == shared {
+		shared.err = err.Error()
+		for _, key := range shared.keys {
+			m.errors[key] = err.Error()
+		}
+	}
+	m.mu.Unlock()
+	if ctx.Err() == nil && err != nil {
+		slog.Warn("channel error", "key", connKey, "err", err)
+	}
 }
 
 func routedSlackMessage(ch *SlackChannel, spec channelSpec, msg IncomingMessage) (IncomingMessage, bool) {
@@ -701,6 +827,7 @@ func (m *Manager) stopSharedSlackLocked(connKey string) {
 	if shared == nil {
 		return
 	}
+	shared.invalidateRecovery()
 	shared.ch.Stop()
 	if shared.cancel != nil {
 		shared.cancel()

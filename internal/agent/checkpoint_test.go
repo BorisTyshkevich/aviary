@@ -181,7 +181,7 @@ func TestRecoverCheckpoints_TrustedIngressRequired(t *testing.T) {
 				AgentName:       "trusted-ingress",
 				SessionID:       sessionID,
 				Message:         privateRequest,
-				Overrides:       tc.overrides,
+				Overrides:       &tc.overrides,
 				CreatedAt:       time.Now().Add(-time.Minute),
 				RetryCount:      1,
 				LastRecoveredAt: time.Now(), // Must not wait for the replay cooldown.
@@ -207,12 +207,9 @@ func TestRecoverCheckpoints_TrustedIngressRequired(t *testing.T) {
 			assert.True(t, os.IsNotExist(err), "non-replayable checkpoint should be removed")
 			msgs, err := store.ReadJSONL[domain.Message](store.SessionPath(agentID, sessionID))
 			require.NoError(t, err)
-			require.Len(t, msgs, 2)
+			require.Len(t, msgs, 1)
 			assert.Equal(t, "", msgs[0].ResponseID, "interrupted request must remain unanswered")
-			assert.Equal(t, domain.MessageRoleAssistant, msgs[1].Role)
-			assert.Contains(t, msgs[1].Content, "Please resend")
-			assert.NotContains(t, msgs[1].Content, privateRequest)
-			assert.Equal(t, []string{msgs[1].Content}, delivered)
+			assert.Empty(t, delivered, "targetless checkpoint must not use session-wide delivery")
 		})
 	}
 }
@@ -281,9 +278,9 @@ func TestRecoverCheckpoints_UnreadableFile(t *testing.T) {
 
 	m.recoverCheckpoints(runner)
 
-	// Corrupt file should be deleted.
+	// Corrupt files remain available for operational inspection.
 	_, err := os.Stat(badPath)
-	assert.True(t, os.IsNotExist(err), "corrupt checkpoint file should be deleted")
+	assert.NoError(t, err, "corrupt checkpoint file should be retained")
 }
 
 // --- runner checkpoint lifecycle tests ---

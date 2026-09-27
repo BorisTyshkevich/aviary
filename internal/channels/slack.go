@@ -63,6 +63,9 @@ type SlackChannel struct {
 	intakeContext   func() context.Context
 	intakeDeferred  func(string, func()) bool
 	redactReference func(channelID, threadTS string) bool
+	onAuthenticated func(userID, teamID string)
+	onReconnected   func()
+	onIngressClosed func()
 }
 
 // slackIngress is built only from the original Slack event, before enrichment.
@@ -256,6 +259,9 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 	c.teamID = resp.TeamID
 	c.identityMu.Unlock()
 	c.logf("slack: auth ok user_id=%s team=%s", resp.UserID, strings.TrimSpace(resp.Team))
+	if c.onAuthenticated != nil {
+		c.onAuthenticated(resp.UserID, resp.TeamID)
+	}
 	cacheCtx, cacheCancel := context.WithTimeout(ctx, 30*time.Second)
 	cacheErr := c.refreshIdentityCache(cacheCtx)
 	cacheCancel()
@@ -306,6 +312,9 @@ func (c *SlackChannel) Stop() {
 		c.ingressClosed = true
 		if c.cancel != nil {
 			c.cancel()
+		}
+		if c.onIngressClosed != nil {
+			c.onIngressClosed()
 		}
 		c.ingressMu.Unlock()
 	})
@@ -372,6 +381,9 @@ func (c *SlackChannel) dispatch(evt socketmode.Event) {
 		c.logf("slack: connecting")
 	case socketmode.EventTypeConnected:
 		c.logf("slack: connected")
+		if c.onReconnected != nil {
+			c.onReconnected()
+		}
 	case socketmode.EventTypeConnectionError:
 		c.logf("slack: connection error")
 	case socketmode.EventTypeInvalidAuth:
@@ -1179,6 +1191,11 @@ func (c *SlackChannel) resolveDeliveryTarget(ctx context.Context, raw string) (s
 	if raw == "" {
 		return "", fmt.Errorf("slack delivery target is required")
 	}
+	// A channel ID from trusted ingress must not be redirected by a cached
+	// channel name that happens to look like the same ID.
+	if slackConversationID(raw) {
+		return raw, nil
+	}
 	c.identityMu.RLock()
 	channelID, hasChannel := c.channelAliases[normalizeSlackAlias(raw)]
 	userID, hasUser := c.userAliases[normalizeSlackAlias(raw)]
@@ -1196,6 +1213,18 @@ func (c *SlackChannel) resolveDeliveryTarget(ctx context.Context, raw string) (s
 	default:
 		return raw, nil
 	}
+}
+
+func slackConversationID(value string) bool {
+	if len(value) < 9 || !strings.ContainsRune("CGD", rune(value[0])) {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		if (value[i] < 'A' || value[i] > 'Z') && (value[i] < '0' || value[i] > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *SlackChannel) openDirectConversation(ctx context.Context, userID string) (string, error) {

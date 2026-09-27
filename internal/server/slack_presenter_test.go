@@ -32,6 +32,9 @@ type presenterTestSender struct {
 }
 
 func (s *presenterTestSender) PostThreadTextContext(ctx context.Context, _, _, body string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	s.mu.Lock()
 	started, release := s.postStarted, s.postRelease
 	s.postStarted = nil
@@ -53,6 +56,39 @@ func (s *presenterTestSender) PostThreadTextContext(ctx context.Context, _, _, b
 		return "", s.postErrors[n-1]
 	}
 	return "ts-" + string(rune('0'+n)), nil
+}
+
+func TestSlackPresenterNoticeGetsFreshBudgetAfterAnswerTimeout(t *testing.T) {
+	sender := &presenterTestSender{postStarted: make(chan struct{}), postRelease: make(chan struct{})}
+	p := presenterForTest(sender, false)
+	p.terminalTimeout = 10 * time.Millisecond
+	srv := &Server{}
+	var budgets []time.Duration
+	p.terminalContextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+		budgets = append(budgets, budget)
+		return srv.terminalContext(context.Background(), budget)
+	}
+	result, _ := p.Terminal(nil, "done", "", "answer", false)
+	require.Equal(t, slackOutcomeUnconfirmed, result.Outcome)
+	require.Equal(t, slackDispositionHandled, result.Disposition,
+		"the fixed notice must retain its own budget after the answer expires")
+	posts, _, _, _ := sender.snapshot()
+	require.Equal(t, []string{"Answer delivery could not be confirmed."}, posts)
+	require.Equal(t, []time.Duration{10 * time.Millisecond, slackAnswerCallTimeout}, budgets)
+}
+
+func TestSlackPresenterDoesNotStartWriteAfterSharedDrainDeadline(t *testing.T) {
+	sender := &presenterTestSender{}
+	p := presenterForTest(sender, false)
+	srv := &Server{}
+	srv.terminalDrainUntil.Store(time.Now().Add(-time.Second).UnixNano())
+	p.terminalContextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+		return srv.terminalContext(context.Background(), budget)
+	}
+	result, _ := p.Terminal(nil, "error", "", "", false)
+	require.False(t, result.ConfirmedNewReply)
+	posts, _, _, _ := sender.snapshot()
+	require.Empty(t, posts, "expired shared drain must prevent a new Slack write")
 }
 
 func (s *presenterTestSender) EditThreadTextContext(ctx context.Context, _, _, body string) error {

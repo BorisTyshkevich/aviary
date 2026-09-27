@@ -42,6 +42,7 @@ type activeJob struct {
 	agentID   string
 	sessionID string
 	cancel    context.CancelFunc
+	userStop  bool
 }
 
 // NewWorkerPool creates a WorkerPool with n concurrent workers.
@@ -152,19 +153,7 @@ func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
 	slog.Info("executing job", "id", job.ID, "task", job.TaskID, "agent", job.AgentID)
 	if err := p.executeJob(jobCtx, job); err != nil {
 		if errors.Is(err, errUnadmittedJob) {
-			// Serialize the final queue state with StopJobs. If the user stop
-			// won, cancellation remains final; otherwise this job is no longer
-			// active when it returns to pending.
-			p.activeMu.Lock()
-			if jobCtx.Err() != nil {
-				if cancelErr := p.queue.Cancel(job.ID); cancelErr != nil {
-					slog.Warn("marking job canceled", "id", job.ID, "err", cancelErr)
-				}
-			} else if requeueErr := p.queue.RequeueUnadmitted(job.ID); requeueErr != nil {
-				slog.Warn("requeueing unadmitted job", "id", job.ID, "err", requeueErr)
-			}
-			delete(p.active, job.ID)
-			p.activeMu.Unlock()
+			p.finishUnadmittedJob(job.ID)
 			return
 		}
 		if errors.Is(err, context.Canceled) {
@@ -182,6 +171,23 @@ func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
 	if err := p.queue.Complete(job.ID); err != nil {
 		slog.Warn("marking job complete", "id", job.ID, "err", err)
 	}
+}
+
+// finishUnadmittedJob serializes rejection with StopJobs. Shutdown also
+// cancels the worker context, so that context alone cannot identify a user
+// request to cancel this durable job.
+func (p *WorkerPool) finishUnadmittedJob(jobID string) {
+	p.activeMu.Lock()
+	defer p.activeMu.Unlock()
+	job := p.active[jobID]
+	if job.userStop {
+		if err := p.queue.Cancel(jobID); err != nil {
+			slog.Warn("marking job canceled", "id", jobID, "err", err)
+		}
+	} else if err := p.queue.RequeueUnadmitted(jobID); err != nil {
+		slog.Warn("requeueing unadmitted job", "id", jobID, "err", err)
+	}
+	delete(p.active, jobID)
 }
 
 func (p *WorkerPool) heartbeatJob(jobID string, stop <-chan struct{}) {
@@ -405,6 +411,8 @@ func (p *WorkerPool) StopJobs(matcher func(jobID, taskID string) bool) int {
 		if job.cancel != nil {
 			job.cancel()
 		}
+		job.userStop = true
+		p.active[jobID] = job
 		stopped++
 	}
 	return stopped

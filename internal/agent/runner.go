@@ -76,6 +76,8 @@ type RunOverrides struct {
 	SuppressDelivery bool
 	// DeferAnswerPersistence lets an authenticated channel publish only after delivery.
 	DeferAnswerPersistence bool
+	// Checkpoint carries Slack's trusted, non-replayable target through this run.
+	Checkpoint *CheckpointHandle `json:"-"`
 }
 
 // Prompt sends a message to the agent and fans out stream events to consumers.
@@ -266,17 +268,20 @@ func (r *AgentRunner) promptCore(
 		// The checkpoint is deleted at goroutine exit unless the server was stopped.
 		checkpointOwned := !persistUserMessage
 		var checkpointErr error
-		if persistUserMessage && persistedPromptID != "" && !isScheduledTaskRun {
+		if overrides.Checkpoint != nil || (persistUserMessage && persistedPromptID != "" && !isScheduledTaskRun) {
 			cp := &RunCheckpoint{
 				AgentName:       r.agent.Name,
 				SessionID:       sessionID,
 				PromptMessageID: persistedPromptID,
-				Message:         message,
-				MediaURL:        mediaURL,
-				Overrides:       overrides,
 				CreatedAt:       time.Now(),
 			}
-			if checkpointErr = store.WriteJSON(checkpointPath, cp); checkpointErr != nil {
+			if overrides.Checkpoint != nil {
+				checkpointErr = overrides.Checkpoint.bind(checkpointPath, *cp)
+			} else {
+				cp.Message, cp.MediaURL, cp.Overrides = message, mediaURL, &overrides
+				checkpointErr = store.WriteJSON(checkpointPath, cp)
+			}
+			if checkpointErr != nil {
 				slog.Warn("agent: failed to write run checkpoint", "agent", r.agent.Name, "err", checkpointErr)
 			} else {
 				checkpointOwned = true
@@ -286,6 +291,12 @@ func (r *AgentRunner) promptCore(
 		// (in which case the checkpoint is kept for recovery on restart).
 		defer func() {
 			if !checkpointOwned {
+				return
+			}
+			if overrides.Checkpoint != nil {
+				if err := overrides.Checkpoint.retireIfHandled(); err != nil {
+					slog.Warn("agent: failed to retire handled Slack checkpoint", "agent", r.agent.Name, "err", err)
+				}
 				return
 			}
 			if state.completedTerminal() || state.stopCause() != StopCauseRunner {
@@ -678,7 +689,11 @@ func (r *AgentRunner) recoverPrompt(ctx context.Context, checkpointID, checkpoin
 	if promptMessageID == "" {
 		promptMessageID = checkpointID
 	}
-	return r.promptCore(ctx, cp.Message, cp.MediaURL, cp.Overrides, promptMessageID, checkpointPath, false, consumers...)
+	var overrides RunOverrides
+	if cp.Overrides != nil {
+		overrides = *cp.Overrides
+	}
+	return r.promptCore(ctx, cp.Message, cp.MediaURL, overrides, promptMessageID, checkpointPath, false, consumers...)
 }
 
 func (r *AgentRunner) resolveSessionID(ctx context.Context) string {
