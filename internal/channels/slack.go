@@ -498,9 +498,6 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	}
 
 	result := checkAllowed(c.allowedEntries(), from, channelID, text, isGroup, c.botUserID, false)
-	if !result.allowed && isThreadReply {
-		result = checkAllowedReplyContinuation(c.allowedEntries(), from, channelID, isGroup)
-	}
 	if !result.allowed {
 		c.logf("slack: ignored message from=%s channel=%s", from, channelID)
 		return

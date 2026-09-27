@@ -474,9 +474,6 @@ func routedSlackMessage(ch *SlackChannel, spec channelSpec, msg IncomingMessage)
 	}
 	allowFrom := ch.resolvedEntriesForRouting(spec.channelConfig.AllowFrom)
 	result := checkAllowed(allowFrom, msg.From, msg.Channel, msg.Text, isGroup, botUserID, false)
-	if !result.allowed && msg.IsThreadReply {
-		result = checkAllowedReplyContinuation(allowFrom, msg.From, msg.Channel, isGroup)
-	}
 	if !result.allowed {
 		return IncomingMessage{}, false
 	}
