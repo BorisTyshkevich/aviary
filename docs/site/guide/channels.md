@@ -40,7 +40,7 @@ Shared channel behavior:
 - `allow_from` controls which senders and group contexts are allowed to reach the agent.
 - Channel-level `model` and `fallbacks` override the agent defaults for messages arriving through that channel.
 - `show_typing` applies to Signal typing notifications and fixed generic Slack assistant status on supported surfaces. The selected agent/channel route controls it, including when agents share one Slack connection. Discord does not support it.
-- `tool_progress` is an optional Slack-only setting, off by default. The selected route controls it independently of `show_typing`. `tool_progress_max_calls` defaults to 100 (range 1–1000) and `tool_progress_max_chars` defaults to 2800 (range 500–3900).
+- `tool_progress` is an optional Slack-only setting with values `off` (default), `name`, and `sql`. The selected route controls it independently of `show_typing`. `tool_progress_max_calls` defaults to 100 (range 1–1000) and `tool_progress_max_chars` defaults to 2800 (range 500–3900).
 
 ## Slack
 
@@ -126,7 +126,7 @@ Slack-specific notes:
 - `allow_from[].from` accepts raw Slack user IDs or human-friendly names such as `alice` or `@alice`.
 - `allow_from[].allowed_groups` accepts raw Slack channel IDs or human-friendly names such as `alerts` or `#alerts`.
 - Slack apps connected through Events API and Socket Mode cannot emit classic typing notifications, but Aviary uses fixed generic Slack assistant status on supported surfaces when the selected route has `show_typing` enabled. Status never includes tool names, arguments, results, errors, paths, or commands.
-- When `tool_progress` is enabled, Aviary shows registered tool names, state, elapsed time, and safe input details in temporary messages in the original thread. SQL literals and comments are redacted; raw results and errors stay private. Each message stays within the UTF-8 byte cap. Calls through the call cap are paginated while the run is active, with up to ten seconds to flush queued pages before the final answer; additional calls are counted on the last page. Progress is cleaned up after the final answer when Slack permits it.
+- With `tool_progress: name`, Aviary shows registered tool names, state, and elapsed time in temporary messages in the original thread. `tool_progress: sql` also shows safe input details, with SQL literals and comments redacted. Raw results and errors stay private. Each message stays within the UTF-8 byte cap. Calls through the call cap are paginated while the run is active, with up to ten seconds to flush queued pages before the final answer; additional calls are counted on the last page. Progress is cleaned up after the final answer when Slack permits it.
 - `users:read` is required if you want Aviary to resolve Slack user names and support name-based routing instead of raw user IDs only.
 - In the control panel, **Settings > Agents > Channels > Slack** includes a **Browse Channels** action that validates the bot token and lists channels visible to the app.
 

@@ -48,9 +48,13 @@ func liveSlackCheckpoint(t *testing.T) (string, agent.RunCheckpoint) {
 }
 
 func liveSlackConfig(model string, progress bool) *config.Config {
+	mode := config.ToolProgressOff
+	if progress {
+		mode = config.ToolProgressName
+	}
 	return &config.Config{Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{}},
 		Agents: []config.AgentConfig{{Name: "bot", Model: model, Channels: []config.ChannelConfig{{
-			Type: "slack", ID: "alerts", ToolProgress: &progress,
+			Type: "slack", ID: "alerts", ToolProgress: &mode,
 		}}}}}
 }
 

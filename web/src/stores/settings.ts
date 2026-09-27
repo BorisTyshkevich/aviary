@@ -37,7 +37,7 @@ export interface AgentChannel {
 	disabled_tools?: string[];
 	allow_from?: AllowFromEntry[];
 	show_typing?: boolean;
-	tool_progress?: boolean;
+	tool_progress?: "off" | "name" | "sql";
 	tool_progress_max_calls?: number;
 	tool_progress_max_chars?: number;
 	separate_top_level_sessions?: boolean;
@@ -251,7 +251,10 @@ export const useSettingsStore = defineStore("settings", () => {
 						show_typing: ch.show_typing !== false,
 						...(ch.type === "slack"
 							? {
-									tool_progress: ch.tool_progress === true,
+									tool_progress:
+										ch.tool_progress === "name" || ch.tool_progress === "sql"
+											? ch.tool_progress
+											: "off",
 									tool_progress_max_calls: ch.tool_progress_max_calls ?? 100,
 									tool_progress_max_chars: ch.tool_progress_max_chars ?? 2800,
 								}

@@ -326,8 +326,12 @@ func (v *validator) checkChannel(field string, ch ChannelConfig) {
 	default:
 		v.errorf(field+".type", "unknown channel type %q; must be \"slack\", \"discord\", or \"signal\"", ch.Type)
 	}
-	if ch.ToolProgress != nil && ch.Type != "slack" {
-		v.errorf(field+".tool_progress", "tool_progress is only supported for Slack channels")
+	if ch.ToolProgress != nil {
+		if ch.Type != "slack" {
+			v.errorf(field+".tool_progress", "tool_progress is only supported for Slack channels")
+		} else if *ch.ToolProgress != ToolProgressOff && *ch.ToolProgress != ToolProgressName && *ch.ToolProgress != ToolProgressSQL {
+			v.errorf(field+".tool_progress", "tool_progress must be one of %q, %q, or %q", ToolProgressOff, ToolProgressName, ToolProgressSQL)
+		}
 	}
 	if ch.ToolProgressMaxCalls != nil {
 		if ch.Type != "slack" {

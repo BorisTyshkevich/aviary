@@ -18,6 +18,11 @@ func TestPublicToolSQLDetailRedactsLiteralsCommentsAndOtherInputs(t *testing.T) 
 	for _, name := range []string{"clickhouse_gen1__query", "chlab_query"} {
 		started, ok := projectPublicToolEvent(registered, name, "first", ToolStateStarted, args, time.Second)
 		require.True(t, ok)
+		if name == "chlab_query" {
+			require.Equal(t, "chlab_query", started.Name)
+		} else {
+			require.Equal(t, "clickhouse_query", started.Name)
+		}
 		require.Zero(t, started.Duration)
 		require.Contains(t, started.Detail, "SELECT count() FROM events")
 		require.Contains(t, started.Detail, "max_rows=100")
@@ -31,6 +36,18 @@ func TestPublicToolSQLDetailRedactsLiteralsCommentsAndOtherInputs(t *testing.T) 
 		require.True(t, ok)
 		require.Equal(t, started.Detail, finished.Detail)
 		require.Equal(t, 3*time.Second, finished.Duration)
+	}
+}
+
+func TestPublicToolNameOmitsDynamicTargetGeneration(t *testing.T) {
+	for name, expected := range map[string]string{
+		"clickhouse_fake-secret-generation__query":   "clickhouse_query",
+		"clickhouse_fake-secret-generation__inspect": "clickhouse_inspect",
+		"clickhouse_fake-secret-generation__future":  "clickhouse_tool",
+	} {
+		event, ok := projectPublicToolEvent(map[string]string{name: name}, name, "call", ToolStateStarted, nil, 0)
+		require.True(t, ok)
+		require.Equal(t, expected, event.Name)
 	}
 }
 

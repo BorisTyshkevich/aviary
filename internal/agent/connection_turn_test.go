@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -48,24 +49,46 @@ func TestConnectionTurnReservesEmptyThreadAndDropsScheduledIdentity(t *testing.T
 	require.False(t, scheduled.Personal())
 }
 
-func TestPrivateTurnDoesNotPersistToolEvidence(t *testing.T) {
+func TestPrivateTurnPublishesOnlyProjectedToolProgress(t *testing.T) {
 	setTestDataDir(t)
 	r := NewAgentRunner(&domain.Agent{ID: "private"}, &config.AgentConfig{}, nil, nil)
 	ctx := privateTestContext(t, r)
 	client := &privateEvidenceClient{}
-	var raw, public int
+	lease, leased := connections.LeaseFromContext(ctx)
+	require.True(t, leased)
+	var raw []ToolEvent
+	var public []PublicToolEvent
+	args := map[string]any{
+		"path": "/fake-secret-private-path", "token": "fake-secret-token",
+		"generation": lease.Target().Generation,
+	}
 	text, stop := r.executeToolCall(ctx, func(event StreamEvent) {
 		if event.Type == StreamEventTool {
-			raw++
+			require.NotNil(t, event.Tool)
+			raw = append(raw, *event.Tool)
 		}
 		if event.Type == StreamEventToolProgress {
-			public++
+			require.NotNil(t, event.PublicTool)
+			public = append(public, *event.PublicTool)
 		}
-	}, client, "shared", nil, toolEventRecord{Name: "artifact_read"}, "artifact_read", nil, map[string]string{"artifact_read": "artifact_read"}, "tool_test")
+	}, client, "shared", nil, toolEventRecord{Name: "artifact_read"}, "artifact_read", args, map[string]string{"artifact_read": "artifact_read"}, "tool_test")
 	require.False(t, stop)
 	require.Equal(t, "alice-private-evidence", text)
-	require.Equal(t, 2, raw)
-	require.Zero(t, public)
+	require.Len(t, raw, 2)
+	require.Equal(t, "alice-private-evidence", raw[1].Result, "private tool result remains available to the runner")
+	require.Len(t, public, 2)
+	require.Equal(t, PublicToolEvent{Name: "artifact_read", InvocationID: "tool_test", State: ToolStateStarted, PrivateSafe: true}, public[0])
+	require.Equal(t, "artifact_read", public[1].Name)
+	require.Equal(t, "tool_test", public[1].InvocationID)
+	require.Equal(t, ToolStateSucceeded, public[1].State)
+	require.True(t, public[1].PrivateSafe)
+	require.Empty(t, public[1].Detail)
+	require.GreaterOrEqual(t, public[1].Duration, time.Duration(0))
+	encoded, err := json.Marshal(public)
+	require.NoError(t, err)
+	for _, secret := range []string{"alice-private-evidence", "/fake-secret-private-path", "fake-secret-token", lease.Target().Generation} {
+		require.NotContains(t, string(encoded), secret)
+	}
 	rows, err := store.ReadJSONL[domain.Message](store.SessionPath("private", "shared"))
 	if err == nil {
 		require.Empty(t, rows)

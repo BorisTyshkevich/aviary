@@ -49,5 +49,13 @@ func privateConnectionTurn(ctx context.Context) bool {
 	return ok && e.Personal() && leased && lease.Target().Generation != ""
 }
 
+// connectedProgressTurn requires an actual leased target. A preparation-only
+// context is private, but has no authorized channel progress projection.
+func connectedProgressTurn(ctx context.Context) bool {
+	e, ok := connections.ExecutionFromContext(ctx)
+	lease, leased := connections.LeaseFromContext(ctx)
+	return ok && e.Personal() && leased && lease.Target().Generation != ""
+}
+
 // PrivateDataContext reports whether shared persistence would expose turn evidence.
 func PrivateDataContext(ctx context.Context) bool { return privateConnectionTurn(ctx) }

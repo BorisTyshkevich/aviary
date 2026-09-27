@@ -42,7 +42,7 @@ unavailable during a private turn. These tools have shared state or diagnostics;
 they are not a private evidence publication mechanism. Read-only local tools and
 explicitly configured trusted deployment executables remain available.
 Configured host executables are trusted code, not a sandbox. A final Slack answer
-is recorded in shared history only after successful delivery. Private turns publish no tool progress; only a successfully delivered final answer is published.
+is recorded in shared history only after successful delivery. Personal connected turns with an active target lease follow the Slack route's `tool_progress` mode: `name` shows tool names and status, and `sql` also shows allowlisted inputs with SQL literals and comments redacted. Private preparation-only turns publish no progress. Raw tool results and errors are never included.
 
 The driver normally derives `max_execution_time` from a Go context deadline.
 The adapter deliberately hides that deadline from the driver while retaining
