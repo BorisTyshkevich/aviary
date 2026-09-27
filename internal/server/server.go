@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/slack-go/slack"
@@ -21,10 +22,13 @@ import (
 	"github.com/lsegal/aviary/internal/auth"
 	"github.com/lsegal/aviary/internal/browser"
 	"github.com/lsegal/aviary/internal/channels"
+	"github.com/lsegal/aviary/internal/clickhouseconn"
 	"github.com/lsegal/aviary/internal/config"
+	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
 	"github.com/lsegal/aviary/internal/llm"
 	"github.com/lsegal/aviary/internal/mcp"
+	"github.com/lsegal/aviary/internal/preparation"
 	"github.com/lsegal/aviary/internal/scheduler"
 	"github.com/lsegal/aviary/internal/sessiontarget"
 	"github.com/lsegal/aviary/internal/store"
@@ -47,6 +51,9 @@ type Server struct {
 	llmFactory        *llm.Factory
 	sched             *scheduler.Scheduler
 	channels          *channels.Manager
+	connections       *connections.Service
+	startupErr        error
+	connectionPolicy  atomic.Pointer[config.ConnectionPolicyConfig]
 	brw               *browser.Manager
 	sampler           *ProcSampler
 	watcher           *config.Watcher
@@ -67,6 +74,7 @@ func New(cfg *config.Config, token string) *Server {
 		hardRestartCh:     make(chan struct{}, 1),
 		upgradeCh:         make(chan struct{}, 1),
 	}
+	s.connectionPolicy.Store(cfg.Connections)
 	// Create auth store first — needed for both MCP deps and LLM token refresh.
 	authPath := filepath.Join(store.SubDir(store.DirAuth), "credentials.json")
 	authStore, _ := auth.NewFileStore(authPath)
@@ -90,6 +98,17 @@ func New(cfg *config.Config, token string) *Server {
 	}
 	s.agents = agent.NewManager(factory)
 	s.llmFactory = factory
+	if service, err := connections.Open(store.SubDir("connections")); err == nil {
+		s.connections = service
+		s.agents.SetConnectionService(service)
+	} else {
+		s.startupErr = errors.New("connection storage is unavailable; refusing to start credential intake")
+	}
+	if engine, err := preparation.Open(store.SubDir("preparation")); err == nil {
+		s.agents.SetPreparationEngine(engine)
+	} else {
+		slog.Error("server: preparation storage unavailable")
+	}
 
 	// Initial reconcile from loaded config.
 	s.agents.Reconcile(cfg)
@@ -103,6 +122,25 @@ func New(cfg *config.Config, token string) *Server {
 	}
 
 	s.channels = channels.NewManager()
+	s.channels.SetConnectionService(s.connections)
+	s.channels.SetConnectionValidator(func(_ context.Context, transport, endpoint string) error {
+		policy := s.connectionPolicy.Load()
+		if transport != "clickhouse" || policy == nil {
+			return errors.New("connection endpoint is not allowed")
+		}
+		_, err := policy.Network.ValidateURL(endpoint)
+		return err
+	})
+	adapter := func() clickhouseconn.Adapter {
+		policy := s.connectionPolicy.Load()
+		if policy == nil {
+			return clickhouseconn.Adapter{}
+		}
+		return clickhouseconn.Adapter{Policy: policy.Network}
+	}
+	s.channels.SetCredentialValidator(func(ctx context.Context, target connections.Target, credential connections.Credential) error {
+		return adapter().ValidateReadOnly(ctx, clickhouseconn.Target{Endpoint: target.Endpoint, Username: credential.Username}, clickhouseconn.NewCredentials(credential.Password))
+	})
 	if s.sched != nil {
 		s.sched.SetTaskOutputDelivery(s.deliverTaskOutput)
 	}
@@ -121,12 +159,14 @@ func New(cfg *config.Config, token string) *Server {
 
 	// Inject deps into MCP tool handlers.
 	mcp.SetDeps(&mcp.Deps{
-		Agents:    s.agents,
-		Scheduler: s.sched,
-		Channels:  s.channels,
-		Browser:   s.brw,
-		Auth:      authStore,
-		Upgrade:   s.triggerUpgrade,
+		Connections: s.connections,
+		ClickHouse:  adapter,
+		Agents:      s.agents,
+		Scheduler:   s.sched,
+		Channels:    s.channels,
+		Browser:     s.brw,
+		Auth:        authStore,
+		Upgrade:     s.triggerUpgrade,
 	})
 	agent.SetToolClientFactory(mcp.NewAgentToolClient)
 	agent.SetSessionMessageObserver(func(agentID, sessionID, role string) {
@@ -163,6 +203,7 @@ func New(cfg *config.Config, token string) *Server {
 
 func (s *Server) applyConfigReload(newCfg *config.Config) {
 	oldCfg := s.cfg
+	s.connectionPolicy.Store(newCfg.Connections)
 	if err := store.UpdateChannelMetadataState(oldCfg, newCfg, time.Now().UTC()); err != nil {
 		slog.Warn("server: failed to update channel metadata state", "err", err)
 	}
@@ -232,6 +273,9 @@ func (s *Server) registerRoutes() {
 // It returns only when the context is cancelled, an error occurs, or an
 // explicit process restart is requested.
 func (s *Server) ListenAndServe(ctx context.Context) error {
+	if s.startupErr != nil {
+		return s.startupErr
+	}
 	s.runCtx = ctx
 
 	// Start config watcher in background.
@@ -340,6 +384,15 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	msgCtx = agent.WithSessionSender(msgCtx, domain.NewMessageSender(msg.From, msg.SenderName, true))
 
 	agentID := agentName
+	if channelType == "slack" && msg.InstallationID != "" && msg.WorkspaceID != "" {
+		msgCtx = connections.WithExecution(msgCtx, connections.Execution{
+			Kind: connections.Interactive,
+			Scope: connections.Scope{AgentID: agentID, InstallationID: msg.InstallationID,
+				WorkspaceID: msg.WorkspaceID, ChannelID: msg.Channel, RootThreadID: msg.ThreadTS},
+			Principal: connections.Principal{InstallationID: msg.InstallationID,
+				WorkspaceID: msg.WorkspaceID, UserID: msg.From},
+		})
+	}
 	channelCfg, _ := s.findChannelConfig(agentName, channelType, configuredID)
 	sessionName := channelSessionNameForIncoming(agentID, channelCfg, msg)
 	if sess, err := agent.NewSessionManager().GetOrCreateNamed(agentID, sessionName); err == nil && sess != nil {
@@ -434,11 +487,16 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	}
 	if slackStreamer != nil {
 		rOpts.SuppressDelivery = true
+		execution, _ := connections.ExecutionFromContext(msgCtx)
+		rOpts.DeferAnswerPersistence = execution.Personal()
 	}
 
 	runner.PromptMediaWithOverrides(msgCtx, msg.Text, msg.MediaURL, rOpts, func(e agent.StreamEvent) {
 		switch e.Type {
 		case agent.StreamEventTool:
+			if e.Private {
+				return
+			}
 			if slackStreamer != nil && e.Tool != nil {
 				if status := slackToolStatusText(e.Tool); status != "" {
 					if as, ok := ch.(channels.AssistantStatusSender); ok && as.ShowAssistantStatus() && strings.TrimSpace(msg.ThreadTS) != "" {
@@ -452,6 +510,9 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				}
 			}
 		case agent.StreamEventStatus:
+			if e.Private {
+				return
+			}
 			if slackStreamer == nil {
 				sendOrEditStatus(e.Text)
 			}
@@ -484,7 +545,13 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 		case agent.StreamEventDone:
 			if slackStreamer != nil {
-				slackStreamer.SendAnswer(msgCtx, e.Model, e.Text)
+				if slackStreamer.SendAnswer(msgCtx, e.Model, e.Text) && rOpts.DeferAnswerPersistence {
+					if sessionID, ok := agent.SessionIDFromContext(msgCtx); ok {
+						if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {
+							slog.Warn("server: failed to record delivered answer")
+						}
+					}
+				}
 			}
 			if stopTyping != nil {
 				stopTyping()
@@ -622,13 +689,12 @@ func (s *slackThreadStreamer) UpsertToolOutput(tool *agent.ToolEvent) {
 	s.FlushTools()
 }
 
-func (s *slackThreadStreamer) SendAnswer(ctx context.Context, model, answer string) {
+func (s *slackThreadStreamer) SendAnswer(ctx context.Context, model, answer string) bool {
 	if s == nil || strings.TrimSpace(answer) == "" {
-		return
+		return false
 	}
 	if !shouldAttachSlackAnswer(answer) || s.answer == nil {
-		s.SendPlain(answer)
-		return
+		return s.SendPlain(answer)
 	}
 	introduction := "Full answer attached."
 	if s.summarize != nil {
@@ -640,13 +706,14 @@ func (s *slackThreadStreamer) SendAnswer(ctx context.Context, model, answer stri
 	}
 	if err := s.answer.SendThreadMarkdownFile(ctx, s.channel, s.threadTS, introduction, answer); err != nil {
 		slog.Warn("server: failed to upload Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
-		s.SendPlain(answer)
+		return s.SendPlain(answer)
 	}
+	return true
 }
 
-func (s *slackThreadStreamer) SendPlain(answer string) {
+func (s *slackThreadStreamer) SendPlain(answer string) bool {
 	if s == nil || answer == "" {
-		return
+		return false
 	}
 	for _, part := range splitSlackPlainText(answer, 3900) {
 		var err error
@@ -657,9 +724,10 @@ func (s *slackThreadStreamer) SendPlain(answer string) {
 		}
 		if err != nil {
 			slog.Warn("server: failed to send Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
-			return
+			return false
 		}
 	}
+	return true
 }
 
 func (s *slackThreadStreamer) FlushTools() {

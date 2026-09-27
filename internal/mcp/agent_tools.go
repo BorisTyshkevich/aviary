@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 
 	"github.com/lsegal/aviary/internal/agent"
@@ -29,22 +30,84 @@ func (c *agentToolClient) ListTools(ctx context.Context) ([]agent.ToolInfo, erro
 	preset := agentPermissionsPreset(ctx)
 	out := make([]agent.ToolInfo, 0, len(tools))
 	for _, t := range tools {
-		if !config.IsToolAllowedByPreset(preset, t.Name) {
+		permissionName := t.Name
+		if connectionToolCandidate(t.Name) {
+			_, target, _, err := connectionAuthority(ctx)
+			if err != nil {
+				continue
+			}
+			operation := "query"
+			if t.Name == "clickhouse_inspect" {
+				operation = "inspect"
+			}
+			t.Name = connectionToolName(target, operation)
+			t.InputSchema = withoutGeneration(t.InputSchema)
+		}
+		if t.Name == "artifact_read" {
+			if _, ok := agent.PreparationFromContext(ctx); !ok {
+				continue
+			}
+		}
+		if !config.IsToolAllowedByPreset(preset, permissionName) {
 			continue
 		}
-		if err := agentToolPermitted(ctx, t.Name); err != nil {
+		if err := agentToolPermitted(ctx, permissionName); err != nil {
 			continue
 		}
-		out = append(out, agent.ToolInfo{Name: t.Name, Description: t.Description, InputSchema: t.InputSchema})
+		out = append(out, agent.ToolInfo{Name: t.Name, PermissionName: permissionName, Description: t.Description, InputSchema: t.InputSchema})
 	}
 	return out, nil
 }
 
 func (c *agentToolClient) CallToolText(ctx context.Context, name string, args map[string]any) (string, error) {
+	if connectionToolCandidate(name) && name != "clickhouse_query" && name != "clickhouse_inspect" {
+		_, target, _, err := connectionAuthority(ctx)
+		if err != nil {
+			return "", err
+		}
+		operation, ok := connectionToolOperation(name, target)
+		if !ok {
+			return "", fmt.Errorf("connection tool generation is stale")
+		}
+		copyArgs := make(map[string]any, len(args)+1)
+		for key, value := range args {
+			copyArgs[key] = value
+		}
+		if supplied, ok := copyArgs["generation"]; ok && supplied != target.Generation {
+			return "", fmt.Errorf("connection generation is stale")
+		}
+		copyArgs["generation"] = target.Generation
+		args = copyArgs
+		name = "clickhouse_" + operation
+	}
 	if err := agentToolPermitted(ctx, name); err != nil {
 		return "", err
 	}
 	return c.client.CallToolText(ctx, name, args)
+}
+
+func withoutGeneration(schema any) any {
+	data, err := json.Marshal(schema)
+	if err != nil {
+		return schema
+	}
+	var result map[string]any
+	if json.Unmarshal(data, &result) != nil {
+		return schema
+	}
+	if properties, ok := result["properties"].(map[string]any); ok {
+		delete(properties, "generation")
+	}
+	if required, ok := result["required"].([]any); ok {
+		filtered := make([]any, 0, len(required))
+		for _, name := range required {
+			if name != "generation" {
+				filtered = append(filtered, name)
+			}
+		}
+		result["required"] = filtered
+	}
+	return result
 }
 
 func (c *agentToolClient) Close() error {

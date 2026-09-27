@@ -12,6 +12,7 @@ import (
 
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/config"
+	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
 )
 
@@ -201,6 +202,7 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 	ctx = agent.WithSessionAgentID(ctx, job.AgentID)
 	ctx = agent.WithTaskID(ctx, job.TaskID)
 	ctx = agent.WithJobID(ctx, job.ID)
+	ctx = connections.WithExecution(ctx, connections.Execution{Kind: connections.Scheduled})
 
 	taskType, prompt, _ := resolveTaskExecution(job, runner.Config())
 	if taskType == "script" {

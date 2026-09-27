@@ -18,7 +18,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -42,8 +41,7 @@ type lockedListener struct {
 
 func (l *lockedListener) Close() error {
 	err := l.Listener.Close()
-	_ = syscall.Flock(int(l.lock.Fd()), syscall.LOCK_UN)
-	_ = l.lock.Close()
+	_ = closeServiceLock(l.lock)
 	return err
 }
 
@@ -155,11 +153,7 @@ func freeDisk() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	var s syscall.Statfs_t
-	if err := syscall.Statfs(root, &s); err != nil {
-		return 0, err
-	}
-	return s.Bavail * uint64(s.Bsize), nil
+	return freeDiskAt(root)
 }
 
 // Serve cleans up stale labs and accepts local requests.
@@ -580,34 +574,34 @@ func Listen() (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = lock.Close()
+	if err := acquireServiceLock(lock); err != nil {
+		_ = closeServiceLock(lock)
 		return nil, errors.New("chlab service is already running")
 	}
 	if err := os.Remove(Socket); err != nil && !os.IsNotExist(err) {
-		_ = lock.Close()
+		_ = closeServiceLock(lock)
 		return nil, err
 	}
 	l, err := net.Listen("unix", Socket)
 	if err != nil {
-		_ = lock.Close()
+		_ = closeServiceLock(lock)
 		return nil, err
 	}
 	if err := os.Chmod(Socket, 0660); err != nil {
 		_ = l.Close()
-		_ = lock.Close()
+		_ = closeServiceLock(lock)
 		return nil, err
 	}
 	if group := os.Getenv("SUDO_GID"); group != "" {
 		gid, err := strconv.Atoi(group)
 		if err != nil || gid < 0 {
 			_ = l.Close()
-			_ = lock.Close()
+			_ = closeServiceLock(lock)
 			return nil, errors.New("invalid SUDO_GID")
 		}
 		if err := os.Chown(Socket, 0, gid); err != nil {
 			_ = l.Close()
-			_ = lock.Close()
+			_ = closeServiceLock(lock)
 			return nil, err
 		}
 	}

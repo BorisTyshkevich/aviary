@@ -240,6 +240,9 @@ func resolveAllowedAgentPath(ctx context.Context, rawPath, operation string) (st
 	if err != nil {
 		return "", nil, err
 	}
+	if err := protectPrivateStorage(resolved); err != nil {
+		return "", nil, err
+	}
 	cfg := runner.Config()
 	if cfg == nil || cfg.Permissions == nil || cfg.Permissions.Filesystem == nil || len(cfg.Permissions.Filesystem.AllowedPaths) == 0 {
 		return "", nil, fmt.Errorf("agent %q has no filesystem allowedPaths configured", runner.Agent().Name)
@@ -248,6 +251,24 @@ func resolveAllowedAgentPath(ctx context.Context, rawPath, operation string) (st
 		return "", nil, fmt.Errorf("%s path is outside the filesystem allowlist: %s", operation, resolved)
 	}
 	return resolved, policy, nil
+}
+
+func protectPrivateStorage(path string) error {
+	resolved, err := filesystem.ResolvePath(path, store.WorkspaceDir())
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{store.DirAuth, "connections", "preparation"} {
+		root, err := filesystem.ResolvePath(store.SubDir(name), store.WorkspaceDir())
+		if err != nil {
+			return fmt.Errorf("private storage is unavailable")
+		}
+		rel, err := filepath.Rel(root, resolved)
+		if err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("private runtime storage is not accessible through file tools")
+		}
+	}
+	return nil
 }
 
 func decodeFileContent(content, encoding string) ([]byte, error) {

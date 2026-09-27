@@ -16,6 +16,13 @@ A universal rule such as "reject all private addresses" is not sufficient becaus
 
 ## Decision
 
+ADR 0005 applies these logical-endpoint and actual-destination boundaries to the
+first direct ClickHouse adapter. Its configuration is available independently
+of outbound MCP; the `mcp.remote` examples below describe the later MCP consumer.
+Direct database endpoints require explicit HTTPS host/port and resolved/rewritten
+address authorization, with redirects rejected. MCP/OAuth secondary discovery
+rules remain deferred beyond Milestone A2.
+
 ### 1. Dynamic endpoints must match configured URL/host policy
 
 Aviary config defines which remote MCP URLs are permitted.

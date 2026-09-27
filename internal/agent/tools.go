@@ -4,9 +4,18 @@ import "context"
 
 // ToolInfo is a provider-agnostic capability descriptor exposed to the model.
 type ToolInfo struct {
-	Name        string
-	Description string
-	InputSchema any
+	Name string
+	// PermissionName is the stable permission key for a generation-scoped tool.
+	PermissionName string
+	Description    string
+	InputSchema    any
+}
+
+func (t ToolInfo) permissionName() string {
+	if t.PermissionName != "" {
+		return t.PermissionName
+	}
+	return t.Name
 }
 
 // ToolClient executes tool calls and enumerates available tools.

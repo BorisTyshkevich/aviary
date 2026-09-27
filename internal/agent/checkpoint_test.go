@@ -160,6 +160,63 @@ func TestRecoverCheckpoints_Fresh(t *testing.T) {
 	assert.Equal(t, 1, userCount, "recovery should not append a duplicate user message")
 }
 
+func TestRecoverCheckpoints_TrustedIngressRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		overrides RunOverrides
+	}{
+		{name: "deferred answer", overrides: RunOverrides{DeferAnswerPersistence: true}},
+		{name: "suppressed delivery", overrides: RunOverrides{SuppressDelivery: true}},
+		{name: "Slack private turn", overrides: RunOverrides{DeferAnswerPersistence: true, SuppressDelivery: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestDataDir(t)
+			provider := &sequenceProvider{}
+			m := NewManager(nil)
+			const agentID = "agent_trusted_ingress"
+			const sessionID = "sess_trusted_ingress"
+			runner := newTestRunner(m, agentID, "trusted-ingress", provider)
+			const privateRequest = "fake private evidence"
+			path := writeCheckpointFile(t, agentID, "cp_private", &RunCheckpoint{
+				AgentName:       "trusted-ingress",
+				SessionID:       sessionID,
+				Message:         privateRequest,
+				Overrides:       tc.overrides,
+				CreatedAt:       time.Now().Add(-time.Minute),
+				RetryCount:      1,
+				LastRecoveredAt: time.Now(), // Must not wait for the replay cooldown.
+			})
+			require.NoError(t, store.AppendJSONL(store.SessionPath(agentID, sessionID), domain.Message{
+				ID: "cp_private", Role: domain.MessageRoleUser, Content: privateRequest, Timestamp: time.Now(),
+			}))
+			var delivered []string
+			RegisterSessionDelivery(agentID, sessionID, "slack", "test", func(msg string) {
+				delivered = append(delivered, msg)
+			})
+			t.Cleanup(func() {
+				deliveryRegistry.mu.Lock()
+				delete(deliveryRegistry.fns, SessionRuntimeKey(agentID, sessionID))
+				deliveryRegistry.mu.Unlock()
+			})
+
+			m.recoverCheckpoints(runner)
+			runner.Wait()
+
+			assert.Equal(t, 0, provider.callCount(), "recovery must not run without trusted ingress")
+			_, err := os.Stat(path)
+			assert.True(t, os.IsNotExist(err), "non-replayable checkpoint should be removed")
+			msgs, err := store.ReadJSONL[domain.Message](store.SessionPath(agentID, sessionID))
+			require.NoError(t, err)
+			require.Len(t, msgs, 2)
+			assert.Equal(t, "", msgs[0].ResponseID, "interrupted request must remain unanswered")
+			assert.Equal(t, domain.MessageRoleAssistant, msgs[1].Role)
+			assert.Contains(t, msgs[1].Content, "Please resend")
+			assert.NotContains(t, msgs[1].Content, privateRequest)
+			assert.Equal(t, []string{msgs[1].Content}, delivered)
+		})
+	}
+}
+
 func TestRecoverCheckpoints_SkipsRecentlyRecovered(t *testing.T) {
 	setTestDataDir(t)
 

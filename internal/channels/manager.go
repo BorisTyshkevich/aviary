@@ -13,6 +13,7 @@ import (
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/auth"
 	"github.com/lsegal/aviary/internal/config"
+	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
 	"github.com/lsegal/aviary/internal/store"
 )
@@ -30,15 +31,40 @@ type ChannelStatus struct {
 
 // Manager manages channel lifecycle across all agents.
 type Manager struct {
-	mu         sync.Mutex
-	channels   map[string]Channel // key: agentName+"/"+channelType+"/"+channelID
-	cancels    map[string]context.CancelFunc
-	startTimes map[string]time.Time
-	errors     map[string]string
-	sinks      map[string]*LogSink // per-channel stdout/stderr capture
-	specs      map[string]channelSpec
-	slack      map[string]*sharedSlackChannel
-	slackAlias map[string]string
+	mu                  sync.Mutex
+	channels            map[string]Channel // key: agentName+"/"+channelType+"/"+channelID
+	cancels             map[string]context.CancelFunc
+	startTimes          map[string]time.Time
+	errors              map[string]string
+	sinks               map[string]*LogSink // per-channel stdout/stderr capture
+	specs               map[string]channelSpec
+	slack               map[string]*sharedSlackChannel
+	slackAlias          map[string]string
+	connectionService   *connections.Service
+	connectionValidator func(context.Context, string, string) error
+	credentialValidator func(context.Context, connections.Target, connections.Credential) error
+}
+
+// SetConnectionService enables deterministic Slack connection setup. It must be
+// called before Reconcile starts channels.
+func (m *Manager) SetConnectionService(service *connections.Service) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.connectionService = service
+}
+
+// SetConnectionValidator applies endpoint policy before a target is selected.
+func (m *Manager) SetConnectionValidator(validate func(context.Context, string, string) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.connectionValidator = validate
+}
+
+// SetCredentialValidator checks a database login before it is stored.
+func (m *Manager) SetCredentialValidator(validate func(context.Context, connections.Target, connections.Credential) error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.credentialValidator = validate
 }
 
 type channelSpec struct {
@@ -350,6 +376,13 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	base.AllowFrom = mergeAllowFrom(resolvedSpecs)
 	ch := NewSlackChannel(base.URL, base.Token, base.AllowFrom, "", nil)
 	ch.showStatus = anySlackStatusEnabled(resolvedSpecs)
+	intake := &slackConnectionIntake{channel: ch, service: m.connectionService, validateEndpoint: m.connectionValidator, validatePassword: m.credentialValidator, specs: resolvedSpecs}
+	ch.intake = intake.handle
+	ch.intakeStart = intake.start
+	ch.intakeWait = intake.wait
+	ch.intakeContext = intake.baseContext
+	ch.intakeDeferred = intake.enqueue
+	ch.redactReference = intake.redactReference
 
 	sink := newLogSink()
 	ch.SetLogSink(sink)
@@ -389,6 +422,7 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 			if !ok {
 				continue
 			}
+			intake.ensureSetup(spec.agentName, routed)
 			msgFn(spec.agentName, spec.channelConfig.Type, spec.channelConfig.ID, ch, routed)
 		}
 	})

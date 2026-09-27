@@ -7,6 +7,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/buildinfo"
 )
 
@@ -73,7 +74,11 @@ func NewInProcessClient(ctx context.Context, srv *sdkmcp.Server) (*InProcessClie
 
 // CallTool invokes the named tool on the in-process server.
 func (c *InProcessClient) CallTool(ctx context.Context, name string, args any) (*sdkmcp.CallToolResult, error) {
-	logToolCall("inprocess", name, args)
+	if agent.PrivateDataContext(ctx) {
+		logToolCall("inprocess", name, "[PRIVATE TURN ARGUMENTS OMITTED]")
+	} else {
+		logToolCall("inprocess", name, args)
+	}
 	return c.session.CallTool(ctx, &sdkmcp.CallToolParams{
 		Name:      name,
 		Arguments: args,

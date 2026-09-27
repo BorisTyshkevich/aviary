@@ -29,6 +29,7 @@ type SlackChannel struct {
 	showStatus    bool
 
 	botUserID         string // populated on connect via auth.test
+	teamID            string // populated on connect via auth.test
 	resolvedAllowFrom []config.AllowFromEntry
 
 	client          *slack.Client
@@ -47,6 +48,18 @@ type SlackChannel struct {
 	cancel          context.CancelFunc
 	logSinkMu       sync.RWMutex
 	logSink         *LogSink
+	intake          func(slackIngress) bool
+	intakeStart     func(context.Context)
+	intakeWait      func()
+	intakeContext   func() context.Context
+	intakeDeferred  func(string, func()) bool
+	redactReference func(channelID, threadTS string) bool
+}
+
+// slackIngress is built only from the original Slack event, before enrichment.
+type slackIngress struct {
+	UserID, ChannelID, RootTS, MessageTS, Text string
+	IsDM, IsEdited                             bool
 }
 
 // NewSlackChannel creates a SlackChannel.
@@ -263,18 +276,22 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 	c.logf("slack: starting socket mode session")
 
 	// Fetch the bot's own user ID so we can detect direct @mentions in groups.
-	if resp, err := c.client.AuthTestContext(ctx); err == nil {
-		c.botUserID = resp.UserID
-		c.logf("slack: auth ok user_id=%s team=%s", resp.UserID, strings.TrimSpace(resp.Team))
-	} else {
-		c.logf("slack: auth.test failed: %v", err)
-		slog.Warn("slack: auth.test failed; direct-mention detection disabled", "err", err)
+	resp, err := c.client.AuthTestContext(ctx)
+	if err != nil || resp == nil || strings.TrimSpace(resp.UserID) == "" || strings.TrimSpace(resp.TeamID) == "" {
+		c.logf("slack: auth.test did not establish installation and workspace identity")
+		return fmt.Errorf("slack identity unavailable")
 	}
+	c.botUserID = resp.UserID
+	c.teamID = resp.TeamID
+	c.logf("slack: auth ok user_id=%s team=%s", resp.UserID, strings.TrimSpace(resp.Team))
 	if err := c.refreshIdentityCache(ctx); err != nil {
 		c.logf("slack: failed to refresh users/channels: %v", err)
 		slog.Warn("slack: failed to load users/channels; name-based routing disabled", "err", err)
 	} else {
 		c.logf("slack: identity cache ready")
+	}
+	if c.intakeStart != nil {
+		c.intakeStart(ctx)
 	}
 
 	go func() {
@@ -292,11 +309,15 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 		}
 	}()
 
-	err := c.sm.RunContext(ctx)
+	err = c.sm.RunContext(ctx)
 	if ctx.Err() == nil {
 		c.logf("slack: socket mode exited with error: %v", err)
 	} else {
 		c.logf("slack: socket mode stopped")
+	}
+	cancel()
+	if c.intakeWait != nil {
+		c.intakeWait()
 	}
 	return err
 }
@@ -307,6 +328,9 @@ func (c *SlackChannel) Stop() {
 		c.logf("slack: stop requested")
 		if c.cancel != nil {
 			c.cancel()
+		}
+		if c.intakeWait != nil {
+			c.intakeWait()
 		}
 	})
 }
@@ -348,6 +372,23 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 		return
 	}
 	if event.SubType == slack.MsgSubTypeMessageReplied {
+		root := firstNonEmpty(event.ThreadTimeStamp, event.TimeStamp)
+		if event.Message != nil {
+			root = firstNonEmpty(event.ThreadTimeStamp, event.Message.ThreadTimestamp, event.Message.Timestamp, event.TimeStamp)
+		}
+		if strings.HasPrefix(event.Channel, "D") && c.redactReference != nil && c.redactReference(event.Channel, root) && c.intakeDeferred != nil {
+			lookupContext := context.Background()
+			if c.intakeContext != nil {
+				lookupContext = c.intakeContext()
+			}
+			c.intakeDeferred(event.Channel+"\x00"+root, func() {
+				normalized, ok := c.normalizeMessageRepliedEvent(lookupContext, event)
+				if ok {
+					c.handleMessageEvent(normalized)
+				}
+			})
+			return
+		}
 		normalized, ok := c.normalizeMessageRepliedEvent(context.Background(), event)
 		if !ok {
 			return
@@ -368,6 +409,7 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	channelID := event.Channel
 	from := event.User
 	text := event.Text
+	blocks := event.Blocks
 	botID := event.BotID
 	var files []slack.File
 	var attachments []slack.Attachment
@@ -382,6 +424,7 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 		if event.Message.Text != "" {
 			text = event.Message.Text
 		}
+		blocks = event.Message.Blocks
 		if event.Message.BotID != "" {
 			botID = event.Message.BotID
 		}
@@ -390,9 +433,11 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	} else if event.Message != nil {
 		files = event.Message.Files
 		attachments = event.Message.Attachments
+		if len(blocks.BlockSet) == 0 {
+			blocks = event.Message.Blocks
+		}
 	}
-	if botID != "" || (c.botUserID != "" && from == c.botUserID) ||
-		(strings.TrimSpace(text) == "" && len(files) == 0 && len(attachments) == 0) || from == "" || channelID == "" {
+	if botID != "" || (c.botUserID != "" && from == c.botUserID) || from == "" || channelID == "" {
 		return
 	}
 
@@ -411,7 +456,20 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	if threadTS == "" {
 		threadTS = rawTimestamp
 	}
+	intakeText := slackVisibleText(text, blocks)
+	if !isGroup && c.redactReference != nil && c.redactReference(channelID, threadTS) {
+		if c.intake != nil {
+			c.intake(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: intakeText, IsDM: true, IsEdited: isEdited})
+		}
+		return
+	}
 	if c.seenMessage(channelID, from, rawTimestamp, text) {
+		return
+	}
+	if c.intake != nil && c.intake(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: intakeText, IsDM: !isGroup, IsEdited: isEdited}) {
+		return
+	}
+	if strings.TrimSpace(text) == "" && len(files) == 0 && len(attachments) == 0 {
 		return
 	}
 	isThreadReply := strings.TrimSpace(threadTS) != "" && strings.TrimSpace(rawTimestamp) != "" && threadTS != rawTimestamp
@@ -455,19 +513,21 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	if fn != nil {
 		mediaURL := c.firstImageDataURL(files)
 		im := IncomingMessage{
-			Type:          "slack",
-			From:          from,
-			SenderName:    c.displayNameForUser(from),
-			Channel:       channelID,
-			ThreadTS:      threadTS,
-			IsThreadReply: isThreadReply,
-			Text:          enrichedText,
-			MediaURL:      mediaURL,
-			ReceivedAt:    receivedAt,
-			RestrictTools: result.restrictTools,
-			DisabledTools: c.disabledTools,
-			Model:         result.model,
-			Fallbacks:     result.fallbacks,
+			Type:           "slack",
+			InstallationID: c.botUserID,
+			WorkspaceID:    c.teamID,
+			From:           from,
+			SenderName:     c.displayNameForUser(from),
+			Channel:        channelID,
+			ThreadTS:       threadTS,
+			IsThreadReply:  isThreadReply,
+			Text:           enrichedText,
+			MediaURL:       mediaURL,
+			ReceivedAt:     receivedAt,
+			RestrictTools:  result.restrictTools,
+			DisabledTools:  c.disabledTools,
+			Model:          result.model,
+			Fallbacks:      result.fallbacks,
 		}
 		// Apply channel-level overrides if entry-level ones are absent.
 		if im.Model == "" {
@@ -789,7 +849,14 @@ func (c *SlackChannel) formatSlackMessages(ref slackMessageReference, msgs []sla
 		title = "Slack message"
 	}
 	lines := []string{fmt.Sprintf("[%s: %s %s]", title, ref.ChannelID, firstNonEmpty(ref.ThreadTS, ref.Timestamp))}
+	threadRoot := ref.ThreadTS
+	if threadRoot == "" && len(msgs) > 1 {
+		threadRoot = msgs[0].Timestamp
+	}
 	for _, msg := range msgs {
+		if c.redactReference != nil && c.redactReference(ref.ChannelID, firstNonEmpty(msg.ThreadTimestamp, threadRoot, msg.Timestamp)) {
+			continue
+		}
 		content := formatSlackMessage(msg.Msg)
 		if content == "" {
 			continue

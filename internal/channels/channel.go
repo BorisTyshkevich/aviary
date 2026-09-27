@@ -8,19 +8,21 @@ import (
 
 // IncomingMessage represents a message received on a channel.
 type IncomingMessage struct {
-	Type          string // channel type: "discord", "slack", "signal", etc.
-	From          string // sender ID
-	SenderName    string // optional human-readable sender name
-	Channel       string // channel ID or name
-	ThreadTS      string // optional platform thread timestamp/root ID
-	IsThreadReply bool   // true when the message is a reply inside a platform thread
-	Text          string
-	MediaURL      string // optional inline media for the LLM (typically a data URL)
-	ReceivedAt    time.Time
-	RestrictTools []string // per-entry tool allow-list override; nil means use agent defaults
-	DisabledTools []string // per-channel tool deny-list override; applied after the allow-list
-	Model         string   // per-entry model override; "" means use agent default
-	Fallbacks     []string // per-entry fallbacks override; nil means use agent defaults
+	Type           string // channel type: "discord", "slack", "signal", etc.
+	InstallationID string // trusted Slack bot installation; empty for other channels
+	WorkspaceID    string // trusted Slack workspace/team; empty for other channels
+	From           string // sender ID
+	SenderName     string // optional human-readable sender name
+	Channel        string // channel ID or name
+	ThreadTS       string // optional platform thread timestamp/root ID
+	IsThreadReply  bool   // true when the message is a reply inside a platform thread
+	Text           string
+	MediaURL       string // optional inline media for the LLM (typically a data URL)
+	ReceivedAt     time.Time
+	RestrictTools  []string // per-entry tool allow-list override; nil means use agent defaults
+	DisabledTools  []string // per-channel tool deny-list override; applied after the allow-list
+	Model          string   // per-entry model override; "" means use agent default
+	Fallbacks      []string // per-entry fallbacks override; nil means use agent defaults
 	// QuoteAuthor and QuoteText are optional fields populated by channel
 	// implementations when the incoming message quotes another message.
 	QuoteAuthor string

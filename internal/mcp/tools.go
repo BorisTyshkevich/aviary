@@ -134,6 +134,7 @@ func Register(s *sdkmcp.Server) {
 	registerSessionSendTool(s)
 	registerTaskTools(s)
 	registerAgentContextTools(s)
+	registerConnectionTools(s)
 	registerFileTools(s)
 	registerExecTools(s)
 	registerSessionTools(s)
@@ -783,6 +784,9 @@ func registerAgentContextTools(s *sdkmcp.Server) {
 		agentID, ok := resolveAgentID(ctx, args.Agent)
 		if !ok {
 			return nil, struct{}{}, fmt.Errorf("agent_file_read requires an agent session context")
+		}
+		if err := protectPrivateStorage(filepath.Join(store.AgentDir(agentID), args.File)); err != nil {
+			return nil, struct{}{}, err
 		}
 		content, err := store.ReadAgentFile(agentID, args.File)
 		if err != nil {
@@ -2358,6 +2362,9 @@ func registerBrowserTools(s *sdkmcp.Server) {
 		FilePath string `json:"file_path"`
 		Caption  string `json:"caption,omitempty"`
 	}) (*sdkmcp.CallToolResult, struct{}, error) {
+		if err := protectPrivateStorage(args.FilePath); err != nil {
+			return nil, struct{}{}, err
+		}
 		slog.Info("mcp: tool call", "component", "channel", "tool", "channel_send_file", "path", args.FilePath)
 		if args.FilePath == "" {
 			return nil, struct{}{}, fmt.Errorf("file_path is required")

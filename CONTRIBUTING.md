@@ -113,8 +113,11 @@ web/
 pnpm test:go          # Go unit tests
 pnpm test:e2e         # Playwright e2e tests (reuses running dev server)
 pnpm test:e2e:ui      # Playwright with interactive UI
-pnpm test             # lint + Go tests + e2e (full CI suite)
+pnpm test             # Go tests + e2e; run pnpm lint separately for code changes
 ```
+
+For direct connection fixtures and preparation/MCP smoke coverage, see
+[Direct connections verification](docs/testing/direct-connections.md).
 
 ## Linting
 
@@ -123,7 +126,8 @@ pnpm lint             # Go (golangci-lint) + web (Biome)
 pnpm lint:fix         # Auto-fix web lint/format issues
 ```
 
-Run `pnpm lint` before submitting a PR — CI enforces it.
+Run `pnpm lint` after code changes and before submitting a code PR — CI enforces
+it. Documentation-only changes do not require a local lint run.
 
 ## Building a Release Binary
 
@@ -166,7 +170,7 @@ The server is usually already running during development (`pnpm dev` starts it).
 3. **Pass all checks locally** before pushing:
 
    ```shell
-   pnpm test      # lint + Go tests + e2e (mirrors CI exactly)
+   pnpm lint && pnpm test  # full checks for code changes
    ```
 
    CI runs Go tests on Linux, macOS, and Windows, plus Go lint, web lint, and Playwright e2e tests. Fix any failures before opening the PR.

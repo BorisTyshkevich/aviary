@@ -19,13 +19,14 @@ import (
 
 // Config is the top-level configuration for Aviary.
 type Config struct {
-	Server    ServerConfig           `yaml:"server"              json:"server"`
-	Agents    []AgentConfig          `yaml:"agents,omitempty"    json:"agents,omitempty"`
-	Models    ModelsConfig           `yaml:"models,omitempty"    json:"models,omitempty"`
-	Browser   BrowserConfig          `yaml:"browser,omitempty"   json:"browser,omitempty"`
-	Search    SearchConfig           `yaml:"search,omitempty"    json:"search,omitempty"`
-	Scheduler SchedulerConfig        `yaml:"scheduler,omitempty" json:"scheduler,omitempty"`
-	Skills    map[string]SkillConfig `yaml:"skills,omitempty" json:"skills,omitempty"`
+	Server      ServerConfig            `yaml:"server"              json:"server"`
+	Agents      []AgentConfig           `yaml:"agents,omitempty"    json:"agents,omitempty"`
+	Models      ModelsConfig            `yaml:"models,omitempty"    json:"models,omitempty"`
+	Browser     BrowserConfig           `yaml:"browser,omitempty"   json:"browser,omitempty"`
+	Search      SearchConfig            `yaml:"search,omitempty"    json:"search,omitempty"`
+	Scheduler   SchedulerConfig         `yaml:"scheduler,omitempty" json:"scheduler,omitempty"`
+	Connections *ConnectionPolicyConfig `yaml:"connections,omitempty" json:"connections,omitempty"`
+	Skills      map[string]SkillConfig  `yaml:"skills,omitempty" json:"skills,omitempty"`
 }
 
 // SkillConfig configures an installed skill runtime.
@@ -97,6 +98,7 @@ type AgentConfig struct {
 	// to a file (e.g. "./RULES.md"); file paths are resolved relative to the
 	// agent working directory at prompt time.
 	Rules       string             `yaml:"rules,omitempty"       json:"rules,omitempty"`
+	Hooks       *HooksConfig       `yaml:"hooks,omitempty"       json:"hooks,omitempty"`
 	Permissions *PermissionsConfig `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	Channels    []ChannelConfig    `yaml:"channels,omitempty"    json:"channels,omitempty"`
 	Tasks       []TaskConfig       `yaml:"tasks,omitempty"       json:"tasks,omitempty"`

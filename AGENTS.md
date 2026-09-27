@@ -31,4 +31,5 @@
   ~/.config/aviary/token for the bearer token. If a backend restart is necessary,
   use `go run ./cmd/aviary serve`. Always use the MCP to test features.
 - Run `pnpm test:go` after Go changes, `pnpm test:e2e` after web changes, and
-  `pnpm lint` after any changes. The full check is `pnpm lint && pnpm test`.
+  `pnpm lint` after code changes. Documentation-only changes do not require lint.
+  The full check is `pnpm lint && pnpm test`.

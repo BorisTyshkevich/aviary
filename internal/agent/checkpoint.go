@@ -31,3 +31,9 @@ type RunCheckpoint struct {
 	// LastRecoveredAt is when the checkpoint was last re-issued.
 	LastRecoveredAt time.Time `json:"last_recovered_at,omitempty"`
 }
+
+// requiresTrustedIngress reports whether recovery would need the original
+// channel consumer or caller identity, neither of which survives a restart.
+func (cp RunCheckpoint) requiresTrustedIngress() bool {
+	return cp.Overrides.DeferAnswerPersistence || cp.Overrides.SuppressDelivery
+}

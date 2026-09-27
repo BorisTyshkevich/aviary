@@ -10,6 +10,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/yaml.v3"
+
+	"github.com/lsegal/aviary/internal/endpointpolicy"
 )
 
 func TestDefault(t *testing.T) {
@@ -23,6 +25,13 @@ func TestDefault(t *testing.T) {
 	assert.True(t, EffectivePrecomputeTasks(cfg.Scheduler))
 	assert.True(t, EffectiveBrowserReuseTabs(cfg.Browser))
 
+}
+
+func TestValidateConnections(t *testing.T) {
+	cfg := Default()
+	cfg.Connections = &ConnectionPolicyConfig{Network: endpointpolicy.Policy{Allow: []endpointpolicy.Rule{{}}}}
+	issues := Validate(&cfg, nil)
+	assert.Contains(t, issues, Issue{Level: LevelError, Field: "connections.network", Message: "allow[0]: host must be exact or a left-most wildcard"})
 }
 
 func TestEffectiveServerExternalAccess(t *testing.T) {

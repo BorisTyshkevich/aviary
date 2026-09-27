@@ -11,8 +11,36 @@ models:    { ... }
 browser:   { ... }
 search:    { ... }
 scheduler: { ... }
+connections: { ... }
 skills:    { ... }
 ```
+
+---
+
+## connections
+
+Controls generic outbound endpoint authorization for connection-backed features.
+The policy is fail-closed: each logical HTTPS host and port, and every resolved
+dial address, must be explicitly allowed. It is not specific to MCP.
+
+```yaml
+connections:
+  network:
+    allow:
+      - host: "*.example.com"
+        ports: [8443]
+        cidrs: ["198.51.100.0/24"]
+    rewrites:
+      - host: "db.example.com"
+        connect_via: "sni-proxy.internal:443"
+        cidrs: ["10.0.0.0/8"]
+```
+
+`host` is exact or a left-most wildcard. `rewrites` preserve the logical URL,
+HTTP Host header, TLS SNI, and certificate verification while dialing only the
+authorized rewrite destination. URL userinfo, queries, fragments, ambient HTTP
+proxies, and redirects are refused. A resolved address is pinned for the
+connection so DNS cannot change it after authorization.
 
 ---
 

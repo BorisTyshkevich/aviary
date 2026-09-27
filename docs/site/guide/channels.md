@@ -69,7 +69,7 @@ You usually need to be a workspace admin, app manager, or someone allowed to ins
 3. Choose **From scratch**.
 4. Give the app a name like `Aviary` and choose the Slack workspace where you want the bot to live.
 5. Open **OAuth & Permissions**.
-6. Under **Bot Token Scopes**, add the permissions Aviary needs. A practical starting set is `chat:write`, `files:write`, `channels:history`, `groups:history`, `channels:read`, `groups:read`, `users:read`, and `app_mentions:read`. Aviary uses `files:write` to attach complete Markdown answers to longer conversational replies.
+6. Under **Bot Token Scopes**, add the permissions Aviary needs. A practical starting set is `chat:write`, `files:write`, `channels:history`, `groups:history`, `im:history`, `im:write`, `channels:read`, `groups:read`, `users:read`, `users:read.email`, and `app_mentions:read`. Aviary uses `files:write` to attach complete Markdown answers to longer conversational replies. Private database setup needs the DM scopes; `users:read.email` supplies the proposed database username.
 7. Still on **OAuth & Permissions**, click **Install to Workspace** or **Reinstall to Workspace**.
 8. After installation, copy the **Bot User OAuth Token**. This is the value that starts with `xoxb-`. Put that into Aviary's `token` field.
 9. Open **Socket Mode** in the Slack app settings and turn on **Enable Socket Mode**.
@@ -85,7 +85,7 @@ At that point you have the two Slack secrets Aviary needs.
 Your Slack app should also have:
 
 - Socket Mode enabled
-- Event Subscriptions enabled, including both channel/direct message events and the `app_mention` event
+- Event Subscriptions enabled, including `message.channels`, `message.groups`, `message.im`, and `app_mention`
 - The app installed to the workspace
 - The bot invited to any channels you want it to read or answer in
 
@@ -125,6 +125,12 @@ Slack-specific notes:
 - Slack apps connected through Events API and Socket Mode cannot emit classic typing notifications, but Aviary uses Slack assistant thread status indicators when `show_typing` is enabled.
 - `users:read` is required if you want Aviary to resolve Slack user names and support name-based routing instead of raw user IDs only.
 - In the control panel, **Settings > Agents > Channels > Slack** includes a **Browse Channels** action that validates the bot token and lists channels visible to the app.
+
+### Connect a Database in a Slack Thread
+
+In the destination channel thread, send `@Aviary connect https://cluster.example.com:8443`. Aviary selects that ClickHouse endpoint for the thread and sends you a private DM. Confirm the proposed username with `use proposed`, or reply with another username in the username prompt thread. Then reply to the separate password prompt thread with only your password. Spaces and punctuation in that reply are part of the password. Send it as plain text: Slack's rich-text composer can interpret `*`, `_`, `~`, and backticks as formatting, making the typed characters ambiguous. Return to the original thread for database work.
+
+Use `@Aviary status` to see the thread target and whether your own credentials are ready. Use `@Aviary disconnect` to detach it. Each participant supplies their own credentials for the shared target. A connection command must match one authorized agent when the bot is shared across agents. The endpoint must pass the configured connection network policy. An inferred or explicit MCP target reports unsupported transport until outbound MCP support is available.
 
 ### Common Confusions
 
