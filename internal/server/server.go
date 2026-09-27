@@ -550,6 +550,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		if channelType == "slack" && config.BoolOr(cc.ShowTyping, true) && strings.TrimSpace(incoming.ThreadTS) != "" {
 			if sender, ok := candidate.(channels.AssistantStatusSender); ok {
 				assistantStatus = newSlackRunStatus(sender, incoming.Channel, incoming.ThreadTS)
+				statusCtx := msgCtx
+				assistantStatus.contextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+					return s.terminalContext(statusCtx, budget)
+				}
 			}
 		}
 		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
@@ -604,8 +608,9 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 			return
 		}
-		terminalCtx, cancel := s.terminalContext(selectedCtx, slackTerminalTimeout)
-		selectedPresenter.terminalContext = terminalCtx
+		selectedPresenter.terminalContextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+			return s.terminalContext(selectedCtx, budget)
+		}
 		kind := "done"
 		switch e.Type {
 		case agent.StreamEventStop:
@@ -614,7 +619,6 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			kind = "error"
 		}
 		result, first := selectedPresenter.Terminal(activeStatus, kind, e.Model, e.Text, e.AlreadyAnswered)
-		cancel()
 		if first && result.Outcome == slackOutcomeAnswer && deferPersistence {
 			if sessionID, ok := agent.SessionIDFromContext(selectedCtx); ok {
 				if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {

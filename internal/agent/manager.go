@@ -190,9 +190,10 @@ func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
 	}
 }
 
-// wakeCheckpointRecovery retries one file once after a live owner exits. It
-// does not rescan the directory or enqueue another wake behind a concurrent
-// recovery, so retained checkpoints cannot cause an unbounded wake loop.
+// wakeCheckpointRecovery retries one file after a live owner exits. If another
+// recovery wins this handoff, keep this eligible manager waiting for that
+// claim to finish. A successful claim never requeues itself, so retained
+// checkpoints cannot create a wake loop without another external contender.
 func (m *Manager) wakeCheckpointRecovery(runner *AgentRunner, name, path string, timeout time.Duration) {
 	m.mu.Lock()
 	if m.stopped || runner.Stopping() {
@@ -202,7 +203,9 @@ func (m *Manager) wakeCheckpointRecovery(runner *AgentRunner, name, path string,
 	m.recoveries.Add(1)
 	m.mu.Unlock()
 	defer m.recoveries.Done()
-	release, claimed := ClaimCheckpointRecovery(path, nil)
+	release, claimed := ClaimCheckpointRecovery(path, func() {
+		m.wakeCheckpointRecovery(runner, name, path, timeout)
+	})
 	if !claimed {
 		return
 	}
