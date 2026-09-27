@@ -329,6 +329,20 @@ func (v *validator) checkChannel(field string, ch ChannelConfig) {
 	if ch.ToolProgress != nil && ch.Type != "slack" {
 		v.errorf(field+".tool_progress", "tool_progress is only supported for Slack channels")
 	}
+	if ch.ToolProgressMaxCalls != nil {
+		if ch.Type != "slack" {
+			v.errorf(field+".tool_progress_max_calls", "tool_progress_max_calls is only supported for Slack channels")
+		} else if *ch.ToolProgressMaxCalls < MinToolProgressMaxCalls || *ch.ToolProgressMaxCalls > MaxToolProgressMaxCalls {
+			v.errorf(field+".tool_progress_max_calls", "tool_progress_max_calls must be between %d and %d", MinToolProgressMaxCalls, MaxToolProgressMaxCalls)
+		}
+	}
+	if ch.ToolProgressMaxChars != nil {
+		if ch.Type != "slack" {
+			v.errorf(field+".tool_progress_max_chars", "tool_progress_max_chars is only supported for Slack channels")
+		} else if *ch.ToolProgressMaxChars < MinToolProgressMaxChars || *ch.ToolProgressMaxChars > MaxToolProgressMaxChars {
+			v.errorf(field+".tool_progress_max_chars", "tool_progress_max_chars must be between %d and %d", MinToolProgressMaxChars, MaxToolProgressMaxChars)
+		}
+	}
 
 	if !BoolOr(ch.Enabled, true) {
 		return

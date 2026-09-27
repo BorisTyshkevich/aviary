@@ -104,7 +104,7 @@ func TestSlackCheckpointLivesThroughTerminalCallbackThenRetires(t *testing.T) {
 			terminal <- err
 			return
 		}
-		terminal <- handle.RecordTerminal(SlackDispositionHandled, false, "", false)
+		terminal <- handle.RecordTerminal(SlackDispositionHandled, false, nil, "", false)
 	})
 	require.Equal(t, AdmissionAccepted, admission.Status)
 	select {
@@ -211,13 +211,13 @@ func TestSlackCheckpointNoticeMarkerAndMonotonicTerminal(t *testing.T) {
 	require.Equal(t, SlackDispositionUnconfirmed, cp.Slack.Disposition,
 		"crash after marker must suppress a fresh standalone post")
 	require.True(t, cp.Slack.NoticeAttempted)
-	require.NoError(t, handle.RecordTerminal(SlackDispositionPending, false, "", false))
+	require.NoError(t, handle.RecordTerminal(SlackDispositionPending, false, nil, "", false))
 	cp, err = store.ReadJSON[RunCheckpoint](path)
 	require.NoError(t, err)
 	require.Equal(t, SlackDispositionPending, cp.Slack.Disposition)
 	require.False(t, cp.Slack.NoticeAttempted, "durable definite rejection permits bounded retry")
-	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true, "progress-1", false))
-	require.NoError(t, handle.RecordTerminal(SlackDispositionUnconfirmed, true, "progress-1", true))
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true, []string{"progress-1"}, "", false))
+	require.NoError(t, handle.RecordTerminal(SlackDispositionUnconfirmed, true, []string{"progress-1"}, "", true))
 	cp, err = store.ReadJSON[RunCheckpoint](path)
 	require.NoError(t, err)
 	require.Equal(t, SlackDispositionHandled, cp.Slack.Disposition)
@@ -225,7 +225,7 @@ func TestSlackCheckpointNoticeMarkerAndMonotonicTerminal(t *testing.T) {
 	require.False(t, cp.Slack.NoticeAttempted, "late unconfirmed result cannot reopen handled delivery")
 	require.NoError(t, handle.retireIfHandled())
 	require.FileExists(t, path, "accepted answer with pending progress cleanup remains durable")
-	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, false, "progress-1", false))
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, false, []string{"progress-1"}, "", false))
 	require.NoError(t, handle.retireIfHandled())
 	require.NoFileExists(t, path)
 }
@@ -236,14 +236,14 @@ func TestSlackCheckpointRejectedFollowupNoticeClearsOnlyNoticeMarker(t *testing.
 	handle := NewSlackCheckpointHandle(fakeSlackCheckpoint())
 	require.NoError(t, handle.bind(path, RunCheckpoint{AgentName: "slack-uncertain-answer", SessionID: "session"}))
 	require.NoError(t, handle.RecordNoticeAttempt())
-	require.NoError(t, handle.RecordTerminal(SlackDispositionUnconfirmed, false, "", false),
+	require.NoError(t, handle.RecordTerminal(SlackDispositionUnconfirmed, false, nil, "", false),
 		"a definitely rejected followup notice permits a later fixed notice, while the answer remains uncertain")
 	cp, err := store.ReadJSON[RunCheckpoint](path)
 	require.NoError(t, err)
 	require.Equal(t, SlackDispositionUnconfirmed, cp.Slack.Disposition)
 	require.False(t, cp.Slack.NoticeAttempted)
 	require.NoError(t, handle.RecordNoticeAttempt())
-	require.NoError(t, handle.RecordTerminal(SlackDispositionUnconfirmed, false, "", true),
+	require.NoError(t, handle.RecordTerminal(SlackDispositionUnconfirmed, false, nil, "", true),
 		"uncertain notice acceptance retains the predispatch marker")
 	cp, err = store.ReadJSON[RunCheckpoint](path)
 	require.NoError(t, err)
@@ -289,7 +289,7 @@ func TestSlackCheckpointFailedUpdateKeepsLastDurableState(t *testing.T) {
 	cp, err := store.ReadJSON[RunCheckpoint](path)
 	require.NoError(t, err)
 	require.Empty(t, cp.Slack.ProgressTS)
-	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true, "progress-1", false),
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true, []string{"progress-1"}, "", false),
 		"terminal write must recover the accepted progress timestamp after its earlier write failed")
 	cp, err = store.ReadJSON[RunCheckpoint](path)
 	require.NoError(t, err)
@@ -298,6 +298,59 @@ func TestSlackCheckpointFailedUpdateKeepsLastDurableState(t *testing.T) {
 	require.True(t, cp.Slack.CleanupPending)
 	require.NoError(t, handle.retireIfHandled())
 	require.FileExists(t, path, "known progress remains for recovery cleanup")
-	require.Error(t, handle.RecordTerminal(SlackDispositionHandled, true, "other-progress", false),
-		"a different timestamp cannot replace the original accepted message")
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true, []string{"progress-1", "other-progress"}, "", false),
+		"later accepted pages must merge without replacing the original message")
+	cp, err = store.ReadJSON[RunCheckpoint](path)
+	require.NoError(t, err)
+	require.Equal(t, []string{"progress-1", "other-progress"}, cp.Slack.ProgressTimestamps())
+}
+
+func TestSlackCheckpointMultiplePagesMergeAfterStorageFailure(t *testing.T) {
+	setTestDataDir(t)
+	path := store.CheckpointPath("slack-pages", "run-1")
+	handle := NewSlackCheckpointHandle(fakeSlackCheckpoint())
+	require.NoError(t, handle.bind(path, RunCheckpoint{AgentName: "slack-pages", SessionID: "session"}))
+	require.NoError(t, os.Rename(path, path+".saved"))
+	require.NoError(t, os.Mkdir(path, 0o700))
+	require.Error(t, handle.RecordProgressTimestamp("page-1"))
+	require.Empty(t, handle.checkpoint.Slack.ProgressTimestamps())
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Rename(path+".saved", path))
+	require.NoError(t, handle.RecordProgressTimestamp("page-2"))
+	require.NoError(t, handle.RecordProgressTimestamp("page-2"), "duplicate callback is idempotent")
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true,
+		[]string{"page-1", "page-2", "page-3"}, "", false))
+	cp, err := store.ReadJSON[RunCheckpoint](path)
+	require.NoError(t, err)
+	require.Equal(t, []string{"page-1", "page-2", "page-3"}, cp.Slack.ProgressTimestamps(),
+		"terminal write restores the original page order even when an earlier progress write failed")
+	require.True(t, cp.Slack.CleanupPending)
+}
+
+func TestSlackCheckpointPromotedNoticeKeepsEarlierPagesForCleanup(t *testing.T) {
+	setTestDataDir(t)
+	path := store.CheckpointPath("slack-notice-pages", "run-1")
+	handle := NewSlackCheckpointHandle(fakeSlackCheckpoint())
+	require.NoError(t, handle.bind(path, RunCheckpoint{AgentName: "slack-notice-pages", SessionID: "session"}))
+	for _, ts := range []string{"page-1", "page-2", "page-3"} {
+		require.NoError(t, handle.RecordProgressTimestamp(ts))
+	}
+	require.Error(t, handle.RecordTerminal(SlackDispositionHandled, true,
+		[]string{"page-1", "page-2", "page-3"}, "unknown-page", false),
+		"an unknown notice page cannot replace cleanup ownership")
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, true,
+		[]string{"page-1", "page-2", "page-3"}, "page-3", false))
+	cp, err := store.ReadJSON[RunCheckpoint](path)
+	require.NoError(t, err)
+	require.Equal(t, []string{"page-1", "page-2"}, cp.Slack.ProgressTimestamps())
+	require.True(t, cp.Slack.CleanupPending)
+	require.NoError(t, handle.RecordTerminal(SlackDispositionHandled, false,
+		[]string{"page-1", "page-2", "page-3"}, "page-3", false))
+	cp, err = store.ReadJSON[RunCheckpoint](path)
+	require.NoError(t, err)
+	require.Equal(t, []string{"page-1", "page-2"}, cp.Slack.ProgressTimestamps(),
+		"finalization cannot re-add the notice to cleanup")
+	require.False(t, cp.Slack.CleanupPending)
+	require.NoError(t, handle.retireIfHandled())
+	require.NoFileExists(t, path)
 }

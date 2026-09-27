@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -216,10 +217,12 @@ func TestAgentRunner_PersistsToolMessagesSeparately(t *testing.T) {
 	assert.Equal(t, ToolStateSucceeded, toolEvents[1].State)
 	assert.NotEmpty(t, toolEvents[0].InvocationID)
 	assert.Equal(t, toolEvents[0].InvocationID, toolEvents[1].InvocationID)
-	assert.Equal(t, []PublicToolEvent{
-		{Name: "web_search", InvocationID: toolEvents[0].InvocationID, State: ToolStateStarted},
-		{Name: "web_search", InvocationID: toolEvents[0].InvocationID, State: ToolStateSucceeded},
-	}, publicEvents)
+	assert.Len(t, publicEvents, 2)
+	assert.Equal(t, PublicToolEvent{Name: "web_search", InvocationID: toolEvents[0].InvocationID, State: ToolStateStarted}, publicEvents[0])
+	assert.Equal(t, "web_search", publicEvents[1].Name)
+	assert.Equal(t, toolEvents[0].InvocationID, publicEvents[1].InvocationID)
+	assert.Equal(t, ToolStateSucceeded, publicEvents[1].State)
+	assert.Greater(t, publicEvents[1].Duration, time.Duration(0))
 	assert.Equal(t, "web_search", toolEvents[0].Name)
 	assert.Empty(t, toolEvents[0].Result)
 	assert.Equal(t, "web_search", toolEvents[1].Name)
@@ -245,15 +248,15 @@ func TestAgentRunner_PersistsToolMessagesSeparately(t *testing.T) {
 func TestPublicToolProjectionRequiresRegisteredName(t *testing.T) {
 	registered := map[string]string{"web_search": "web_search"}
 	for _, state := range []ToolState{ToolStateStarted, ToolStateSucceeded, ToolStateFailed} {
-		public, ok := projectPublicToolEvent(registered, "web_search", "tool_1", state)
+		public, ok := projectPublicToolEvent(registered, "web_search", "tool_1", state, nil, 0)
 		assert.True(t, ok)
 		assert.Equal(t, PublicToolEvent{Name: "web_search", InvocationID: "tool_1", State: state}, public)
 	}
-	_, ok := projectPublicToolEvent(registered, "model_invented_fake_secret", "tool_2", ToolStateStarted)
+	_, ok := projectPublicToolEvent(registered, "model_invented_fake_secret", "tool_2", ToolStateStarted, nil, 0)
 	assert.False(t, ok)
-	_, ok = projectPublicToolEvent(registered, "web_search", "", ToolStateStarted)
+	_, ok = projectPublicToolEvent(registered, "web_search", "", ToolStateStarted, nil, 0)
 	assert.False(t, ok)
-	_, ok = projectPublicToolEvent(registered, "web_search", "tool_3", ToolState("unknown"))
+	_, ok = projectPublicToolEvent(registered, "web_search", "tool_3", ToolState("unknown"), nil, 0)
 	assert.False(t, ok)
 }
 
@@ -327,7 +330,13 @@ func TestFailedToolProjectsOnlyRegisteredNameAndState(t *testing.T) {
 		assert.Equal(t, ToolStateFailed, raw[1].State)
 		assert.Contains(t, raw[1].Error, "fake-secret error")
 		assert.Equal(t, PublicToolEvent{Name: "registered_tool", InvocationID: "tool_failure", State: ToolStateStarted}, public[0])
-		assert.Equal(t, PublicToolEvent{Name: "registered_tool", InvocationID: "tool_failure", State: ToolStateFailed}, public[1])
+		assert.Equal(t, "registered_tool", public[1].Name)
+		assert.Equal(t, "tool_failure", public[1].InvocationID)
+		assert.Equal(t, ToolStateFailed, public[1].State)
+		assert.Greater(t, public[1].Duration, time.Duration(0))
+		assert.Empty(t, public[0].Detail)
+		assert.Empty(t, public[1].Detail)
+		assert.NotContains(t, fmt.Sprint(public), "fake-secret")
 	}
 }
 

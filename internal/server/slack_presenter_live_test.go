@@ -10,6 +10,7 @@ import (
 
 	"github.com/slack-go/slack"
 
+	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/channels"
 )
 
@@ -45,7 +46,7 @@ func TestSlackPresenterLiveSmoke(t *testing.T) {
 	ch := channels.NewSlackChannel("", fixture.BotToken, nil, "", nil)
 	p := newSlackPresenter(ch, fixture.Channel, rootTS, true)
 	p.delay = 100 * time.Millisecond
-	p.Tool("synthetic_registered_tool", "smoke-call-1", "started")
+	p.Tool(agent.PublicToolEvent{Name: "synthetic_registered_tool", InvocationID: "smoke-call-1", State: agent.ToolState("started")})
 	deadline := time.Now().Add(10 * time.Second)
 	for p.progressTimestamp() == "" && time.Now().Before(deadline) {
 		time.Sleep(25 * time.Millisecond)
@@ -53,7 +54,7 @@ func TestSlackPresenterLiveSmoke(t *testing.T) {
 	if p.progressTimestamp() == "" {
 		t.Fatal("synthetic Slack progress was not accepted")
 	}
-	p.Tool("synthetic_registered_tool", "smoke-call-1", "succeeded")
+	p.Tool(agent.PublicToolEvent{Name: "synthetic_registered_tool", InvocationID: "smoke-call-1", State: agent.ToolState("succeeded")})
 	updated := false
 	for !updated && time.Now().Before(deadline) {
 		messages, _, _, fetchErr := api.GetConversationRepliesContext(ctx, &slack.GetConversationRepliesParameters{ChannelID: fixture.Channel, Timestamp: rootTS, Limit: 20})

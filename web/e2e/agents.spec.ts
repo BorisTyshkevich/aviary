@@ -861,6 +861,8 @@ test("Slack tool progress loads and saves independently of typing", async ({
 							id: "workspace-bot",
 							show_typing: false,
 							tool_progress: true,
+							tool_progress_max_calls: 150,
+							tool_progress_max_chars: 3000,
 							allow_from: [{ from: "*" }],
 						},
 					],
@@ -880,6 +882,10 @@ test("Slack tool progress loads and saves independently of typing", async ({
 		.click();
 	const progress = page.getByLabel("Show tool progress");
 	await expect(progress).toBeChecked();
+	const maxCalls = page.getByLabel("Max tool calls");
+	const maxChars = page.getByLabel("Max UTF-8 bytes");
+	await expect(maxCalls).toHaveValue("150");
+	await expect(maxChars).toHaveValue("3000");
 	await expect(page.getByLabel("Show typing indicator")).not.toBeChecked();
 	await progress.uncheck();
 	await page.getByRole("button", { name: "Save Changes" }).click();
@@ -887,12 +893,33 @@ test("Slack tool progress loads and saves independently of typing", async ({
 	expect(savedConfig).toMatchObject({
 		agents: [{ channels: [{ show_typing: false }] }],
 	});
-	expect(JSON.stringify(savedConfig)).not.toContain("tool_progress");
+	expect(savedConfig).toMatchObject({
+		agents: [
+			{
+				channels: [
+					{ tool_progress_max_calls: 150, tool_progress_max_chars: 3000 },
+				],
+			},
+		],
+	});
 	await progress.check();
+	await maxCalls.fill("100");
+	await maxChars.fill("2800");
 	await page.getByRole("button", { name: "Save Changes" }).click();
 	await expect(page.getByTitle("Settings saved")).toBeVisible();
 	expect(savedConfig).toMatchObject({
-		agents: [{ channels: [{ tool_progress: true, show_typing: false }] }],
+		agents: [
+			{
+				channels: [
+					{
+						tool_progress: true,
+						tool_progress_max_calls: 100,
+						tool_progress_max_chars: 2800,
+						show_typing: false,
+					},
+				],
+			},
+		],
 	});
 });
 

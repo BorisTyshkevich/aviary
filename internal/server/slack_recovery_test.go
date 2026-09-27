@@ -23,6 +23,7 @@ type recoverySender struct {
 	mu                                sync.Mutex
 	posts, edits, deletes             []string
 	postError, editError, deleteError error
+	deleteErrorByTS                   map[string]error
 }
 
 func (f *recoverySender) PostThreadTextContext(ctx context.Context, channel, thread, text string) (string, error) {
@@ -52,6 +53,9 @@ func (f *recoverySender) DeleteThreadMessageContext(ctx context.Context, channel
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.deletes = append(f.deletes, channel+"/"+ts)
+	if err := f.deleteErrorByTS[ts]; err != nil {
+		return err
+	}
 	return f.deleteError
 }
 
@@ -146,6 +150,92 @@ func TestSlackRecoveryRetainsDeniedCleanup(t *testing.T) {
 	posts, edits, _ := sender.snapshot()
 	require.Empty(t, posts)
 	require.Empty(t, edits)
+}
+
+func TestSlackRecoveryEditsLastPageAndDeletesEarlierPages(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{
+		ProgressTS: "page-1", ProgressExtraTS: []string{"page-2", "page-3"}, CleanupPending: true,
+	})
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	posts, edits, deletes := sender.snapshot()
+	require.Empty(t, posts)
+	require.Equal(t, []string{"C-original/page-3:Interrupted; please resend your request."}, edits)
+	require.Equal(t, []string{"C-original/page-1", "C-original/page-2"}, deletes)
+	require.NoFileExists(t, path)
+}
+
+func TestSlackRecoveryPersistsEachPageDeletedBeforeLaterFailure(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{
+		ProgressTS: "page-1", ProgressExtraTS: []string{"page-2", "page-3"},
+		CleanupPending: true, Disposition: agent.SlackDispositionHandled,
+	})
+	sender.deleteErrorByTS = map[string]error{
+		"page-2": &channels.SlackDeliveryError{Rejected: true, Cause: errors.New("fake denied")},
+	}
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	meta := readRecovery(t, path).Slack
+	require.Equal(t, agent.SlackDispositionHandled, meta.Disposition)
+	require.Equal(t, []string{"page-2", "page-3"}, meta.ProgressTimestamps(),
+		"a crash after the first deletion must resume at the next page")
+	require.True(t, meta.CleanupPending)
+	_, _, deletes := sender.snapshot()
+	require.Equal(t, []string{"C-original/page-1", "C-original/page-2"}, deletes)
+	sender.deleteErrorByTS = nil
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	_, _, deletes = sender.snapshot()
+	require.Equal(t, []string{"C-original/page-1", "C-original/page-2", "C-original/page-2", "C-original/page-3"}, deletes)
+	require.NoFileExists(t, path)
+}
+
+func TestSlackRecoveryMissingPageCountsAsDeleted(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{
+		ProgressTS: "missing-page", ProgressExtraTS: []string{"page-2"},
+		CleanupPending: true, Disposition: agent.SlackDispositionHandled,
+	})
+	// SlackChannel normalizes message_not_found to nil; the fake sender
+	// models that successful idempotent delete on the first page.
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	_, _, deletes := sender.snapshot()
+	require.Equal(t, []string{"C-original/missing-page", "C-original/page-2"}, deletes)
+	require.NoFileExists(t, path)
+}
+
+func TestSlackRecoveryNoticePromotionKeepsEarlierPagesOnDeleteFailure(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{
+		ProgressTS: "page-1", ProgressExtraTS: []string{"page-2", "notice-page"}, CleanupPending: true,
+	})
+	sender.deleteErrorByTS = map[string]error{
+		"page-2": &channels.SlackDeliveryError{Rejected: true, Cause: errors.New("fake denied")},
+	}
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	meta := readRecovery(t, path).Slack
+	require.Equal(t, agent.SlackDispositionHandled, meta.Disposition)
+	require.Equal(t, []string{"page-2"}, meta.ProgressTimestamps())
+	require.True(t, meta.CleanupPending)
+	_, edits, deletes := sender.snapshot()
+	require.Equal(t, []string{"C-original/notice-page:Interrupted; please resend your request."}, edits)
+	require.Equal(t, []string{"C-original/page-1", "C-original/page-2"}, deletes)
+	sender.deleteErrorByTS = nil
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	_, edits, deletes = sender.snapshot()
+	require.Len(t, edits, 1, "handled recovery must not rewrite the fixed notice")
+	require.Equal(t, []string{"C-original/page-1", "C-original/page-2", "C-original/page-2"}, deletes)
+	require.NoFileExists(t, path)
+}
+
+func TestSlackRecoveryUncertainLastPageEditKeepsAllPages(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{
+		ProgressTS: "page-1", ProgressExtraTS: []string{"page-2"}, CleanupPending: true,
+	})
+	sender.editError = errors.New("fake connection lost after edit dispatch")
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	meta := readRecovery(t, path).Slack
+	require.Equal(t, agent.SlackDispositionUnconfirmed, meta.Disposition)
+	require.Equal(t, []string{"page-1", "page-2"}, meta.ProgressTimestamps())
+	posts, edits, deletes := sender.snapshot()
+	require.Empty(t, posts)
+	require.Equal(t, []string{"C-original/page-2:Interrupted; please resend your request."}, edits)
+	require.Empty(t, deletes)
 }
 
 func TestSlackRecoveryNoticeMarkerPreventsDuplicatePost(t *testing.T) {
@@ -269,6 +359,8 @@ func TestSlackRecoveryRetainsInvalidStateWithoutPosting(t *testing.T) {
 	for _, meta := range []agent.SlackCheckpoint{
 		{Disposition: "bogus"},
 		{Disposition: agent.SlackDispositionHandled, CleanupPending: true},
+		{Disposition: agent.SlackDispositionHandled, ProgressExtraTS: []string{"orphan"}, CleanupPending: true},
+		{Disposition: agent.SlackDispositionHandled, ProgressTS: "duplicate", ProgressExtraTS: []string{"duplicate"}, CleanupPending: true},
 	} {
 		t.Run(string(meta.Disposition), func(t *testing.T) {
 			path, route, sender := recoveryFixture(t, meta)

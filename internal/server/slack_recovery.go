@@ -53,7 +53,28 @@ func slackRecoveryMetadataValid(meta *agent.SlackCheckpoint) bool {
 	default:
 		return false
 	}
-	return !meta.CleanupPending || meta.ProgressTS != ""
+	if meta.CleanupPending && meta.ProgressTS == "" {
+		return false
+	}
+	if meta.ProgressTS == "" && len(meta.ProgressExtraTS) != 0 {
+		return false
+	}
+	seen := make(map[string]bool, 1+len(meta.ProgressExtraTS))
+	for _, ts := range meta.ProgressTimestamps() {
+		if ts == "" || seen[ts] {
+			return false
+		}
+		seen[ts] = true
+	}
+	return true
+}
+
+func setSlackRecoveryProgress(meta *agent.SlackCheckpoint, timestamps []string) {
+	meta.ProgressTS, meta.ProgressExtraTS = "", nil
+	if len(timestamps) != 0 {
+		meta.ProgressTS = timestamps[0]
+		meta.ProgressExtraTS = append([]string(nil), timestamps[1:]...)
+	}
 }
 
 // RecoverSlackCheckpoints makes one bounded recovery pass over durable Slack
@@ -199,14 +220,22 @@ func (s *Server) recoverClaimedSlackCheckpoint(ctx context.Context, route channe
 	if !route.Current() {
 		return
 	}
-	if meta.ProgressTS != "" {
+	if timestamps := meta.ProgressTimestamps(); len(timestamps) != 0 {
+		last := timestamps[len(timestamps)-1]
 		callCtx, cancel := slackRecoveryContext(ctx, route, slackAnswerCallTimeout)
-		err := route.Channel.EditThreadTextContext(callCtx, meta.ChannelID, meta.ProgressTS, slackRecoveryNotice(meta))
+		err := route.Channel.EditThreadTextContext(callCtx, meta.ChannelID, last, slackRecoveryNotice(meta))
 		cancel()
 		if err == nil {
-			meta.Disposition, meta.CleanupPending = agent.SlackDispositionHandled, false
+			// The edited final page is now the notice. Earlier pages still need
+			// deletion; never delete the notice itself as progress cleanup.
+			setSlackRecoveryProgress(meta, timestamps[:len(timestamps)-1])
+			meta.Disposition, meta.CleanupPending = agent.SlackDispositionHandled, len(timestamps) > 1
 			if persistSlackRecovery(path, &cp) {
-				retireSlackRecovery(path)
+				if meta.CleanupPending {
+					s.recoverSlackCleanup(ctx, route, path, &cp)
+				} else {
+					retireSlackRecovery(path)
+				}
 			}
 			return
 		}
@@ -261,15 +290,23 @@ func (s *Server) recoverSlackCleanup(ctx context.Context, route channels.SlackAu
 		slog.Warn("server: Slack progress cleanup awaits original message and authenticated route", "checkpoint", filepath.Base(path))
 		return
 	}
-	callCtx, cancel := slackRecoveryContext(ctx, route, slackProgressTimeout)
-	err := route.Channel.DeleteThreadMessageContext(callCtx, cp.Slack.ChannelID, cp.Slack.ProgressTS)
-	cancel()
-	if err != nil {
-		slog.Warn("server: retaining Slack checkpoint with pending progress cleanup", "checkpoint", filepath.Base(path))
-		return
+	for len(cp.Slack.ProgressTimestamps()) != 0 {
+		if !route.Current() {
+			return
+		}
+		remaining := cp.Slack.ProgressTimestamps()
+		callCtx, cancel := slackRecoveryContext(ctx, route, slackProgressTimeout)
+		err := route.Channel.DeleteThreadMessageContext(callCtx, cp.Slack.ChannelID, remaining[0])
+		cancel()
+		if err != nil {
+			slog.Warn("server: retaining Slack checkpoint with pending progress cleanup", "checkpoint", filepath.Base(path))
+			return
+		}
+		setSlackRecoveryProgress(cp.Slack, remaining[1:])
+		cp.Slack.CleanupPending = cp.Slack.ProgressTS != ""
+		if !persistSlackRecovery(path, cp) {
+			return
+		}
 	}
-	cp.Slack.CleanupPending = false
-	if persistSlackRecovery(path, cp) {
-		retireSlackRecovery(path)
-	}
+	retireSlackRecovery(path)
 }
