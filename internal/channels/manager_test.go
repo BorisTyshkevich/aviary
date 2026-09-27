@@ -798,6 +798,30 @@ func TestSlackChannel_HandleAppMention(t *testing.T) {
 	assert.Equal(t, time.Unix(1710000000, 123456000).UTC(), msg.ReceivedAt)
 }
 
+func TestSlackChannel_ThreadReplyRequiresOwnMention(t *testing.T) {
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "messages": []any{}})
+	}))
+	defer api.Close()
+	ch := NewSlackChannel("xapp-token", "xoxb-token", []config.AllowFromEntry{{
+		From: "*", AllowedGroups: "C123", RespondToMentions: true,
+	}}, "m", nil)
+	ch.client = slack.New("xoxb-token", slack.OptionAPIURL(api.URL+"/"))
+	ch.botUserID = "UCLICKSEARCH"
+	var messages []IncomingMessage
+	ch.OnMessage(func(m IncomingMessage) { messages = append(messages, m) })
+	for _, event := range []slackevents.MessageEvent{
+		{User: "U123", Channel: "C123", Text: "<@UOTHER> connect", TimeStamp: "1710000000.000001"},
+		{User: "U123", Channel: "C123", Text: "continue", TimeStamp: "1710000001.000001", ThreadTimeStamp: "1710000000.000001"},
+		{User: "U123", Channel: "C123", Text: "<@UCLICKSEARCH> help", TimeStamp: "1710000002.000001", ThreadTimeStamp: "1710000000.000001"},
+	} {
+		ch.handleMessageEvent(&event)
+	}
+	assert.Len(t, messages, 1)
+	assert.True(t, messages[0].IsThreadReply)
+	assert.Equal(t, "1710000000.000001", messages[0].ThreadTS)
+}
+
 func TestSlackChannel_DeduplicatesMessageAndAppMention(t *testing.T) {
 	ch := NewSlackChannel("xapp-token", "xoxb-token", []config.AllowFromEntry{{
 		From: "*", AllowedGroups: "*", RespondToMentions: true,
@@ -1262,6 +1286,23 @@ func TestRoutedSlackMessage_SharedConnectionRoutesMatchingSpec(t *testing.T) {
 
 	_, ok = routedSlackMessage(ch, coder, msg)
 	assert.False(t, ok)
+}
+
+func TestRoutedSlackMessage_ThreadReplyRequiresOwnMention(t *testing.T) {
+	ch := NewSlackChannel("xapp-token", "xoxb-token", nil, "m", nil)
+	ch.botUserID = "UCLICKSEARCH"
+	spec := channelSpec{channelConfig: config.ChannelConfig{AllowFrom: []config.AllowFromEntry{{
+		From: "*", AllowedGroups: "C123", RespondToMentions: true,
+	}}}}
+	msg := IncomingMessage{Type: "slack", From: "U123", Channel: "C123", ThreadTS: "1710000000.000001", IsThreadReply: true}
+	for _, text := range []string{"continue", "<@UOTHER> help"} {
+		msg.Text = text
+		_, ok := routedSlackMessage(ch, spec, msg)
+		assert.False(t, ok, text)
+	}
+	msg.Text = "<@UCLICKSEARCH> help"
+	_, ok := routedSlackMessage(ch, spec, msg)
+	assert.True(t, ok)
 }
 
 func TestRoutedSlackMessage_SharedConnectionResolvesChannelName(t *testing.T) {
