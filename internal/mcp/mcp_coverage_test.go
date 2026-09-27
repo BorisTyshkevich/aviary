@@ -557,10 +557,19 @@ func TestConfigGetSaveValidateTools(t *testing.T) {
 		!strings.HasPrefix(strings.TrimSpace(out), "[") && strings.TrimSpace(out) != "null")
 
 	// config_save with valid JSON config
-	cfgJSON := `{"agents":[{"name":"bot","model":"anthropic/claude-3-haiku","channels":[{"type":"slack","id":"alerts"}]}]}`
+	cfgJSON := `{"agents":[{"name":"bot","model":"anthropic/claude-3-haiku","channels":[{"type":"slack","id":"alerts","tool_progress":true}]}]}`
 	out, err = d.CallTool(context.Background(), "config_save", map[string]any{"config": cfgJSON})
 	assert.NoError(t, err)
 	assert.True(t, strings.Contains(out, "saved"))
+	loaded, err := config.Load("")
+	assert.NoError(t, err)
+	if assert.Len(t, loaded.Agents, 1) && assert.Len(t, loaded.Agents[0].Channels, 1) {
+		assert.True(t, config.BoolOr(loaded.Agents[0].Channels[0].ToolProgress, false))
+	}
+	out, err = d.CallTool(context.Background(), "config_get", map[string]any{})
+	assert.NoError(t, err)
+	assert.Contains(t, out, `"tool_progress": true`)
+	toolCallContains(t, d, "config_save", map[string]any{"config": `{"agents":[{"name":"bot","channels":[{"type":"signal","tool_progress":false}]}]}`}, "tool_progress is only supported for Slack")
 
 	state, err := store.ReadAppState()
 	assert.NoError(t, err)

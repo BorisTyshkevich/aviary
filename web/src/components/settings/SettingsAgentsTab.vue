@@ -723,6 +723,11 @@
 											class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
 										Show typing indicator
 									</label>
+									<label v-if="ch.type === 'slack'" class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
+										<input type="checkbox" v-model="ch.tool_progress"
+											class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
+										Show tool progress
+									</label>
 									<label class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
 										<input type="checkbox" v-model="ch.reply_to_replies"
 											class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />

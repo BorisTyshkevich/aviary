@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -23,11 +24,12 @@ import (
 
 type deliveryTestChannel struct {
 	stubChannel
-	mu     sync.Mutex
-	fail   bool
-	sent   []string
-	onSend func()
-	once   sync.Once
+	mu      sync.Mutex
+	fail    bool
+	sent    []string
+	deleted []string
+	onSend  func()
+	once    sync.Once
 }
 
 type sensitiveDeliveryToolClient struct {
@@ -65,6 +67,40 @@ func (c *deliveryTestChannel) SendThreadMessageAndGetID(_, _, text string) (stri
 	}
 	c.sent = append(c.sent, text)
 	return "posted", nil
+}
+
+func (c *deliveryTestChannel) PostThreadTextContext(_ context.Context, channel, thread, text string) (string, error) {
+	return c.SendThreadMessageAndGetID(channel, thread, text)
+}
+
+func (c *deliveryTestChannel) EditThreadTextContext(_ context.Context, _, _, text string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fail {
+		return errors.New("fake delivery failure")
+	}
+	if len(c.sent) != 0 {
+		c.sent[len(c.sent)-1] = text
+	}
+	return nil
+}
+
+func (c *deliveryTestChannel) DeleteThreadMessageContext(_ context.Context, _, ts string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleted = append(c.deleted, ts)
+	return nil
+}
+
+func (c *deliveryTestChannel) deletedMessages() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.deleted...)
+}
+
+func (c *deliveryTestChannel) ShareThreadMarkdownFileContext(_ context.Context, _, _, _, answer string) error {
+	_, err := c.SendThreadMessageAndGetID("C123", "1700000000.000001", answer)
+	return err
 }
 
 func TestPrivateSlackDeliveryDoesNotFanOutToSessionRegistry(t *testing.T) {
@@ -286,6 +322,107 @@ func TestSlackNoReplyClearsStatusWithoutPosting(t *testing.T) {
 	runner.Wait()
 	require.Empty(t, ch.posted())
 	require.Equal(t, []string{"is thinking", ""}, ch.snapshotStatuses())
+}
+
+type slowDeliveryToolClient struct{ delay time.Duration }
+
+func (c *slowDeliveryToolClient) ListTools(context.Context) ([]agent.ToolInfo, error) {
+	return []agent.ToolInfo{{Name: "synthetic_tool", InputSchema: map[string]any{"type": "object"}}}, nil
+}
+
+func (c *slowDeliveryToolClient) CallToolText(ctx context.Context, _ string, _ map[string]any) (string, error) {
+	select {
+	case <-time.After(c.delay):
+		return "synthetic result", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+func (c *slowDeliveryToolClient) Close() error { return nil }
+
+func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
+	setupServerDataDir(t)
+	resetSlogForTest()
+	var rounds int
+	var roundsMu sync.Mutex
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		roundsMu.Lock()
+		defer roundsMu.Unlock()
+		rounds++
+		if rounds%2 == 1 {
+			writeDeliveryToolCall(w, "synthetic_tool", map[string]any{"path": "/fake-private-path"})
+		} else {
+			writeDeliveryText(w, "synthetic final")
+		}
+	}))
+	t.Cleanup(model.Close)
+	on, off := true, false
+	cfg := &config.Config{
+		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Channels: []config.ChannelConfig{
+			{Type: "slack", ID: "quiet", ToolProgress: &off},
+			{Type: "slack", ID: "active", ToolProgress: &on},
+		}}},
+	}
+	srv := New(cfg, "fake-token")
+	tool := &slowDeliveryToolClient{delay: 1200 * time.Millisecond}
+	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
+	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
+	shared := &deliveryTestChannel{}
+	runner, ok := srv.agents.Get("bot")
+	require.True(t, ok)
+	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "quiet", shared, channels.IncomingMessage{
+		Type: "slack", Channel: "C1", ThreadTS: "1700000000.000001", From: "U1", Text: "quiet",
+	})
+	runner.Wait()
+	require.Equal(t, []string{"synthetic final"}, shared.posted())
+	require.Empty(t, shared.deletedMessages())
+	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "active", shared, channels.IncomingMessage{
+		Type: "slack", Channel: "C2", ThreadTS: "1700000000.000002", From: "U1", Text: "active",
+	})
+	runner.Wait()
+	posted := shared.posted()
+	require.Len(t, posted, 3)
+	require.Contains(t, posted[1], "Tool progress")
+	require.Contains(t, posted[1], "synthetic_tool")
+	require.NotContains(t, posted[1], "/fake-private-path")
+	require.Equal(t, "synthetic final", posted[2])
+	require.Equal(t, []string{"posted"}, shared.deletedMessages())
+}
+
+func TestSlackPrivateTurnSuppressesEnabledToolProgress(t *testing.T) {
+	setupServerDataDir(t)
+	resetSlogForTest()
+	var rounds int
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		rounds++
+		if rounds == 1 {
+			writeDeliveryToolCall(w, "synthetic_tool", map[string]any{"path": "/fake-private-path"})
+		} else {
+			writeDeliveryText(w, "synthetic private answer")
+		}
+	}))
+	t.Cleanup(model.Close)
+	on := true
+	cfg := &config.Config{
+		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Channels: []config.ChannelConfig{{Type: "slack", ID: "active", ToolProgress: &on}}}},
+	}
+	srv := New(cfg, "fake-token")
+	selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
+	tool := &slowDeliveryToolClient{delay: 1200 * time.Millisecond}
+	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
+	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
+	ch := &deliveryTestChannel{}
+	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "active", ch, channels.IncomingMessage{
+		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
+	})
+	runner, ok := srv.agents.Get("bot")
+	require.True(t, ok)
+	runner.Wait()
+	require.Equal(t, []string{"synthetic private answer"}, ch.posted())
+	require.Empty(t, ch.deletedMessages())
 }
 
 type statusDeliveryChannel struct {

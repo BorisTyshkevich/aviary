@@ -37,6 +37,7 @@ export interface AgentChannel {
 	disabled_tools?: string[];
 	allow_from?: AllowFromEntry[];
 	show_typing?: boolean;
+	tool_progress?: boolean;
 	separate_top_level_sessions?: boolean;
 	reply_to_replies?: boolean;
 	ignore_other_user_mentions?: boolean;
@@ -208,6 +209,12 @@ function parseConfigPayload(raw: string): Partial<AppConfig> {
 	}
 }
 
+function channelForType(channel: AgentChannel): AgentChannel {
+	const safe = { ...channel };
+	if (safe.type !== "slack") delete safe.tool_progress;
+	return safe;
+}
+
 export const useSettingsStore = defineStore("settings", () => {
 	const config = ref<AppConfig | null>(null);
 	const loading = ref(false);
@@ -232,10 +239,13 @@ export const useSettingsStore = defineStore("settings", () => {
 				agents: (parsed.agents ?? []).map((agent) => ({
 					...agent,
 					channels: (agent.channels ?? []).map((ch) => ({
-						...ch,
+						...channelForType(ch),
 						enabled: ch.enabled !== false,
 						// Default these to true when absent.
 						show_typing: ch.show_typing !== false,
+						...(ch.type === "slack"
+							? { tool_progress: ch.tool_progress === true }
+							: {}),
 						reply_to_replies: ch.reply_to_replies !== false,
 						react_to_emoji: ch.react_to_emoji !== false,
 						send_read_receipts: ch.send_read_receipts !== false,
@@ -280,8 +290,15 @@ export const useSettingsStore = defineStore("settings", () => {
 		saving.value = true;
 		error.value = null;
 		try {
-			await callTool("config_save", { config: JSON.stringify(updated) });
-			config.value = updated;
+			const channelSafe = {
+				...updated,
+				agents: updated.agents.map((agent) => ({
+					...agent,
+					channels: (agent.channels ?? []).map(channelForType),
+				})),
+			};
+			await callTool("config_save", { config: JSON.stringify(channelSafe) });
+			config.value = channelSafe;
 		} catch (e) {
 			error.value = e instanceof Error ? e.message : String(e);
 			throw e;

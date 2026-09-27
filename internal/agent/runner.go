@@ -306,7 +306,7 @@ func (r *AgentRunner) promptCore(
 		// Guard: if this message was already successfully answered (e.g. by a
 		// concurrent run or on a retry), do not process it again.
 		if promptMsgID != "" && HasMessageResponse(r.agent.ID, sessionID, promptMsgID) {
-			emit(StreamEvent{Type: StreamEventDone})
+			emit(StreamEvent{Type: StreamEventDone, AlreadyAnswered: true})
 			return
 		}
 
@@ -413,12 +413,12 @@ func (r *AgentRunner) promptCore(
 				conversation = history
 			}
 		}
-		toolNames := make(map[string]struct{}, len(tools))
+		toolNames := make(map[string]string, len(tools))
 		if evidence != "" {
 			conversation = append(conversation, llm.Message{Role: llm.RoleUser, Content: evidence})
 		}
 		for _, t := range tools {
-			toolNames[t.Name] = struct{}{}
+			toolNames[t.Name] = t.Name
 		}
 		llmTools := buildLLMToolDefinitions(tools)
 
@@ -567,6 +567,7 @@ func (r *AgentRunner) promptCore(
 						unavailableTool = nativeCall.Name
 						break
 					}
+					invocationID := newID("tool")
 					resultText, canceled := r.executeToolCall(
 						promptCtx,
 						emit,
@@ -576,6 +577,8 @@ func (r *AgentRunner) promptCore(
 						toolEventRecord{Name: nativeCall.Name, Args: nativeCall.Arguments},
 						nativeCall.Name,
 						nativeCall.Arguments,
+						toolNames,
+						invocationID,
 					)
 					if canceled {
 						return
@@ -1161,10 +1164,23 @@ func (r *AgentRunner) executeToolCall(
 	streamRec toolEventRecord,
 	name string,
 	args map[string]any,
+	registeredNames map[string]string,
+	invocationID string,
 ) (string, bool) {
 	args = normalizeSessionToolArguments(name, sessionID, args)
 	streamRec.Args = args
-	emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args}})
+	emitToolState := func(state ToolState, result, errorText string) {
+		emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{
+			Name: streamRec.Name, InvocationID: invocationID, State: state,
+			Args: streamRec.Args, Result: result, Error: errorText,
+		}})
+		if !privateConnectionTurn(promptCtx) {
+			if public, ok := projectPublicToolEvent(registeredNames, name, invocationID, state); ok {
+				emit(StreamEvent{Type: StreamEventToolProgress, PublicTool: &public})
+			}
+		}
+	}
+	emitToolState(ToolStateStarted, "", "")
 	if usageRec != nil {
 		usageRec.ToolCalls++
 	}
@@ -1174,7 +1190,7 @@ func (r *AgentRunner) executeToolCall(
 			emit(StreamEvent{Type: StreamEventStop})
 			return "", true
 		}
-		emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args, Error: callErr.Error()}})
+		emitToolState(ToolStateFailed, "", callErr.Error())
 		errRec := toolEventRecord{Name: name, Args: args, Error: callErr.Error()}
 		errPayload, _ := json.Marshal(errRec)
 		if !privateConnectionTurn(promptCtx) {
@@ -1183,13 +1199,28 @@ func (r *AgentRunner) executeToolCall(
 		return "error: " + callErr.Error(), false
 	}
 
-	emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args, Result: resultText}})
+	emitToolState(ToolStateSucceeded, resultText, "")
 	histRec := toolEventRecord{Name: name, Args: args, Result: resultText}
 	histPayload, _ := json.Marshal(histRec)
 	if !privateConnectionTurn(promptCtx) {
 		r.appendSessionMessage(sessionID, domain.MessageRoleTool, string(histPayload), "", "")
 	}
 	return resultText, false
+}
+
+// projectPublicToolEvent uses the runner's filtered registration snapshot, not
+// a model-provided label or a raw tool event, to construct channel progress.
+func projectPublicToolEvent(registeredNames map[string]string, proposedName, invocationID string, state ToolState) (PublicToolEvent, bool) {
+	switch state {
+	case ToolStateStarted, ToolStateSucceeded, ToolStateFailed:
+	default:
+		return PublicToolEvent{}, false
+	}
+	name, ok := registeredNames[proposedName]
+	if !ok || name == "" || invocationID == "" {
+		return PublicToolEvent{}, false
+	}
+	return PublicToolEvent{Name: name, InvocationID: invocationID, State: state}, true
 }
 
 func normalizeSessionToolArguments(toolName, sessionID string, args map[string]any) map[string]any {
