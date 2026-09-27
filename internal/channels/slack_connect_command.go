@@ -33,22 +33,60 @@ func validSlackDBUsername(username string) bool {
 	return true
 }
 
-func unwrapSlackEmail(raw string) string {
-	if !strings.HasPrefix(raw, "<mailto:") || !strings.HasSuffix(raw, ">") {
+func unwrapSlackUsername(raw string) string {
+	if !strings.HasPrefix(raw, "<") || !strings.HasSuffix(raw, ">") {
 		return raw
 	}
-	inner := strings.TrimSuffix(strings.TrimPrefix(raw, "<mailto:"), ">")
-	address, label, hasLabel := strings.Cut(inner, "|")
-	if hasLabel && address != label {
+	inner := raw[1 : len(raw)-1]
+	destination, label, hasLabel := strings.Cut(inner, "|")
+	if strings.HasPrefix(destination, "mailto:") {
+		address := strings.TrimPrefix(destination, "mailto:")
+		if !hasLabel || address == label {
+			return address
+		}
 		return raw
 	}
-	return address
+	if !hasLabel || label == "" || strings.ContainsAny(label, "<>|") {
+		return raw
+	}
+	if destination == "http://"+label || destination == "https://"+label {
+		return label
+	}
+	return raw
+}
+
+// slackCommandFields keeps Slack's angle-bracket links together when their
+// display labels contain spaces. Text outside a link remains separate tokens.
+func slackCommandFields(raw string) []string {
+	var fields []string
+	for i := 0; i < len(raw); {
+		r, size := utf8.DecodeRuneInString(raw[i:])
+		if unicode.IsSpace(r) {
+			i += size
+			continue
+		}
+		start := i
+		if raw[i] == '<' {
+			if end := strings.IndexByte(raw[i:], '>'); end >= 0 {
+				i += end + 1
+			}
+		}
+		for i < len(raw) {
+			r, size = utf8.DecodeRuneInString(raw[i:])
+			if unicode.IsSpace(r) {
+				break
+			}
+			i += size
+		}
+		fields = append(fields, raw[start:i])
+	}
+	return fields
 }
 
 // parseSlackConnectionCommand recognizes only a whole message command. URLs in
 // ordinary conversation, quoted history and tool results never select a target.
 func parseSlackConnectionCommand(raw, botID string, isDM bool) (slackConnectionCommand, bool, error) {
-	fields := strings.Fields(raw)
+	fields := slackCommandFields(raw)
 	if len(fields) == 0 {
 		return slackConnectionCommand{}, false, nil
 	}
@@ -84,13 +122,13 @@ func parseSlackConnectionCommand(raw, botID string, isDM bool) (slackConnectionC
 	}
 	cmd.endpoint = args[0]
 	if len(args) == 2 {
-		username := unwrapSlackEmail(args[1])
+		username := decodeSlackEntities(unwrapSlackUsername(args[1]))
 		if !validSlackDBUsername(username) {
 			return cmd, true, fmt.Errorf("username must be one nonempty token of at most 256 bytes without whitespace, controls or Slack markup")
 		}
 		cmd.username = username
 	}
-	cmd.endpoint = unwrapSlackURL(cmd.endpoint)
+	cmd.endpoint = decodeSlackEntities(unwrapSlackURL(cmd.endpoint))
 	u, err := url.Parse(cmd.endpoint)
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(cmd.endpoint, "#") {
 		return cmd, true, fmt.Errorf("connect requires an HTTPS URL without credentials, query or fragment")
@@ -139,7 +177,7 @@ func unwrapSlackURL(raw string) string {
 	if !strings.HasPrefix(urlPart, "https://") {
 		return raw
 	}
-	if hasLabel && label != urlPart {
+	if strings.ContainsAny(urlPart, "<>") || (hasLabel && (label == "" || strings.ContainsAny(label, "<>|"))) {
 		return raw
 	}
 	return urlPart

@@ -130,6 +130,8 @@ Slack-specific notes:
 
 In the destination channel thread, send `@Aviary connect https://cluster.example.com:8443`. Aviary uses your Slack email as the database username and sends one private password prompt. To use another login, append the non-secret username: `@Aviary connect https://cluster.example.com:8443 reporting_reader`. An explicit transport also works: `@Aviary connect clickhouse https://cluster.example.com:8443 reporting_reader`. If Slack email is unavailable, supply the username argument or add `users:read.email` and reinstall the Slack app. Reply in the private password prompt's thread with only your password. Spaces and punctuation in that reply are part of the password. Send it as plain text: Slack's rich-text composer can interpret `*`, `_`, `~`, and backticks as formatting, making the typed characters ambiguous. Return to the original thread for database work.
 
+If Slack shows the URL as a hostname or custom link label, Aviary connects to the link's actual HTTPS destination, including its port, regardless of the displayed text.
+
 Use `@Aviary status` to see the thread target and whether your own credentials are ready. Use `@Aviary disconnect` to detach it. Each participant supplies their own credentials for the shared target. A connection command must match one authorized agent when the bot is shared across agents. The endpoint must pass the configured connection network policy. An inferred or explicit MCP target reports unsupported transport until outbound MCP support is available.
 
 ### Common Confusions

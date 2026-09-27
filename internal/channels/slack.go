@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -58,8 +59,8 @@ type SlackChannel struct {
 
 // slackIngress is built only from the original Slack event, before enrichment.
 type slackIngress struct {
-	UserID, ChannelID, RootTS, MessageTS, Text string
-	IsDM, IsEdited                             bool
+	UserID, ChannelID, RootTS, MessageTS, Text, CommandText string
+	IsDM, IsEdited                                          bool
 }
 
 // NewSlackChannel creates a SlackChannel.
@@ -456,17 +457,18 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	if threadTS == "" {
 		threadTS = rawTimestamp
 	}
-	intakeText := slackVisibleText(text, blocks)
 	if !isGroup && c.redactReference != nil && c.redactReference(channelID, threadTS) {
 		if c.intake != nil {
-			c.intake(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: intakeText, IsDM: true, IsEdited: isEdited})
+			c.intake(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: slackVisibleText(text, blocks), CommandText: text, IsDM: true, IsEdited: isEdited})
 		}
 		return
 	}
 	if c.seenMessage(channelID, from, rawTimestamp, text) {
 		return
 	}
-	if c.intake != nil && c.intake(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: intakeText, IsDM: !isGroup, IsEdited: isEdited}) {
+	// Keep both views: command links need their raw destination, while a DM
+	// can become a classified password reply before intake handles it.
+	if c.intake != nil && c.intake(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: slackVisibleText(text, blocks), CommandText: text, IsDM: !isGroup, IsEdited: isEdited}) {
 		return
 	}
 	if strings.TrimSpace(text) == "" && len(files) == 0 && len(attachments) == 0 {
@@ -547,7 +549,8 @@ func (c *SlackChannel) seenMessage(channelID, from, timestamp, text string) bool
 		return false
 	}
 	now := time.Now()
-	key := channelID + "\x00" + from + "\x00" + timestamp + "\x00" + text
+	textDigest := sha256.Sum256([]byte(text))
+	key := channelID + "\x00" + from + "\x00" + timestamp + "\x00" + string(textDigest[:])
 	c.seenMu.Lock()
 	defer c.seenMu.Unlock()
 	if c.seenMessages == nil {

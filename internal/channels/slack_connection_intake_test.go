@@ -67,14 +67,14 @@ func TestSlackConnectionIntakePrivateSetupAndRestartRedaction(t *testing.T) {
 	intake := &slackConnectionIntake{channel: ch, service: service, specs: []channelSpec{spec},
 		validateEndpoint: func(context.Context, string, string) error { return nil },
 		validatePassword: func(_ context.Context, _ connections.Target, c connections.Credential) error {
-			if c.Username != "aviary_reader" || c.Password != "  fake password !  " {
+			if c.Username != "aviary_reader" || c.Password != "  fake &amp; <tag>  " {
 				t.Errorf("credential altered")
 			}
 			return nil
 		}}
 	ch.intake = intake.handle
 	ch.redactReference = intake.redactReference
-	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", Text: "<@BOT> connect https://db.example aviary_reader"}) {
+	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", CommandText: "<@BOT> connect https://db.example aviary_reader"}) {
 		t.Fatal("connect not consumed")
 	}
 	if _, ok := service.Current(connections.Scope{AgentID: "agent", InstallationID: "BOT", WorkspaceID: "TEAM", ChannelID: "C1", RootThreadID: "50.000001"}); !ok {
@@ -83,7 +83,7 @@ func TestSlackConnectionIntakePrivateSetupAndRestartRedaction(t *testing.T) {
 	if !service.ClassifyReply("BOT", "TEAM", "D1", "100.000001") {
 		t.Fatal("password prompt not durable")
 	}
-	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000006", Text: "<@BOT> connect https://db.example other_reader"}) {
+	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000006", CommandText: "<@BOT> connect https://db.example other_reader"}) {
 		t.Fatal("username change command not consumed")
 	}
 	mu.Lock()
@@ -100,16 +100,38 @@ func TestSlackConnectionIntakePrivateSetupAndRestartRedaction(t *testing.T) {
 	if !intake.handle(slackIngress{UserID: "U2", ChannelID: "D1", RootTS: "100.000001", MessageTS: "100.000004", Text: "wrong principal fake secret", IsDM: true}) {
 		t.Fatal("wrong principal reply not suppressed")
 	}
-	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "D1", RootTS: "100.000001", MessageTS: "100.000005", Text: "  fake password !  ", IsDM: true}) {
-		t.Fatal("password not consumed")
+	// Model the prompt becoming classified between the event's first check
+	// and intake's second check. Intake must still receive visible secret text.
+	firstRedactionCheck := true
+	ch.redactReference = func(channel, root string) bool {
+		if firstRedactionCheck {
+			firstRedactionCheck = false
+			return false
+		}
+		return intake.redactReference(channel, root)
+	}
+	ch.OnMessage(func(IncomingMessage) { t.Fatal("password reached ordinary handler") })
+	ch.handleMessageEvent(&slackevents.MessageEvent{
+		User: "U1", Channel: "D1", TimeStamp: "100.000005", ThreadTimeStamp: "100.000001",
+		Text: "  fake &amp;amp; &lt;tag&gt;  ",
+		Blocks: slack.Blocks{BlockSet: []slack.Block{slack.NewRichTextBlock("", slack.NewRichTextSection(
+			slack.NewRichTextSectionTextElement("  fake &amp; <tag>  ", nil)))}},
+	})
+	if firstRedactionCheck {
+		t.Fatal("event did not reach classification check")
+	}
+	for receipt := range ch.seenMessages {
+		if strings.Contains(receipt, "fake") {
+			t.Fatal("password retained in message receipt")
+		}
 	}
 	target, _ := service.Current(connections.Scope{AgentID: "agent", InstallationID: "BOT", WorkspaceID: "TEAM", ChannelID: "C1", RootThreadID: "50.000001"})
 	exec := connections.Execution{Kind: connections.Interactive, Scope: target.Scope, Principal: connections.Principal{InstallationID: "BOT", WorkspaceID: "TEAM", UserID: "U1"}}
 	credential, ok := service.CredentialFor(exec, target)
-	if !ok || credential.Password != "  fake password !  " {
+	if !ok || credential.Password != "  fake &amp; <tag>  " {
 		t.Fatal("exact password not stored privately")
 	}
-	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000007", Text: "<@BOT> connect https://db.example changed_reader"}) {
+	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000007", CommandText: "<@BOT> connect https://db.example changed_reader"}) {
 		t.Fatal("credential username change command not consumed")
 	}
 	mu.Lock()
@@ -124,7 +146,7 @@ func TestSlackConnectionIntakePrivateSetupAndRestartRedaction(t *testing.T) {
 		if strings.Contains(post, "Existing credentials use another username") {
 			credentialChangeRejected = true
 		}
-		if strings.Contains(post, "fake password") {
+		if strings.Contains(post, "fake &amp;") {
 			t.Fatal("password echoed to Slack")
 		}
 	}
@@ -192,7 +214,7 @@ func TestSlackConnectionIntakeInfersEmailOrRequestsUsernameOverride(t *testing.T
 			ch.botUserID, ch.teamID = "BOT", "TEAM"
 			spec := channelSpec{agentName: "agent", channelConfig: config.ChannelConfig{Type: "slack", AllowFrom: []config.AllowFromEntry{{From: "U1", AllowedGroups: "C1", RespondToMentions: true}}}}
 			intake := &slackConnectionIntake{channel: ch, service: service, specs: []channelSpec{spec}, validateEndpoint: func(context.Context, string, string) error { return nil }}
-			if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", Text: "<@BOT> connect https://db.example"}) {
+			if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", CommandText: "<@BOT> connect https://db.example"}) {
 				t.Fatal("connect not consumed")
 			}
 			scope := connections.Scope{AgentID: "agent", InstallationID: "BOT", WorkspaceID: "TEAM", ChannelID: "C1", RootThreadID: "50.000001"}
@@ -263,7 +285,7 @@ func TestSlackConnectionIntakeDoesNotRepromptDuringPasswordValidation(t *testing
 			<-release
 			return nil
 		}}
-	connect := slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", Text: "<@BOT> connect https://db.example reader"}
+	connect := slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", CommandText: "<@BOT> connect https://db.example reader"}
 	if !intake.handle(connect) {
 		t.Fatal("connect not consumed")
 	}
@@ -335,7 +357,7 @@ func TestSlackConnectionIntakeRejectsAmbiguousAndUnauthorizedCommands(t *testing
 	ch.botUserID, ch.teamID = "BOT", "TEAM"
 	allowed := config.ChannelConfig{Type: "slack", AllowFrom: []config.AllowFromEntry{{From: "U1", AllowedGroups: "C1", RespondToMentions: true}}}
 	intake := &slackConnectionIntake{channel: ch, specs: []channelSpec{{agentName: "a", channelConfig: allowed}, {agentName: "b", channelConfig: allowed}}}
-	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "100.000001", MessageTS: "100.000001", Text: "<@BOT> connect https://db.example"}) {
+	if !intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "100.000001", MessageTS: "100.000001", CommandText: "<@BOT> connect https://db.example"}) {
 		t.Fatal("ambiguous command not consumed")
 	}
 	mu.Lock()
@@ -343,7 +365,7 @@ func TestSlackConnectionIntakeRejectsAmbiguousAndUnauthorizedCommands(t *testing
 		t.Fatalf("ambiguous response: %v", posted)
 	}
 	mu.Unlock()
-	if !intake.handle(slackIngress{UserID: "U2", ChannelID: "C1", RootTS: "100.000001", MessageTS: "100.000003", Text: "<@BOT> disconnect"}) {
+	if !intake.handle(slackIngress{UserID: "U2", ChannelID: "C1", RootTS: "100.000001", MessageTS: "100.000003", CommandText: "<@BOT> disconnect"}) {
 		t.Fatal("unauthorized command not consumed")
 	}
 	mu.Lock()
@@ -443,7 +465,7 @@ func TestSlackConnectionIntakeDoesNotBlockSocketEventLoop(t *testing.T) {
 	}()
 	returned := make(chan bool, 1)
 	go func() {
-		returned <- intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", Text: "<@BOT> connect <https://db.example>"})
+		returned <- intake.handle(slackIngress{UserID: "U1", ChannelID: "C1", RootTS: "50.000001", MessageTS: "50.000001", CommandText: "<@BOT> connect <https://db.example>"})
 	}()
 	select {
 	case ok := <-returned:

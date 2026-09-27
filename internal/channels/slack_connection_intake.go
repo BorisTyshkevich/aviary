@@ -148,7 +148,7 @@ func (i *slackConnectionIntake) handle(in slackIngress) bool {
 		i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() { i.handleSetupReply(in) })
 		return true
 	}
-	cmd, recognized, parseErr := parseSlackConnectionCommand(in.Text, i.channel.botUserID, in.IsDM)
+	cmd, recognized, parseErr := parseSlackConnectionCommand(in.CommandText, i.channel.botUserID, in.IsDM)
 	if !recognized {
 		return false
 	}
@@ -159,7 +159,7 @@ func (i *slackConnectionIntake) handle(in slackIngress) bool {
 	for n := range i.specs {
 		spec := &i.specs[n]
 		msg := IncomingMessage{Type: "slack", From: in.UserID, Channel: in.ChannelID,
-			ThreadTS: in.RootTS, IsThreadReply: in.RootTS != in.MessageTS, Text: canonicalBotMention(in.Text, i.channel.botUserID)}
+			ThreadTS: in.RootTS, IsThreadReply: in.RootTS != in.MessageTS, Text: canonicalBotMention(in.CommandText, i.channel.botUserID)}
 		if ts, ok := parseSlackTimestamp(in.MessageTS); ok {
 			msg.ReceivedAt = ts
 		}

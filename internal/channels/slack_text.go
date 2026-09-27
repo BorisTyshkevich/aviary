@@ -26,7 +26,11 @@ func slackVisibleText(raw string, blocks slack.Blocks) string {
 		}
 		return strings.TrimPrefix(parts[1], "mailto:")
 	})
-	return strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">").Replace(plain)
+	return decodeSlackEntities(plain)
+}
+
+func decodeSlackEntities(raw string) string {
+	return strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">").Replace(raw)
 }
 
 func richTextVisible(blocks slack.Blocks) (string, bool) {
