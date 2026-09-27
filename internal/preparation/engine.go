@@ -57,6 +57,7 @@ type Input struct {
 type Result struct {
 	Status           string    `json:"status"`
 	Summary          string    `json:"summary"`
+	PublicSummary    string    `json:"public_summary,omitempty"`
 	Artifacts        []string  `json:"artifacts"`
 	RunID            string    `json:"run_id,omitempty"`
 	ObservedAt       time.Time `json:"observed_at"`
@@ -66,6 +67,7 @@ type Result struct {
 type wireResult struct {
 	Status           string    `json:"status"`
 	Summary          string    `json:"summary"`
+	PublicSummary    string    `json:"public_summary,omitempty"`
 	Artifacts        []string  `json:"artifacts"`
 	ObservedAt       time.Time `json:"observed_at"`
 	ProducerRevision string    `json:"producer_revision"`
@@ -250,7 +252,7 @@ func (e *Engine) Run(ctx context.Context, cfg config.BeforeTurnHookConfig, in In
 	if err != nil || out.overflow {
 		return Result{}, ErrUnavailable
 	}
-	if credential != nil && credential.Password != "" && bytes.Contains(out.Bytes(), []byte(credential.Password)) {
+	if credential != nil && containsCredential(out.Bytes(), credential.Password) {
 		return Result{}, ErrUnavailable
 	}
 	var wire wireResult
@@ -268,7 +270,7 @@ func (e *Engine) Run(ctx context.Context, cfg config.BeforeTurnHookConfig, in In
 	if credential != nil && credential.Password != "" {
 		for _, name := range wire.Artifacts {
 			content, err := os.ReadFile(filepath.Join(stage, name))
-			if err != nil || bytes.Contains(content, []byte(credential.Password)) {
+			if err != nil || containsCredential(content, credential.Password) {
 				return Result{}, ErrUnavailable
 			}
 		}
@@ -296,7 +298,7 @@ func (e *Engine) Run(ctx context.Context, cfg config.BeforeTurnHookConfig, in In
 	if err := os.Rename(stage, final); err != nil {
 		return Result{}, ErrUnavailable
 	}
-	return Result{Status: wire.Status, Summary: wire.Summary, Artifacts: wire.Artifacts, RunID: id, ObservedAt: wire.ObservedAt, ProducerRevision: wire.ProducerRevision}, nil
+	return Result{Status: wire.Status, Summary: wire.Summary, PublicSummary: wire.PublicSummary, Artifacts: wire.Artifacts, RunID: id, ObservedAt: wire.ObservedAt, ProducerRevision: wire.ProducerRevision}, nil
 }
 
 type limitWriter struct {
@@ -320,10 +322,26 @@ func validResult(r wireResult) bool {
 	if r.Status != "complete" && r.Status != "partial" && r.Status != "unavailable" && r.Status != "denied" && r.Status != "timed_out" {
 		return false
 	}
-	if len(r.Summary) > maxSummary || r.ProducerRevision == "" || len(r.ProducerRevision) > maxRevision || r.ObservedAt.IsZero() || len(r.Artifacts) > maxFiles {
+	if len(r.Summary) > maxSummary || len(r.PublicSummary) > 256 || strings.ContainsAny(r.PublicSummary, "\r\n<>@*_`~&") || r.ProducerRevision == "" || len(r.ProducerRevision) > maxRevision || r.ObservedAt.IsZero() || len(r.Artifacts) > maxFiles {
 		return false
 	}
+	for _, c := range r.PublicSummary {
+		if c < 32 || c > 126 {
+			return false
+		}
+	}
 	return true
+}
+
+func containsCredential(data []byte, password string) bool {
+	if password == "" {
+		return false
+	}
+	if bytes.Contains(data, []byte(password)) {
+		return true
+	}
+	escaped, _ := json.Marshal(password)
+	return bytes.Contains(data, escaped[1:len(escaped)-1])
 }
 
 func cleanRelative(name string) bool {
@@ -464,6 +482,33 @@ func (e *Engine) Read(_ context.Context, in Input, runID, relative string, maxBy
 		return nil, ErrForbidden
 	}
 	return b, nil
+}
+
+// Discard removes a published run once a lifecycle caller has copied its
+// accepted artifact into a longer-lived private owner store.
+func (e *Engine) Discard(in Input, runID string) error {
+	if !validateInput(in) || len(runID) != 32 {
+		return ErrForbidden
+	}
+	for _, c := range runID {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return ErrForbidden
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	scope := filepath.Join(e.root, identityKey(in))
+	for _, path := range []string{e.root, scope} {
+		info, err := os.Lstat(path)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return ErrForbidden
+		}
+	}
+	if err := os.RemoveAll(filepath.Join(scope, runID)); err != nil {
+		return ErrUnavailable
+	}
+	_ = os.Remove(scope) // Keep the directory when it contains other runs.
+	return nil
 }
 
 type retainedRun struct {

@@ -217,10 +217,10 @@ type ChannelConfig struct {
 	// on its own messages. On Signal, this treats the emoji as a prompt and
 	// mirrors the same reaction back. Defaults to true for supported channels.
 	ReactToEmoji *bool `yaml:"react_to_emoji,omitempty"   json:"react_to_emoji,omitempty"`
-	// ReplyToReplies controls whether the Signal agent responds when someone
-	// replies to one of its own messages. Replies still have to match the
-	// entry's sender/group allowFrom scope, but can continue without
-	// re-satisfying mention-based group gating. Defaults to true.
+	// ReplyToReplies lets Signal continue replies to its messages and lets Slack
+	// continue replies in a thread claimed by an authorized explicit mention.
+	// Sender, group, exclude and tool policy still apply on every reply.
+	// Defaults to true.
 	ReplyToReplies *bool `yaml:"reply_to_replies,omitempty" json:"reply_to_replies,omitempty"`
 	// SendReadReceipts controls whether the agent sends read receipts for
 	// messages it will respond to. Read receipts are only sent for messages

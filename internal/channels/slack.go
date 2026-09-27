@@ -50,6 +50,7 @@ type SlackChannel struct {
 	logSinkMu       sync.RWMutex
 	logSink         *LogSink
 	intake          func(slackIngress) bool
+	affinityPass    func(slackIngress) bool
 	intakeStart     func(context.Context)
 	intakeWait      func()
 	intakeContext   func() context.Context
@@ -282,8 +283,10 @@ func (c *SlackChannel) Start(ctx context.Context) error {
 		c.logf("slack: auth.test did not establish installation and workspace identity")
 		return fmt.Errorf("slack identity unavailable")
 	}
+	c.identityMu.Lock()
 	c.botUserID = resp.UserID
 	c.teamID = resp.TeamID
+	c.identityMu.Unlock()
 	c.logf("slack: auth ok user_id=%s team=%s", resp.UserID, strings.TrimSpace(resp.Team))
 	if err := c.refreshIdentityCache(ctx); err != nil {
 		c.logf("slack: failed to refresh users/channels: %v", err)
@@ -500,6 +503,9 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 	}
 
 	result := checkAllowed(c.allowedEntries(), from, channelID, text, isGroup, c.botUserID, false)
+	if !result.allowed && isGroup && c.affinityPass != nil && c.affinityPass(slackIngress{UserID: from, ChannelID: channelID, RootTS: threadTS, MessageTS: rawTimestamp, Text: text, IsEdited: isEdited}) {
+		result = checkAllowedReplyContinuationText(c.allowedEntries(), from, channelID, text, true)
+	}
 	if !result.allowed {
 		c.logf("slack: ignored message from=%s channel=%s", from, channelID)
 		return
@@ -521,6 +527,8 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 			ThreadTS:       threadTS,
 			IsThreadReply:  isThreadReply,
 			Text:           enrichedText,
+			OriginalText:   text,
+			IsEdited:       isEdited,
 			MediaURL:       mediaURL,
 			ReceivedAt:     receivedAt,
 			RestrictTools:  result.restrictTools,

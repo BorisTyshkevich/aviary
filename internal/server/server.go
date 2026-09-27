@@ -52,6 +52,7 @@ type Server struct {
 	sched             *scheduler.Scheduler
 	channels          *channels.Manager
 	connections       *connections.Service
+	preparation       *preparation.Engine
 	startupErr        error
 	connectionPolicy  atomic.Pointer[config.ConnectionPolicyConfig]
 	brw               *browser.Manager
@@ -105,6 +106,7 @@ func New(cfg *config.Config, token string) *Server {
 		s.startupErr = errors.New("connection storage is unavailable; refusing to start credential intake")
 	}
 	if engine, err := preparation.Open(store.SubDir("preparation")); err == nil {
+		s.preparation = engine
 		s.agents.SetPreparationEngine(engine)
 	} else {
 		slog.Error("server: preparation storage unavailable")
@@ -141,6 +143,7 @@ func New(cfg *config.Config, token string) *Server {
 	s.channels.SetCredentialValidator(func(ctx context.Context, target connections.Target, credential connections.Credential) error {
 		return adapter().ValidateReadOnly(ctx, clickhouseconn.Target{Endpoint: target.Endpoint, Username: credential.Username}, clickhouseconn.NewCredentials(credential.Password))
 	})
+	s.channels.SetPostConnectHook(s.collectAfterConnect)
 	if s.sched != nil {
 		s.sched.SetTaskOutputDelivery(s.deliverTaskOutput)
 	}

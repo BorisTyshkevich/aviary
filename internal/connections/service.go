@@ -10,6 +10,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ var (
 	ErrBusy       = errors.New("thread has an active turn")
 	ErrStale      = errors.New("connection setup is stale")
 	ErrPrompt     = errors.New("private setup prompt is unavailable")
+	ErrDuplicate  = errors.New("private setup reply was already processed")
 	ErrValidation = errors.New("connection validation failed")
 )
 
@@ -70,12 +73,25 @@ func (c Credential) String() string { return "credential version " + c.Version }
 func (c Credential) GoString() string { return c.String() }
 
 type privateCredential struct {
-	Username   string    `json:"username"`
-	Password   string    `json:"password"`
-	Version    string    `json:"version"`
-	Principal  Principal `json:"principal"`
-	Scope      Scope     `json:"scope"`
-	Generation string    `json:"generation"`
+	Username   string            `json:"username"`
+	Password   string            `json:"password"`
+	Version    string            `json:"version"`
+	Principal  Principal         `json:"principal"`
+	Scope      Scope             `json:"scope"`
+	Generation string            `json:"generation"`
+	Evidence   *EvidenceSnapshot `json:"evidence,omitempty"`
+}
+
+// EvidenceSnapshot is immutable, private connection evidence collected after login.
+// It lasts exactly as long as the owning credential and target generation.
+type EvidenceSnapshot struct {
+	Status           string    `json:"status"`
+	Summary          string    `json:"summary"`
+	RunID            string    `json:"run_id"`
+	ObservedAt       time.Time `json:"observed_at"`
+	ProducerRevision string    `json:"producer_revision"`
+	Path             string    `json:"path"`
+	Content          []byte    `json:"content"`
 }
 
 // Prompt contains only non-secret classification and correlation metadata.
@@ -86,6 +102,7 @@ type Prompt struct {
 	Target      Target    `json:"target"`
 	Stage       string    `json:"stage"`
 	Username    string    `json:"username"`
+	LastReplyTS string    `json:"last_reply_ts,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	Completed   bool      `json:"completed"`
 }
@@ -98,12 +115,18 @@ type state struct {
 // Service is safe for concurrent use within one Aviary process. Open one instance
 // per data directory; storage is not designed for multiple writer processes.
 type Service struct {
-	mu          sync.Mutex
-	dir         string
-	state       state
-	credentials map[string]privateCredential
-	busy        map[string]int
-	completing  map[string]bool
+	mu              sync.Mutex
+	dir             string
+	state           state
+	credentials     map[string]privateCredential
+	busy            map[string]int
+	completing      map[string]bool
+	evidencePending map[string]pendingEvidence
+}
+
+type pendingEvidence struct {
+	version string
+	done    chan struct{}
 }
 
 // Open loads or creates one private connection store at dir.
@@ -117,7 +140,7 @@ func Open(dir string) (*Service, error) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return nil, errors.New("securing connection storage failed")
 	}
-	s := &Service{dir: dir, state: state{Targets: map[string]Target{}, Prompts: map[string]Prompt{}}, credentials: map[string]privateCredential{}, busy: map[string]int{}, completing: map[string]bool{}}
+	s := &Service{dir: dir, state: state{Targets: map[string]Target{}, Prompts: map[string]Prompt{}}, credentials: map[string]privateCredential{}, busy: map[string]int{}, completing: map[string]bool{}, evidencePending: map[string]pendingEvidence{}}
 	if err := readOptional(filepath.Join(dir, "state.json"), &s.state); err != nil {
 		return nil, err
 	}
@@ -183,6 +206,10 @@ func (s *Service) purgeOrphansLocked() bool {
 		t := s.state.Targets[key(v.Scope)]
 		if t.Generation != v.Generation || v.Generation == "" || !v.Principal.valid() || v.Principal.InstallationID != v.Scope.InstallationID || v.Principal.WorkspaceID != v.Scope.WorkspaceID || k != credentialKey(v.Principal, t) {
 			delete(s.credentials, k)
+			if pending, ok := s.evidencePending[k]; ok {
+				close(pending.done)
+				delete(s.evidencePending, k)
+			}
 			changed = true
 		}
 	}
@@ -426,6 +453,94 @@ func (s *Service) CredentialFor(e Execution, t Target) (Credential, bool) {
 	v, ok := s.credentials[credentialKey(e.Principal, t)]
 	return Credential{Username: v.Username, Password: v.Password, Version: v.Version}, ok
 }
+
+// SaveEvidence attaches a bounded snapshot only to the current personal login.
+func (s *Service) SaveEvidence(e Execution, t Target, version string, evidence EvidenceSnapshot) error {
+	if !e.Personal() || e.Scope != t.Scope || version == "" || len(evidence.Content) == 0 || len(evidence.Content) > 1<<20 || evidence.Path != "evidence.json" || len(evidence.RunID) != 32 {
+		return ErrInvalid
+	}
+	for _, c := range evidence.RunID {
+		if !strings.ContainsRune("0123456789abcdef", c) {
+			return ErrInvalid
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.currentLocked(t) {
+		return ErrStale
+	}
+	k := credentialKey(e.Principal, t)
+	c, ok := s.credentials[k]
+	escapedPassword, _ := json.Marshal(c.Password)
+	if !ok || c.Version != version || (c.Password != "" && (strings.Contains(string(evidence.Content), c.Password) || strings.Contains(string(evidence.Content), string(escapedPassword[1:len(escapedPassword)-1])))) {
+		return ErrStale
+	}
+	previous := c
+	copyEvidence := evidence
+	copyEvidence.Content = append([]byte(nil), evidence.Content...)
+	c.Evidence = &copyEvidence
+	s.credentials[k] = c
+	if err := s.saveCredentials(); err != nil {
+		s.credentials[k] = previous
+		return err
+	}
+	return nil
+}
+
+// WaitForEvidence lets an immediately following turn wait for the one in-flight
+// post-connect collection. No later turn starts or refreshes collection.
+func (s *Service) WaitForEvidence(ctx context.Context, e Execution, t Target) {
+	if !e.Personal() || e.Scope != t.Scope {
+		return
+	}
+	s.mu.Lock()
+	var done <-chan struct{}
+	if s.currentLocked(t) {
+		k := credentialKey(e.Principal, t)
+		if c, ok := s.credentials[k]; ok {
+			if pending, ok := s.evidencePending[k]; ok && pending.version == c.Version {
+				done = pending.done
+			}
+		}
+	}
+	s.mu.Unlock()
+	if done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}
+}
+
+// FinishEvidence releases turns waiting for this credential's post-connect hook.
+func (s *Service) FinishEvidence(p Principal, t Target, version string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := credentialKey(p, t)
+	if pending, ok := s.evidencePending[k]; ok && pending.version == version {
+		close(pending.done)
+		delete(s.evidencePending, k)
+	}
+}
+
+// EvidenceFor returns a copy only to the matching current personal credential.
+func (s *Service) EvidenceFor(e Execution, t Target) (EvidenceSnapshot, string, bool) {
+	if !e.Personal() || e.Scope != t.Scope {
+		return EvidenceSnapshot{}, "", false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.currentLocked(t) {
+		return EvidenceSnapshot{}, "", false
+	}
+	c, ok := s.credentials[credentialKey(e.Principal, t)]
+	if !ok || c.Evidence == nil {
+		return EvidenceSnapshot{}, "", false
+	}
+	result := *c.Evidence
+	result.Content = append([]byte(nil), result.Content...)
+	return result, c.Version, true
+}
 func (s *Service) currentLocked(t Target) bool {
 	v, ok := s.state.Targets[key(t.Scope)]
 	return ok && v == t && t.Generation != ""
@@ -433,6 +548,16 @@ func (s *Service) currentLocked(t Target) bool {
 
 func promptKey(installation, workspace, channel, root string) string {
 	return key(struct{ Installation, Workspace, Channel, Root string }{installation, workspace, channel, root})
+}
+
+func slackReplyTimestamp(ts string) (uint64, uint64, bool) {
+	seconds, fraction, ok := strings.Cut(ts, ".")
+	if !ok || seconds == "" || len(fraction) != 6 {
+		return 0, 0, false
+	}
+	sec, secErr := strconv.ParseUint(seconds, 10, 64)
+	micro, microErr := strconv.ParseUint(fraction, 10, 64)
+	return sec, micro, secErr == nil && microErr == nil
 }
 
 // PutPrompt durably records non-secret private prompt correlation metadata.
@@ -513,21 +638,43 @@ func (s *Service) FinishPrompt(p Principal, dmChannel, dmRoot string) error {
 	return nil
 }
 
-// CompletePassword durably consumes a prompt before validation, so a crash or
-// repeated reply cannot replay it. Validation runs outside the lifecycle lock.
-func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, dmRoot, password string, validate func(context.Context, Target, Credential) error) error {
+// CompletePassword durably marks a prompt busy before validation, so a crash or
+// concurrent reply cannot replay it. A failed authentication reopens the same
+// prompt while its target and expiry remain valid. Validation runs outside the
+// lifecycle lock.
+func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, dmRoot, replyTS, password string, validate func(context.Context, Target, Credential) error) error {
+	seconds, micros, valid := slackReplyTimestamp(replyTS)
+	if !valid {
+		return ErrInvalid
+	}
 	k := promptKey(p.InstallationID, p.WorkspaceID, dmChannel, dmRoot)
 	s.mu.Lock()
 	pr, ok := s.state.Prompts[k]
-	if !ok || pr.Principal != p || pr.Stage != "password" || pr.Completed || !time.Now().Before(pr.ExpiresAt) || !s.currentLocked(pr.Target) || s.completing[k] {
+	if !ok || pr.Principal != p || pr.Stage != "password" || !time.Now().Before(pr.ExpiresAt) || !s.currentLocked(pr.Target) {
 		s.mu.Unlock()
 		return ErrPrompt
 	}
+	if pr.LastReplyTS != "" {
+		previousSeconds, previousMicros, previousValid := slackReplyTimestamp(pr.LastReplyTS)
+		if !previousValid {
+			s.mu.Unlock()
+			return ErrPrompt
+		}
+		if seconds < previousSeconds || (seconds == previousSeconds && micros <= previousMicros) {
+			s.mu.Unlock()
+			return ErrDuplicate
+		}
+	}
+	if pr.Completed || s.completing[k] {
+		s.mu.Unlock()
+		return ErrPrompt
+	}
+	previous := pr
 	pr.Completed = true
+	pr.LastReplyTS = replyTS
 	s.state.Prompts[k] = pr
 	if err := s.saveState(); err != nil {
-		pr.Completed = false
-		s.state.Prompts[k] = pr
+		s.state.Prompts[k] = previous
 		s.mu.Unlock()
 		return err
 	}
@@ -543,6 +690,21 @@ func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, 
 		return ErrValidation
 	}
 	if err := validate(ctx, pr.Target, c); err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		latest := s.state.Prompts[k]
+		if latest != pr || !s.currentLocked(latest.Target) {
+			return ErrStale
+		}
+		if !time.Now().Before(latest.ExpiresAt) {
+			return ErrPrompt
+		}
+		latest.Completed = false
+		s.state.Prompts[k] = latest
+		if saveErr := s.saveState(); saveErr != nil {
+			s.state.Prompts[k] = pr
+			return saveErr
+		}
 		return ErrValidation
 	}
 	s.mu.Lock()
@@ -562,5 +724,9 @@ func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, 
 		}
 		return err
 	}
+	if pending, ok := s.evidencePending[ck]; ok {
+		close(pending.done)
+	}
+	s.evidencePending[ck] = pendingEvidence{version: c.Version, done: make(chan struct{})}
 	return nil
 }

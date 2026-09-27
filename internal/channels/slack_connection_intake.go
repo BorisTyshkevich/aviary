@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -17,18 +18,22 @@ import (
 // slackConnectionIntake owns the channel-specific setup conversation. The
 // connection service owns target generations and durable prompt classification.
 type slackConnectionIntake struct {
-	channel          *SlackChannel
-	service          *connections.Service
-	validateEndpoint func(context.Context, string, string) error
-	validatePassword func(context.Context, connections.Target, connections.Credential) error
-	specs            []channelSpec
-	promptMu         sync.Mutex
-	startMu          sync.Mutex
-	stopped          bool
-	startOnce        sync.Once
-	workers          sync.WaitGroup
-	workerCtx        context.Context
-	queues           [4]chan func()
+	channel            *SlackChannel
+	service            *connections.Service
+	validateEndpoint   func(context.Context, string, string) error
+	validatePassword   func(context.Context, connections.Target, connections.Credential) error
+	postConnect        func(context.Context, connections.Target, connections.Principal, bool) (string, error)
+	specs              []channelSpec
+	claimCommand       func(slackIngress, channelSpec) bool
+	promptMu           sync.Mutex
+	startMu            sync.Mutex
+	stopped            bool
+	startOnce          sync.Once
+	workers            sync.WaitGroup
+	postConnectWorkers sync.WaitGroup
+	postConnectSlots   chan struct{}
+	workerCtx          context.Context
+	queues             [4]chan func()
 }
 
 const slackEmailUnavailableMessage = "Slack email unavailable; add users:read.email or provide username after URL"
@@ -43,6 +48,7 @@ func (i *slackConnectionIntake) start(ctx context.Context) {
 	}
 	i.startOnce.Do(func() {
 		i.workerCtx = ctx
+		i.postConnectSlots = make(chan struct{}, 4)
 		for n := range i.queues {
 			queue := make(chan func(), 16)
 			i.queues[n] = queue
@@ -69,6 +75,7 @@ func (i *slackConnectionIntake) wait() {
 	i.stopped = true
 	i.startMu.Unlock()
 	i.workers.Wait()
+	i.postConnectWorkers.Wait()
 }
 
 func (i *slackConnectionIntake) baseContext() context.Context {
@@ -189,6 +196,12 @@ func (i *slackConnectionIntake) handle(in slackIngress) bool {
 		i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() { i.reply(in.ChannelID, in.RootTS, "Connection setup is unavailable.") })
 		return true
 	}
+	if i.claimCommand != nil && !i.claimCommand(in, *selected) {
+		i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() {
+			i.reply(in.ChannelID, in.RootTS, "Connection command could not select one authorized agent. Ask an administrator to check channel routing.")
+		})
+		return true
+	}
 	i.enqueue(in.ChannelID+"\x00"+in.RootTS, func() { i.executeCommand(in, *selected, cmd) })
 	return true
 }
@@ -246,8 +259,6 @@ func (i *slackConnectionIntake) executeCommand(in slackIngress, selected channel
 			i.promptMu.Unlock()
 			if cmd.username != "" && cmd.username != active.Username {
 				i.reply(in.ChannelID, in.RootTS, "An existing private setup is pending. To change the username, disconnect and reconnect in this thread.")
-			} else {
-				i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete the existing private setup prompt.")
 			}
 			return
 		}
@@ -272,15 +283,13 @@ func (i *slackConnectionIntake) executeCommand(in slackIngress, selected channel
 			} else {
 				i.reply(in.ChannelID, in.RootTS, "Connection attached, but private setup could not start. Retry connect in this thread.")
 			}
-		} else {
-			i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete private setup in the bot DM.")
 		}
 	}
 }
 
 func connectionActionError(err error) string {
 	if err == connections.ErrBusy {
-		return "A turn is active in this thread. Wait for it to finish before changing the connection."
+		return "This thread is busy. Wait for the current operation to finish before changing the connection."
 	}
 	return "Connection action failed."
 }
@@ -356,12 +365,86 @@ func (i *slackConnectionIntake) handleSetupReply(in slackIngress) {
 		}
 		ctx, cancel := context.WithTimeout(i.baseContext(), 15*time.Second)
 		defer cancel()
-		err := i.service.CompletePassword(ctx, principal, in.ChannelID, in.RootTS, in.Text, i.validatePassword)
+		err := i.service.CompletePassword(ctx, principal, in.ChannelID, in.RootTS, in.MessageTS, in.Text, i.validatePassword)
 		if err == nil {
-			i.reply(in.ChannelID, in.RootTS, "Credentials saved. Return to the original thread to continue.")
+			execution := connections.Execution{Kind: connections.Interactive, Scope: prompt.Target.Scope, Principal: principal}
+			credential, _ := i.service.CredentialFor(execution, prompt.Target)
+			if i.postConnectSlots == nil { // Direct intake tests do not start workers.
+				i.finishConnect(prompt.Target, principal, credential.Version, true)
+			} else {
+				select {
+				case i.postConnectSlots <- struct{}{}:
+					i.postConnectWorkers.Add(1)
+					go func() {
+						defer i.postConnectWorkers.Done()
+						defer func() { <-i.postConnectSlots }()
+						i.finishConnect(prompt.Target, principal, credential.Version, true)
+					}()
+				default:
+					i.channel.logf("slack: post-connect collection capacity reached")
+					i.finishConnect(prompt.Target, principal, credential.Version, false)
+				}
+			}
+		} else if errors.Is(err, connections.ErrDuplicate) {
+			return
+		} else if errors.Is(err, connections.ErrValidation) {
+			i.reply(in.ChannelID, in.RootTS, "Credentials could not be verified. Check the password and reply in this DM thread to try again. If it still fails, check the database account and connection.")
 		} else {
-			i.reply(in.ChannelID, in.RootTS, "Credentials could not be saved. Check the connection and start setup again.")
+			i.reply(in.ChannelID, in.RootTS, "Credentials could not be saved. Start setup again from the original thread.")
 		}
 		return
 	}
+}
+
+func (i *slackConnectionIntake) finishConnect(target connections.Target, principal connections.Principal, version string, collect bool) {
+	defer i.service.FinishEvidence(principal, target, version)
+	facts := ""
+	if collect && i.postConnect != nil {
+		collectCtx, stop := context.WithTimeout(i.baseContext(), 2*time.Minute+5*time.Second)
+		var err error
+		facts, err = i.postConnect(collectCtx, target, principal, i.postConnectQueryAllowed(target, principal))
+		stop()
+		if err != nil {
+			facts = "Baseline facts are unavailable."
+		}
+	} else if !collect && i.postConnectConfigured(target) {
+		facts = "Baseline facts are unavailable."
+	}
+	if current, ok := i.service.Current(target.Scope); ok && current == target && i.service.HasCredential(principal, target) {
+		message := "ClickHouse connected. Ask a question in this thread."
+		if facts != "" {
+			message = "ClickHouse connected. " + facts + " Ask a question in this thread."
+		}
+		i.reply(target.Scope.ChannelID, target.Scope.RootThreadID, message)
+	}
+}
+
+func (i *slackConnectionIntake) postConnectConfigured(target connections.Target) bool {
+	for _, spec := range i.specs {
+		if spec.agentName == target.Scope.AgentID && spec.postConnectConfigured {
+			return true
+		}
+	}
+	return false
+}
+
+func (i *slackConnectionIntake) postConnectQueryAllowed(target connections.Target, principal connections.Principal) bool {
+	for _, spec := range i.specs {
+		if spec.agentName != target.Scope.AgentID {
+			continue
+		}
+		entries := i.channel.resolvedEntriesForRouting(spec.channelConfig.AllowFrom)
+		result := checkAllowedReplyContinuationText(entries, principal.UserID, target.Scope.ChannelID, "", !strings.HasPrefix(target.Scope.ChannelID, "D"))
+		if !result.allowed {
+			continue
+		}
+		if slices.Contains(spec.channelConfig.DisabledTools, "clickhouse_query") {
+			return false
+		}
+		if len(result.restrictTools) > 0 && !slices.Contains(result.restrictTools, "clickhouse_query") {
+			return false
+		}
+		return true
+	}
+	return false
 }

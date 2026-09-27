@@ -35,7 +35,7 @@ func TestConnectionToolsRequireTrustedPersonalLeaseAndFreshGeneration(t *testing
 	if err := s.PutPrompt(prompt); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CompletePassword(context.Background(), principal, "dm", "root", "fake-secret", func(context.Context, connections.Target, connections.Credential) error { return nil }); err != nil {
+	if err := s.CompletePassword(context.Background(), principal, "dm", "root", "100.000001", "fake-secret", func(context.Context, connections.Target, connections.Credential) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	lease, err := s.Begin(scope)
@@ -142,7 +142,7 @@ func TestLiveConnectionToolsInProcess(t *testing.T) {
 		if err := s.PutPrompt(connections.Prompt{Principal: principal, DMChannelID: "dm", DMRootID: root, Target: target, Stage: "password", Username: account.Username, ExpiresAt: time.Now().Add(time.Hour)}); err != nil {
 			t.Fatal("prompt setup failed")
 		}
-		if err := s.CompletePassword(context.Background(), principal, "dm", root, account.Password, func(ctx context.Context, t connections.Target, c connections.Credential) error {
+		if err := s.CompletePassword(context.Background(), principal, "dm", root, "100.000001", account.Password, func(ctx context.Context, t connections.Target, c connections.Credential) error {
 			return clickhouseconn.Adapter{Policy: policy}.ValidateReadOnly(ctx, clickhouseconn.Target{Endpoint: t.Endpoint, Username: c.Username}, clickhouseconn.NewCredentials(c.Password))
 		}); err != nil {
 			t.Fatal("credential validation failed")

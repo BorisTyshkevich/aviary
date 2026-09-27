@@ -45,7 +45,15 @@ func checkAllowedReplyContinuation(
 	from, channelID string,
 	isGroup bool,
 ) allowResult {
-	return checkAllowedWithOptions(entries, from, channelID, "", isGroup, "", false, true)
+	return checkAllowedReplyContinuationText(entries, from, channelID, "", isGroup)
+}
+
+func checkAllowedReplyContinuationText(
+	entries []config.AllowFromEntry,
+	from, channelID, text string,
+	isGroup bool,
+) allowResult {
+	return checkAllowedWithOptions(entries, from, channelID, text, isGroup, "", false, true)
 }
 
 func checkAllowedWithOptions(
@@ -193,5 +201,14 @@ func isDirectMention(text, botUserID string) bool {
 		return false
 	}
 	return strings.Contains(text, "<@"+botUserID+">") ||
-		strings.Contains(text, "<@!"+botUserID+">")
+		strings.Contains(text, "<@!"+botUserID+">") || containsLabeledMention(text, botUserID)
+}
+
+func containsLabeledMention(text, botID string) bool {
+	for _, marker := range []string{"<@" + botID + "|", "<@!" + botID + "|"} {
+		if index := strings.Index(text, marker); index >= 0 && strings.IndexByte(text[index+len(marker):], '>') >= 0 {
+			return true
+		}
+	}
+	return false
 }

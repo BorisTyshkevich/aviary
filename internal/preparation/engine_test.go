@@ -290,3 +290,18 @@ func TestRunCountEvictsOldestAndOversizedRunFails(t *testing.T) {
 	_, err = e.Run(context.Background(), helperConfig("success"), testInput("alice", "three"), c)
 	require.ErrorIs(t, err, ErrUnavailable)
 }
+
+func TestPublicSummaryIsSingleLineWithoutSlackMarkup(t *testing.T) {
+	base := wireResult{Status: "complete", Summary: "private", ProducerRevision: "v1", ObservedAt: time.Now()}
+	base.PublicSummary = "Version 25.8; uptime 3d 4h."
+	require.True(t, validResult(base))
+	for _, unsafe := range []string{"line\nbreak", "<@U123>", "*bold*", "`code`", "@here", "tab\tmark", strings.Repeat("x", 257)} {
+		base.PublicSummary = unsafe
+		require.False(t, validResult(base))
+	}
+}
+
+func TestCredentialDetectionIncludesJSONEscapes(t *testing.T) {
+	require.True(t, containsCredential([]byte(`{"password":"fake\nsecret"}`), "fake\nsecret"))
+	require.False(t, containsCredential([]byte(`{"status":"complete"}`), "fake\nsecret"))
+}

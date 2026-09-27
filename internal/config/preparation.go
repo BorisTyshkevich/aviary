@@ -8,10 +8,11 @@ import (
 
 // HooksConfig configures lifecycle executables for an agent.
 type HooksConfig struct {
-	BeforeTurn *BeforeTurnHookConfig `yaml:"before_turn,omitempty" json:"before_turn,omitempty"`
+	BeforeTurn  *BeforeTurnHookConfig `yaml:"before_turn,omitempty" json:"before_turn,omitempty"`
+	PostConnect *BeforeTurnHookConfig `yaml:"post_connect,omitempty" json:"post_connect,omitempty"`
 }
 
-// BeforeTurnHookConfig invokes a trusted executable before the first model request.
+// BeforeTurnHookConfig configures a trusted lifecycle executable.
 type BeforeTurnHookConfig struct {
 	Argv            []string `yaml:"argv" json:"argv"`
 	Timeout         string   `yaml:"timeout,omitempty" json:"timeout,omitempty"`
@@ -20,13 +21,29 @@ type BeforeTurnHookConfig struct {
 }
 
 func (v *validator) checkPreparationHook(field string, hooks *HooksConfig) {
-	if hooks == nil || hooks.BeforeTurn == nil {
+	if hooks == nil {
 		return
 	}
-	h := hooks.BeforeTurn
-	base := field + ".hooks.before_turn"
+	if hooks.BeforeTurn != nil && hooks.PostConnect != nil {
+		v.errorf(field+".hooks", "before_turn and post_connect cannot both be configured")
+	}
+	if hooks.BeforeTurn != nil {
+		v.checkHookConfig(field+".hooks.before_turn", hooks.BeforeTurn)
+	}
+	if hooks.PostConnect != nil {
+		v.checkHookConfig(field+".hooks.post_connect", hooks.PostConnect)
+		if !hooks.PostConnect.AllowCredential {
+			v.errorf(field+".hooks.post_connect.allow_credential", "post_connect requires credential forwarding")
+		}
+		if hooks.PostConnect.OnError == "stop" {
+			v.errorf(field+".hooks.post_connect.on_error", "post_connect cannot undo a saved login")
+		}
+	}
+}
+
+func (v *validator) checkHookConfig(base string, h *BeforeTurnHookConfig) {
 	if len(h.Argv) == 0 || len(h.Argv) > 32 || strings.TrimSpace(h.Argv[0]) == "" {
-		v.errorf(base+".argv", "before_turn requires 1-32 executable arguments")
+		v.errorf(base+".argv", "hook requires 1-32 executable arguments")
 	}
 	for i, arg := range h.Argv {
 		if len(arg) > 4096 {

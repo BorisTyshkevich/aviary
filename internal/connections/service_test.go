@@ -68,6 +68,61 @@ func TestTargetLeaseIsolationAndRestart(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestConnectionEvidenceLastsUntilCredentialOrTargetChanges(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	require.NoError(t, err)
+	scope := testScope("evidence")
+	target, _, err := s.Select(scope, "clickhouse", "https://cluster.example")
+	require.NoError(t, err)
+	principal := testPrincipal("alice")
+	login := func(root, ts string) {
+		require.NoError(t, s.PutPrompt(Prompt{Principal: principal, DMChannelID: "dm", DMRootID: root, Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Minute)}))
+		require.NoError(t, s.CompletePassword(context.Background(), principal, "dm", root, ts, "fake-password", func(context.Context, Target, Credential) error { return nil }))
+	}
+	login("first", "100.000001")
+	execution := Execution{Kind: Interactive, Scope: scope, Principal: principal}
+	credential, ok := s.CredentialFor(execution, target)
+	require.True(t, ok)
+	waited := make(chan struct{})
+	go func() { s.WaitForEvidence(context.Background(), execution, target); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("turn did not wait for post-connect evidence")
+	case <-time.After(10 * time.Millisecond):
+	}
+	evidence := EvidenceSnapshot{Status: "complete", RunID: "0123456789abcdef0123456789abcdef", Path: "evidence.json", Content: []byte(`{"version":"25.8"}`), ObservedAt: time.Now(), ProducerRevision: "fake-v1"}
+	leaking := evidence
+	leaking.Content = []byte(`{"password":"fake-password"}`)
+	require.Error(t, s.SaveEvidence(execution, target, credential.Version, leaking))
+	require.NoError(t, s.SaveEvidence(execution, target, credential.Version, evidence))
+	s.FinishEvidence(principal, target, credential.Version)
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("turn remained blocked after collection")
+	}
+	s, err = Open(dir)
+	require.NoError(t, err)
+	got, version, ok := s.EvidenceFor(execution, target)
+	require.True(t, ok)
+	require.Equal(t, credential.Version, version)
+	require.Equal(t, evidence.Content, got.Content)
+	got.Content[0] = 'x'
+	got, _, ok = s.EvidenceFor(execution, target)
+	require.True(t, ok)
+	require.Equal(t, evidence.Content, got.Content)
+	_, _, ok = s.EvidenceFor(Execution{Kind: Interactive, Scope: scope, Principal: testPrincipal("bob")}, target)
+	require.False(t, ok)
+	login("second", "100.000002")
+	_, _, ok = s.EvidenceFor(execution, target)
+	require.False(t, ok)
+	_, _, err = s.Select(scope, "clickhouse", "https://new.example")
+	require.NoError(t, err)
+	_, _, ok = s.EvidenceFor(execution, target)
+	require.False(t, ok)
+}
+
 func TestPrivatePromptsAndCredentialOwnership(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)
@@ -82,9 +137,9 @@ func TestPrivatePromptsAndCredentialOwnership(t *testing.T) {
 	_, ok := s.PromptFor(bob, "dm-alice", "prompt-a")
 	require.False(t, ok)
 	secret := " fake password with spaces ! "
-	require.ErrorIs(t, s.CompletePassword(context.Background(), bob, "dm-alice", "prompt-a", secret, nil), ErrPrompt)
-	require.NoError(t, s.CompletePassword(context.Background(), alice, "dm-alice", "prompt-a", secret, func(context.Context, Target, Credential) error { return nil }))
-	require.ErrorIs(t, s.CompletePassword(context.Background(), alice, "dm-alice", "prompt-a", secret, nil), ErrPrompt)
+	require.ErrorIs(t, s.CompletePassword(context.Background(), bob, "dm-alice", "prompt-a", "100.000001", secret, nil), ErrPrompt)
+	require.NoError(t, s.CompletePassword(context.Background(), alice, "dm-alice", "prompt-a", "100.000001", secret, func(context.Context, Target, Credential) error { return nil }))
+	require.ErrorIs(t, s.CompletePassword(context.Background(), alice, "dm-alice", "prompt-a", "100.000002", secret, nil), ErrPrompt)
 	e := Execution{Kind: Interactive, Scope: target.Scope, Principal: alice}
 	c, ok := s.CredentialFor(e, target)
 	require.True(t, ok)
@@ -129,7 +184,7 @@ func TestStaleCompletionAndExpiredTombstones(t *testing.T) {
 	resume := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- s.CompletePassword(context.Background(), p, "dm", "prompt", "fake-secret", func(_ context.Context, _ Target, _ Credential) error { close(started); <-resume; return nil })
+		done <- s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", "fake-secret", func(_ context.Context, _ Target, _ Credential) error { close(started); <-resume; return nil })
 	}()
 	<-started
 	next, _, err := s.Select(testScope("thread"), "clickhouse", "https://next.example")
@@ -138,7 +193,7 @@ func TestStaleCompletionAndExpiredTombstones(t *testing.T) {
 	require.ErrorIs(t, <-done, ErrStale)
 	require.False(t, s.HasCredential(p, next))
 	require.True(t, s.ClassifyReply("install", "workspace", "dm", "prompt"))
-	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "prompt", "fake-secret", nil), ErrPrompt)
+	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000002", "fake-secret", nil), ErrPrompt)
 
 	expired := Prompt{Principal: p, DMChannelID: "dm", DMRootID: "expired", Target: next, Stage: "password", ExpiresAt: time.Now().Add(-time.Second)}
 	require.NoError(t, s.PutPrompt(expired))
@@ -219,7 +274,7 @@ func TestActivePromptForWhilePasswordValidationRuns(t *testing.T) {
 			t.Cleanup(releaseValidation)
 			done := make(chan error, 1)
 			go func() {
-				done <- s.CompletePassword(context.Background(), p, "dm", "password-prompt", "fake-password", func(context.Context, Target, Credential) error {
+				done <- s.CompletePassword(context.Background(), p, "dm", "password-prompt", "100.000001", "fake-password", func(context.Context, Target, Credential) error {
 					close(started)
 					<-release
 					return tc.validation
@@ -252,11 +307,100 @@ func TestActivePromptForWhilePasswordValidationRuns(t *testing.T) {
 				require.ErrorIs(t, err, ErrValidation)
 				require.False(t, s.HasCredential(p, target))
 			}
-			_, ok = s.ActivePromptFor(p, target)
-			require.False(t, ok)
-			require.False(t, s.HasActivePrompt(p, target))
+			active, ok = s.ActivePromptFor(p, target)
+			require.Equal(t, tc.validation != nil, ok)
+			if ok {
+				require.False(t, active.Completed)
+			}
+			require.Equal(t, tc.validation != nil, s.HasActivePrompt(p, target))
 		})
 	}
+}
+
+func TestFailedPasswordCanRetrySamePromptAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	require.NoError(t, err)
+	p := testPrincipal("alice")
+	target, _, err := s.Select(testScope("thread"), "clickhouse", "https://cluster.example")
+	require.NoError(t, err)
+	require.NoError(t, s.PutPrompt(Prompt{Principal: p, DMChannelID: "dm", DMRootID: "prompt", Target: target,
+		Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Hour)}))
+	validate := func(_ context.Context, _ Target, c Credential) error {
+		if c.Password != "fake-correct-password" {
+			return errors.New("fake authentication failed")
+		}
+		return nil
+	}
+	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", "fake-wrong-password", validate), ErrValidation)
+	require.False(t, s.HasCredential(p, target))
+	require.True(t, s.ClassifyReply("install", "workspace", "dm", "prompt"))
+	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", "fake-wrong-password", validate), ErrDuplicate)
+	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "prompt", "99.999999", "fake-wrong-password", validate), ErrDuplicate)
+
+	restarted, err := Open(dir)
+	require.NoError(t, err)
+	pr, ok := restarted.PromptFor(p, "dm", "prompt")
+	require.True(t, ok)
+	require.False(t, pr.Completed)
+	require.NoError(t, restarted.CompletePassword(context.Background(), p, "dm", "prompt", "100.000002", "fake-correct-password", validate))
+	require.True(t, restarted.HasCredential(p, target))
+	_, ok = restarted.PromptFor(p, "dm", "prompt")
+	require.False(t, ok)
+	require.ErrorIs(t, restarted.CompletePassword(context.Background(), p, "dm", "prompt", "100.000003", "fake-correct-password", validate), ErrPrompt)
+}
+
+func TestFailedPasswordDoesNotReopenStaleExpiredOrUnsavedPrompt(t *testing.T) {
+	newSetup := func(t *testing.T, expires time.Time) (*Service, Principal, Target) {
+		t.Helper()
+		s, err := Open(t.TempDir())
+		require.NoError(t, err)
+		p := testPrincipal("alice")
+		target, _, err := s.Select(testScope("thread"), "clickhouse", "https://cluster.example")
+		require.NoError(t, err)
+		require.NoError(t, s.PutPrompt(Prompt{Principal: p, DMChannelID: "dm", DMRootID: "prompt", Target: target,
+			Stage: "password", Username: "alice", ExpiresAt: expires}))
+		return s, p, target
+	}
+	t.Run("replaced target", func(t *testing.T) {
+		s, p, target := newSetup(t, time.Now().Add(time.Hour))
+		err := s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", "fake-wrong-password",
+			func(context.Context, Target, Credential) error {
+				_, _, err := s.Select(target.Scope, "clickhouse", "https://replacement.example")
+				require.NoError(t, err)
+				return errors.New("fake authentication failed")
+			})
+		require.ErrorIs(t, err, ErrStale)
+		_, ok := s.ActivePromptFor(p, target)
+		require.False(t, ok)
+		require.True(t, s.ClassifyReply("install", "workspace", "dm", "prompt"))
+	})
+	t.Run("expired during validation", func(t *testing.T) {
+		expires := time.Now().Add(250 * time.Millisecond)
+		s, p, target := newSetup(t, expires)
+		err := s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", "fake-wrong-password",
+			func(context.Context, Target, Credential) error {
+				time.Sleep(time.Until(expires) + time.Millisecond)
+				return errors.New("fake authentication failed")
+			})
+		require.ErrorIs(t, err, ErrPrompt)
+		_, ok := s.ActivePromptFor(p, target)
+		require.False(t, ok)
+	})
+	t.Run("reopen persistence failure", func(t *testing.T) {
+		s, p, target := newSetup(t, time.Now().Add(time.Hour))
+		statePath := filepath.Join(s.dir, "state.json")
+		err := s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", "fake-wrong-password",
+			func(context.Context, Target, Credential) error {
+				require.NoError(t, os.Remove(statePath))
+				require.NoError(t, os.Mkdir(statePath, 0o700))
+				return errors.New("fake authentication failed")
+			})
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrValidation)
+		_, ok := s.ActivePromptFor(p, target)
+		require.False(t, ok)
+	})
 }
 
 func TestPutPromptRejectsUsernameStageButRetainsHistoricalClassification(t *testing.T) {
@@ -289,7 +433,7 @@ func TestValidationFailureNeverLeaksSecret(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, s.PutPrompt(Prompt{Principal: p, DMChannelID: "dm", DMRootID: "prompt", Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Hour)}))
 	secret := "fake-secret-cannot-appear"
-	err = s.CompletePassword(context.Background(), p, "dm", "prompt", secret, func(context.Context, Target, Credential) error { return errors.New("driver said " + secret) })
+	err = s.CompletePassword(context.Background(), p, "dm", "prompt", "100.000001", secret, func(context.Context, Target, Credential) error { return errors.New("driver said " + secret) })
 	require.ErrorIs(t, err, ErrValidation)
 	require.False(t, strings.Contains(err.Error(), secret))
 	require.False(t, s.HasCredential(p, target))
@@ -305,17 +449,17 @@ func TestMissingValidatorConsumesPromptAndRotationChangesVersion(t *testing.T) {
 		return Prompt{Principal: p, DMChannelID: "dm", DMRootID: root, Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Hour)}
 	}
 	require.NoError(t, s.PutPrompt(prompt("first")))
-	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "first", "fake-one", nil), ErrValidation)
-	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "first", "fake-one", nil), ErrPrompt)
+	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "first", "100.000001", "fake-one", nil), ErrValidation)
+	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "first", "100.000002", "fake-one", nil), ErrPrompt)
 	require.False(t, s.HasCredential(p, target))
 	validate := func(context.Context, Target, Credential) error { return nil }
 	require.NoError(t, s.PutPrompt(prompt("second")))
-	require.NoError(t, s.CompletePassword(context.Background(), p, "dm", "second", "fake-two", validate))
+	require.NoError(t, s.CompletePassword(context.Background(), p, "dm", "second", "100.000003", "fake-two", validate))
 	e := Execution{Kind: Interactive, Scope: target.Scope, Principal: p}
 	first, ok := s.CredentialFor(e, target)
 	require.True(t, ok)
 	require.NoError(t, s.PutPrompt(prompt("third")))
-	require.NoError(t, s.CompletePassword(context.Background(), p, "dm", "third", "fake-three", validate))
+	require.NoError(t, s.CompletePassword(context.Background(), p, "dm", "third", "100.000004", "fake-three", validate))
 	second, ok := s.CredentialFor(e, target)
 	require.True(t, ok)
 	require.NotEqual(t, first.Version, second.Version)
@@ -341,7 +485,7 @@ func TestReplacementDisconnectAndRestartScrubOldCredentials(t *testing.T) {
 		root := fmt.Sprintf("prompt-%d", i)
 		require.NoError(t, s.PutPrompt(Prompt{Principal: p, DMChannelID: "dm", DMRootID: root, Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Hour)}))
 		secret := fmt.Sprintf("fake-old-secret-%d", i)
-		require.NoError(t, s.CompletePassword(context.Background(), p, "dm", root, secret, func(context.Context, Target, Credential) error { return nil }))
+		require.NoError(t, s.CompletePassword(context.Background(), p, "dm", root, fmt.Sprintf("100.%06d", i+1), secret, func(context.Context, Target, Credential) error { return nil }))
 		if i == 0 {
 			previous, err = os.ReadFile(privatePath)
 			require.NoError(t, err)

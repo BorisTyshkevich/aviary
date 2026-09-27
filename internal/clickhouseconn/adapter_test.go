@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	chproto "github.com/ClickHouse/ch-go/proto"
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
@@ -51,23 +52,30 @@ func nativeResponse(t *testing.T, columns []string, types []column.Type, rows []
 	return buf.Buf
 }
 
-func TestValidateReadOnlyAcceptsOnlyEnforcedModesAndSafeGrants(t *testing.T) {
+func TestValidateReadOnlyRequiresConnectionModeTwoWithoutInspectingGrants(t *testing.T) {
 	for _, tc := range []struct {
-		name, readonly, grant string
-		readonlyRows          int
-		wantOK                bool
+		name, readonly string
+		readonlyRows   int
+		wantOK         bool
+		serverReject   bool
 	}{
-		{name: "mode 1", readonly: "1", grant: "GRANT SELECT ON system.* TO reader", readonlyRows: 1, wantOK: true},
-		{name: "mode 2", readonly: "2", grant: "GRANT SELECT ON system.* TO reader", readonlyRows: 1, wantOK: true},
-		{name: "mode 0", readonly: "0", grant: "GRANT SELECT ON system.* TO reader", readonlyRows: 1},
-		{name: "unknown mode", readonly: "3", grant: "GRANT SELECT ON system.* TO reader", readonlyRows: 1},
-		{name: "malformed mode", readonly: "02", grant: "GRANT SELECT ON system.* TO reader", readonlyRows: 1},
-		{name: "missing setting", readonly: "2", grant: "GRANT SELECT ON system.* TO reader"},
-		{name: "truncated setting", readonly: "2", grant: "GRANT SELECT ON system.* TO reader", readonlyRows: 2},
-		{name: "unsafe grant", readonly: "2", grant: "GRANT INSERT ON system.* TO reader", readonlyRows: 1},
+		{name: "mode 2", readonly: "2", readonlyRows: 1, wantOK: true},
+		{name: "mode 1", readonly: "1", readonlyRows: 1},
+		{name: "mode 0", readonly: "0", readonlyRows: 1},
+		{name: "unknown mode", readonly: "3", readonlyRows: 1},
+		{name: "malformed mode", readonly: "02", readonlyRows: 1},
+		{name: "missing setting", readonly: "2"},
+		{name: "truncated setting", readonly: "2", readonlyRows: 2},
+		{name: "pinned incompatible setting", serverReject: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.URL.Query()["readonly"]; len(got) != 1 || got[0] != "2" {
+					t.Errorf("connection did not apply readonly=2: %q", got)
+				}
+				if got := r.URL.Query().Get("max_execution_time"); got != "" {
+					t.Errorf("connection added max_execution_time=%q", got)
+				}
 				query, err := io.ReadAll(r.Body)
 				if err != nil {
 					t.Error(err)
@@ -79,13 +87,16 @@ func TestValidateReadOnlyAcceptsOnlyEnforcedModesAndSafeGrants(t *testing.T) {
 				case "SELECT displayName(), version(), revision(), timezone()":
 					body = nativeResponse(t, []string{"displayName()", "version()", "revision()", "timezone()"}, []column.Type{"String", "String", "UInt32", "String"}, [][]any{{"mock", "25.1.1.1", uint32(clickhouse.ClientTCPProtocolVersion), "UTC"}})
 				case "SELECT value FROM system.settings WHERE name = 'readonly'":
+					if tc.serverReject {
+						w.Header().Set("X-ClickHouse-Exception-Code", "164")
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
 					rows := make([][]any, tc.readonlyRows)
 					for i := range rows {
 						rows[i] = []any{tc.readonly}
 					}
 					body = nativeResponse(t, []string{"value"}, []column.Type{"String"}, rows)
-				case "SHOW GRANTS FINAL":
-					body = nativeResponse(t, []string{"grant"}, []column.Type{"String"}, [][]any{{tc.grant}})
 				default:
 					t.Errorf("unexpected query: %q", query)
 					w.WriteHeader(http.StatusBadRequest)
@@ -108,12 +119,17 @@ func TestValidateReadOnlyAcceptsOnlyEnforcedModesAndSafeGrants(t *testing.T) {
 				t.Fatal(err)
 			}
 			adapter := Adapter{Policy: endpointpolicy.Policy{Allow: []endpointpolicy.Rule{{Host: u.Hostname(), Ports: []int{port}, CIDRs: []string{"127.0.0.1/32"}}}}, Resolver: fixedResolver{}}
-			err = adapter.ValidateReadOnly(context.Background(), Target{Endpoint: server.URL, Username: "reader", CABundlePath: certPath}, NewCredentials("fake-password"))
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			err = adapter.ValidateReadOnly(ctx, Target{Endpoint: server.URL, Username: "reader", CABundlePath: certPath}, NewCredentials("fake-password"))
 			if tc.wantOK && err != nil {
-				t.Fatalf("safe account rejected: %v", err)
+				t.Fatalf("readonly=2 connection rejected: %v", err)
 			}
 			if !tc.wantOK && err == nil {
-				t.Fatal("unsafe account accepted")
+				t.Fatal("connection without effective readonly=2 accepted")
+			}
+			if tc.serverReject && !strings.Contains(err.Error(), "server error code 164") {
+				t.Fatalf("sanitized ClickHouse rejection code missing: %v", err)
 			}
 		})
 	}
@@ -168,24 +184,6 @@ func TestRedirectRejectingAcceptsOnlyNumericClickHouseExceptionCode(t *testing.T
 				t.Fatal("server header detail leaked into error")
 			}
 		})
-	}
-}
-
-func TestSafeGrantsRejectsBroadAccounts(t *testing.T) {
-	if safeGrants([][]any{{"GRANT ALL ON *.* TO admin WITH GRANT OPTION"}}) {
-		t.Fatal("broad grant was accepted")
-	}
-	if !safeGrants([][]any{{"GRANT SELECT ON system.* TO reader"}, {"GRANT SHOW ON *.* TO reader"}}) {
-		t.Fatal("read-only grants were rejected")
-	}
-	if safeGrants([][]any{{"GRANT SELECT ON system.* TO reader WITH GRANT OPTION"}}) {
-		t.Fatal("grant option was accepted")
-	}
-	if safeGrants([][]any{{"GRANT SELECT, INSERT ON system.* TO reader"}}) {
-		t.Fatal("mixed grant was accepted")
-	}
-	if safeGrants([][]any{{"GRANT SELECT ON system.*, INSERT ON default.* TO reader"}}) {
-		t.Fatal("multi-element grant was accepted")
 	}
 }
 
