@@ -366,7 +366,7 @@ func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
 		}}},
 	}
 	srv := New(cfg, "fake-token")
-	tool := &slowDeliveryToolClient{delay: 1200 * time.Millisecond}
+	tool := &slowDeliveryToolClient{delay: 2 * time.Second}
 	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
 	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
 	shared := &deliveryTestChannel{}
@@ -411,7 +411,7 @@ func TestSlackPrivateTurnSuppressesEnabledToolProgress(t *testing.T) {
 	}
 	srv := New(cfg, "fake-token")
 	selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
-	tool := &slowDeliveryToolClient{delay: 1200 * time.Millisecond}
+	tool := &slowDeliveryToolClient{delay: 2 * time.Second}
 	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
 	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
 	ch := &deliveryTestChannel{}

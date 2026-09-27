@@ -73,6 +73,32 @@ func TestSlackDeleteMissingMessageCountsAsCleanup(t *testing.T) {
 	require.NoError(t, ch.DeleteThreadMessageContext(ctx, "C123", "1710000001.123456"))
 }
 
+func TestSlackUpdateMissingMessageIsDefiniteRejection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/chat.update", r.URL.Path)
+		_, _ = w.Write([]byte(`{"ok":false,"error":"message_not_found"}`))
+	}))
+	defer server.Close()
+	ch := deliveryTestSlackClient(server)
+	err := ch.EditThreadTextContext(context.Background(), "C123", "1710000001.123456", "fixed notice")
+	var delivery *SlackDeliveryError
+	require.ErrorAs(t, err, &delivery)
+	require.True(t, delivery.Rejected)
+}
+
+func TestSlackDeliveryTargetFailureIsDefiniteRejection(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/conversations.open", r.URL.Path)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	ch := deliveryTestSlackClient(server)
+	_, err := ch.PostThreadTextContext(context.Background(), "U123", "1710000000.123456", "synthetic")
+	var delivery *SlackDeliveryError
+	require.ErrorAs(t, err, &delivery)
+	require.True(t, delivery.Rejected)
+}
+
 func TestSlackDeliveryRetryClassifiesLastDispatchedAttempt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -200,6 +226,19 @@ func TestSlackGenericThreadSendKeepsMarkdownEnabled(t *testing.T) {
 	ts, err := ch.SendThreadMessageAndGetID("C123", "1710000000.123456", "*synthetic*")
 	require.NoError(t, err)
 	require.Equal(t, "1710000001.123456", ts)
+}
+
+func TestSlackGenericThreadSendRejectsBlankThreadTimestamp(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		_, _ = w.Write([]byte(`{"ok":true,"channel":"C123","ts":"1710000001.123456"}`))
+	}))
+	defer server.Close()
+	ch := deliveryTestSlackClient(server)
+	_, err := ch.SendThreadMessageAndGetID("C123", " \t ", "synthetic")
+	require.Error(t, err)
+	require.Zero(t, calls.Load())
 }
 
 func TestSlackFileShareFallbackDependsOnCompletionAcceptance(t *testing.T) {

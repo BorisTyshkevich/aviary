@@ -140,6 +140,9 @@ func (c *SlackChannel) SendAndGetID(channel, text string) (string, error) {
 // SendThreadMessageAndGetID posts a reply to a Slack thread and returns the
 // message timestamp, which can later be passed to EditMessage.
 func (c *SlackChannel) SendThreadMessageAndGetID(channel, threadTS, text string) (string, error) {
+	if strings.TrimSpace(threadTS) == "" {
+		return "", fmt.Errorf("slack thread timestamp is required")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	resolvedChannel, err := c.resolveDeliveryTarget(ctx, channel)

@@ -74,7 +74,7 @@ func slackKnownRejection(err error) bool {
 		return false
 	}
 	switch apiErr.Err {
-	case "invalid_auth", "not_authed", "account_inactive", "missing_scope", "not_in_channel", "channel_not_found", "invalid_arguments", "file_not_found", "cant_update_message", "cant_delete_message":
+	case "invalid_auth", "not_authed", "account_inactive", "missing_scope", "not_in_channel", "channel_not_found", "invalid_arguments", "file_not_found", "message_not_found", "cant_update_message", "cant_delete_message":
 		return true
 	default:
 		return false
@@ -90,6 +90,10 @@ func slackClassifyError(err error, status int) *SlackDeliveryError {
 	rejected := status == http.StatusTooManyRequests || errors.As(err, &rate) ||
 		(errors.As(err, &code) && code.Code == http.StatusTooManyRequests) || slackKnownRejection(err)
 	return &SlackDeliveryError{Cause: err, Rejected: rejected, Status: status}
+}
+
+func slackPreflightRejection(err error) *SlackDeliveryError {
+	return &SlackDeliveryError{Cause: err, Rejected: true}
 }
 
 // slackDeliveryCall retries only a valid Slack 429 with a delay that fits
@@ -166,10 +170,10 @@ func (c *SlackChannel) PostThreadTextContext(ctx context.Context, channel, threa
 	defer cancel()
 	resolved, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
-		return "", err
+		return "", slackPreflightRejection(err)
 	}
 	if strings.TrimSpace(threadTS) == "" {
-		return "", &SlackDeliveryError{Cause: errors.New("slack thread timestamp is required"), Rejected: true}
+		return "", slackPreflightRejection(errors.New("slack thread timestamp is required"))
 	}
 	return slackDeliveryCall(ctx, func(attempt context.Context) (string, error) {
 		_, ts, err := c.client.PostMessageContext(attempt, resolved,
@@ -184,7 +188,7 @@ func (c *SlackChannel) EditThreadTextContext(ctx context.Context, channel, ts, b
 	defer cancel()
 	resolved, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
-		return err
+		return slackPreflightRejection(err)
 	}
 	_, err = slackDeliveryCall(ctx, func(attempt context.Context) (struct{}, error) {
 		_, _, _, err := c.client.UpdateMessageContext(attempt, resolved, ts, slack.MsgOptionText(body, false), slack.MsgOptionDisableMarkdown())
@@ -199,7 +203,7 @@ func (c *SlackChannel) DeleteThreadMessageContext(ctx context.Context, channel, 
 	defer cancel()
 	resolved, err := c.resolveDeliveryTarget(ctx, channel)
 	if err != nil {
-		return err
+		return slackPreflightRejection(err)
 	}
 	_, err = slackDeliveryCall(ctx, func(attempt context.Context) (struct{}, error) {
 		_, _, err := c.client.DeleteMessageContext(attempt, resolved, ts)
