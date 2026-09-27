@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"os"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/domain"
+	"github.com/lsegal/aviary/internal/llm"
 	"github.com/lsegal/aviary/internal/store"
 )
 
@@ -74,6 +76,46 @@ func TestRunStopCauseAndCheckpointOwnership(t *testing.T) {
 			} else {
 				require.True(t, os.IsNotExist(err), "user stop should retire replayable checkpoint")
 			}
+		})
+	}
+}
+
+func TestCompletedTerminalCallbackCannotBecomeRunnerStop(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		events []llm.Event
+		kind   StreamEventType
+	}{
+		{"done", []llm.Event{{Type: llm.EventTypeText, Text: "answer"}, {Type: llm.EventTypeDone}}, StreamEventDone},
+		{"error", []llm.Event{{Type: llm.EventTypeError, Error: errors.New("fake provider failure")}}, StreamEventError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setTestDataDir(t)
+			provider := &sequenceProvider{responses: [][]llm.Event{tc.events}}
+			r := NewAgentRunner(&domain.Agent{ID: "terminal", Name: "terminal", Model: "test/model"},
+				&config.AgentConfig{Name: "terminal"}, provider, nil)
+			terminal := make(chan struct{}, 1)
+			release := make(chan struct{})
+			admission := r.Prompt(WithSessionID(context.Background(), "session"), "request", func(e StreamEvent) {
+				if e.Type == tc.kind {
+					terminal <- struct{}{}
+					<-release // hold the terminal callback across runner shutdown
+				}
+			})
+			require.Equal(t, AdmissionAccepted, admission.Status)
+			select {
+			case <-terminal:
+			case <-time.After(time.Second):
+				t.Fatal("terminal callback did not begin")
+			}
+			path := store.CheckpointPath("terminal", admission.RunID)
+			require.FileExists(t, path)
+			r.Stop()
+			require.True(t, checkpointIsLive(path), "terminal callback still owns checkpoint")
+			require.FileExists(t, path)
+			close(release)
+			r.Wait()
+			require.NoFileExists(t, path, "completed terminal must not be replayed after stop")
 		})
 	}
 }
@@ -160,7 +202,7 @@ func TestManagerDrainDeadlineDoesNotReleaseLiveRun(t *testing.T) {
 	require.False(t, checkpointIsLive(path))
 }
 
-func TestCheckpointRecoveryClaimSerializesManagers(t *testing.T) {
+func TestCheckpointRecoveryClaimWakesEveryWaitingManager(t *testing.T) {
 	path := store.CheckpointPath("claim", "run-1")
 	release, claimed := ClaimCheckpointRecovery(path, nil)
 	require.True(t, claimed)
@@ -174,16 +216,81 @@ func TestCheckpointRecoveryClaimSerializesManagers(t *testing.T) {
 	select {
 	case <-resumed:
 	case <-time.After(time.Second):
-		t.Fatal("newest manager was not resumed")
+		t.Fatal("newer manager was not resumed")
 	}
 	select {
 	case <-firstPending:
-		t.Fatal("older manager also resumed")
-	default:
+	case <-time.After(time.Second):
+		t.Fatal("older waiter was lost")
 	}
 	nextRelease, claimed := ClaimCheckpointRecovery(path, nil)
 	require.True(t, claimed)
 	nextRelease()
+}
+
+func TestStoppedManagerWakeCannotReplaceActiveRecovery(t *testing.T) {
+	setTestDataDir(t)
+	const agentID = "wake-owner"
+	path := store.CheckpointPath(agentID, "run-1")
+	require.NoError(t, store.WriteJSON(path, RunCheckpoint{AgentName: agentID, SessionID: "session", Message: "request", CreatedAt: time.Now()}))
+	old := NewManager(nil)
+	oldRunner := newTestRunner(old, agentID, agentID, &sequenceProvider{})
+	old.Stop()
+	newManager := NewManager(nil)
+	newProvider := &sequenceProvider{}
+	newRunner := newTestRunner(newManager, agentID, agentID, newProvider)
+	release, claimed := ClaimCheckpointRecovery(path, nil)
+	require.True(t, claimed)
+	_, claimed = ClaimCheckpointRecovery(path, func() { newManager.wakeCheckpointRecovery(newRunner, "run-1.json", path, time.Hour) })
+	require.False(t, claimed)
+	_, claimed = ClaimCheckpointRecovery(path, func() { old.wakeCheckpointRecovery(oldRunner, "run-1.json", path, time.Hour) })
+	require.False(t, claimed)
+	release()
+	deadline := time.After(2 * time.Second)
+	for newProvider.callCount() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("active manager recovery was lost to stale callback")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	newRunner.Wait()
+	require.NoError(t, newManager.Drain(context.Background()))
+}
+
+func TestConcurrentRecoveryWakesQuiesceOnRetainedCheckpoint(t *testing.T) {
+	setTestDataDir(t)
+	const agentID = "retained-wake"
+	path := store.CheckpointPath(agentID, "run-1")
+	require.NoError(t, store.WriteJSON(path, RunCheckpoint{
+		AgentName: agentID, SessionID: "session", Message: "request", CreatedAt: time.Now(),
+		RetryCount: 1, LastRecoveredAt: time.Now(),
+	}))
+	m := NewManager(nil)
+	runner := newTestRunner(m, agentID, agentID, &sequenceProvider{})
+	release, claimed := ClaimCheckpointRecovery(path, nil)
+	require.True(t, claimed)
+	woke := make(chan struct{}, 2)
+	for range 2 {
+		_, claimed = ClaimCheckpointRecovery(path, func() {
+			m.wakeCheckpointRecovery(runner, "run-1.json", path, time.Hour)
+			woke <- struct{}{}
+		})
+		require.False(t, claimed)
+	}
+	release()
+	for range 2 {
+		select {
+		case <-woke:
+		case <-time.After(time.Second):
+			t.Fatal("pending recovery wake did not finish")
+		}
+	}
+	liveCheckpoints.Lock()
+	pending := len(liveCheckpoints.pending[checkpointKey(path)])
+	liveCheckpoints.Unlock()
+	require.Zero(t, pending, "retained checkpoint must not queue recursive wakes")
+	require.FileExists(t, path)
 }
 
 func TestManagerCannotAdmitNewRunnerAfterStop(t *testing.T) {
@@ -241,6 +348,21 @@ func TestUserStopRetiresOnlySelectedStaleCheckpoints(t *testing.T) {
 	require.NoError(t, RetireCheckpointsForUserStop("stale", "one"))
 	require.NoFileExists(t, first)
 	require.FileExists(t, second)
+}
+
+func TestScopedUserStopIgnoresVanishedCheckpointAndReportsCorruption(t *testing.T) {
+	setTestDataDir(t)
+	dir := store.CheckpointDir("stale")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	missing := store.CheckpointPath("stale", "missing")
+	require.NoError(t, os.Symlink("not-present.json", missing))
+	require.NoError(t, RetireCheckpointsForUserStop("stale", "session"),
+		"a checkpoint removed after listing must not make an already requested stop fail")
+	bad := store.CheckpointPath("stale", "corrupt")
+	require.NoError(t, os.WriteFile(bad, []byte("not json"), 0o600))
+	err := RetireCheckpointsForUserStop("stale", "session")
+	require.ErrorContains(t, err, "parsing")
+	require.FileExists(t, bad, "corrupt checkpoint remains for inspection")
 }
 
 func TestUserStopSuppressesClaimedRecoveryUntilRelease(t *testing.T) {

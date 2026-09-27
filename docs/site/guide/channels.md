@@ -39,7 +39,8 @@ Shared channel behavior:
 - `disabled_tools` can only restrict what the agent already has permission to use.
 - `allow_from` controls which senders and group contexts are allowed to reach the agent.
 - Channel-level `model` and `fallbacks` override the agent defaults for messages arriving through that channel.
-- `show_typing` applies to Signal typing notifications and Slack assistant status indicators. Discord does not support it.
+- `show_typing` applies to Signal typing notifications and fixed generic Slack assistant status on supported surfaces. The selected agent/channel route controls it, including when agents share one Slack connection. Discord does not support it.
+- `tool_progress` is an optional Slack-only setting, off by default. The selected route controls it independently of `show_typing`.
 
 ## Slack
 
@@ -124,7 +125,8 @@ Slack-specific notes:
 
 - `allow_from[].from` accepts raw Slack user IDs or human-friendly names such as `alice` or `@alice`.
 - `allow_from[].allowed_groups` accepts raw Slack channel IDs or human-friendly names such as `alerts` or `#alerts`.
-- Slack apps connected through Events API and Socket Mode cannot emit classic typing notifications, but Aviary uses Slack assistant thread status indicators when `show_typing` is enabled.
+- Slack apps connected through Events API and Socket Mode cannot emit classic typing notifications, but Aviary uses fixed generic Slack assistant status on supported surfaces when the selected route has `show_typing` enabled. Status never includes tool names, arguments, results, errors, paths, or commands.
+- When `tool_progress` is enabled, Aviary may briefly show registered tool names with generic started, succeeded, or failed states in the original thread. Tool arguments, results, errors, paths, commands, and URLs are never shown. Progress is temporary and cleaned up after the final answer when Slack permits it.
 - `users:read` is required if you want Aviary to resolve Slack user names and support name-based routing instead of raw user IDs only.
 - In the control panel, **Settings > Agents > Channels > Slack** includes a **Browse Channels** action that validates the bot token and lists channels visible to the app.
 
@@ -171,7 +173,6 @@ Example:
 agents:
   - name: discord-lobby
     model: anthropic/claude-sonnet-4-6
-    verbose: true
     channels:
       - type: discord
         token: auth:discord:default

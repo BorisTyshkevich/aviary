@@ -966,12 +966,12 @@ func (c *SignalChannel) dispatch(line []byte) {
 		dataMessage = env.EditMessage.DataMessage
 	}
 
-	isReplyToSelf := c.replyToReplies && c.phone != "" &&
+	wasReplyToSelf := c.phone != "" &&
 		dataMessage != nil &&
 		dataMessage.Quote != nil &&
 		dataMessage.Quote.Author == c.phone
 
-	c.dispatchEnvelope(env.Source, env.Timestamp, c.isMentioned(dataMessage), isReplyToSelf, dataMessage)
+	c.dispatchEnvelope(env.Source, env.Timestamp, c.isMentioned(dataMessage), wasReplyToSelf, dataMessage)
 }
 
 // fetchUUID calls listAccounts on the signal-cli daemon to discover and store
@@ -1027,7 +1027,15 @@ func (c *SignalChannel) isMentioned(dataMessage *signalDataMessage) bool {
 	return false
 }
 
-func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasMentioned bool, isReplyToSelf bool, dataMessage *signalDataMessage) {
+func (c *SignalChannel) routeIncoming(msg IncomingMessage) (IncomingMessage, bool) {
+	result := checkAllowed(c.allowFrom, msg.From, msg.Channel, msg.Text, msg.IsGroup, "", msg.WasMentioned)
+	if msg.WasReplyToSelf && c.replyToReplies {
+		result = checkAllowedReplyContinuation(c.allowFrom, msg.From, msg.Channel, msg.IsGroup)
+	}
+	return applyAllowedIncoming(msg, result, c.disabledTools, c.model, c.fallbacks)
+}
+
+func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasMentioned bool, wasReplyToSelf bool, dataMessage *signalDataMessage) {
 	if dataMessage == nil || (dataMessage.Message == "" && len(dataMessage.Attachments) == 0) {
 		return
 	}
@@ -1075,11 +1083,9 @@ func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasM
 	// Replies to the agent's own messages must still match an allowFrom entry's
 	// sender and group scope; replyToReplies only relaxes mention gating so the
 	// user can continue the same allowed conversation without re-mentioning.
-	result := checkAllowed(c.allowFrom, source, channelID, msgText, isGroup, "", wasMentioned)
-	if isReplyToSelf {
-		result = checkAllowedReplyContinuation(c.allowFrom, source, channelID, isGroup)
-	}
-	if !result.allowed {
+	im, allowed := c.routeIncoming(IncomingMessage{Type: "signal", From: source, SenderName: source, Channel: channelID,
+		Text: msgText, ReceivedAt: receivedAt, IsGroup: isGroup, WasMentioned: wasMentioned, WasReplyToSelf: wasReplyToSelf})
+	if !allowed {
 		return
 	}
 
@@ -1088,19 +1094,7 @@ func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasM
 	c.handlerMu.RUnlock()
 
 	if fn != nil {
-		im := IncomingMessage{
-			Type:          "signal",
-			From:          source,
-			SenderName:    source,
-			Channel:       channelID,
-			Text:          msgText,
-			MediaURL:      c.firstSignalImageDataURL(dataMessage.Attachments, source, channelID, isGroup),
-			ReceivedAt:    receivedAt,
-			RestrictTools: result.restrictTools,
-			DisabledTools: c.disabledTools,
-			Model:         result.model,
-			Fallbacks:     result.fallbacks,
-		}
+		im.MediaURL = c.firstSignalImageDataURL(dataMessage.Attachments, source, channelID, isGroup)
 		if dataMessage.Quote != nil {
 			im.QuoteAuthor = dataMessage.Quote.Author
 			qtext := dataMessage.Quote.Text
@@ -1108,12 +1102,6 @@ func (c *SignalChannel) dispatchEnvelope(source string, msgTimestamp int64, wasM
 				qtext = strings.ReplaceAll(qtext, "\uFFFC", repl)
 			}
 			im.QuoteText = qtext
-		}
-		if im.Model == "" {
-			im.Model = c.model
-		}
-		if len(im.Fallbacks) == 0 {
-			im.Fallbacks = c.fallbacks
 		}
 		fn(im)
 		// Send a read receipt only after the message has been handed off.

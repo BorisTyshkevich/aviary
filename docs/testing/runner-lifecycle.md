@@ -27,15 +27,27 @@ not declare surviving goroutines dead. The same-process recovery registry
 blocks replay of their checkpoints until their callbacks and checkpoint
 teardown actually finish. A hard restart waits for the old socket to close
 before the replacement opens. Shared Slack connection replacement on reload
-uses the same socket ordering.
+uses the same socket ordering. If the old socket cannot be confirmed closed
+within the handoff deadline, the replacement is withheld and the error is
+logged; a later reconcile or restart is needed to retry the handoff (tracked
+as [issue #41](https://github.com/lsegal/aviary/issues/41)).
+
+The scheduler closes its claim loop before channel ingress quiescence, without
+canceling jobs already claimed. A job remains owned in this process until its
+accepted run has delivered its terminal callback and the queue outcome is
+written. Another Scheduler in the same process skips that job during startup
+recovery and queue claiming, even if shutdown's drain deadline elapsed. A
+process exit clears this ownership, so the file-backed queue still recovers
+interrupted jobs on the next start.
 
 The server owns separate channel and execution contexts during shutdown, so
 root cancellation does not prematurely cancel admitted work or Signal transport
 before the drain. A caller's own canceled request context still stops its run.
 Signal has no Slack-style Socket Mode acknowledgement gate: its daemon and
 transport remain available until the bounded runner drain ends, then channel
-teardown begins. The server gate stops new non-Slack runner submissions when
-shutdown starts. The focused tests cover runner ownership, admission fallback,
+teardown begins. The server gate stops new non-Slack runner submissions after
+Slack ingress handoff and attempts a fixed resend notice at the original target
+while the transport is still available. The focused tests cover runner ownership, admission fallback,
 checkpoint exclusion, and Slack socket ordering. They do not establish an
 end-to-end guarantee for a live Signal daemon or for an OS-delivered process
 signal; those require an external integration environment. A server-level root

@@ -531,7 +531,6 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	base.AllowFrom = mergeAllowFrom(resolvedSpecs)
 	ch := NewSlackChannel(base.URL, base.Token, base.AllowFrom, "", nil)
 	ch.affinityPass = func(in slackIngress) bool { return in.RootTS != "" && in.RootTS != in.MessageTS }
-	ch.showStatus = anySlackStatusEnabled(resolvedSpecs)
 	intake := &slackConnectionIntake{channel: ch, service: m.connectionService, validateEndpoint: m.connectionValidator, validatePassword: m.credentialValidator, postConnect: m.postConnect, specs: resolvedSpecs}
 	intake.claimCommand = func(in slackIngress, selected channelSpec) bool { return m.claimSlackCommand(ch, in, selected) }
 	ch.intake = intake.handle
@@ -637,15 +636,6 @@ func matchesAnyAllowedGroup(entries []config.AllowFromEntry, channelID string) b
 	return false
 }
 
-func anySlackStatusEnabled(specs []channelSpec) bool {
-	for _, spec := range specs {
-		if config.BoolOr(spec.channelConfig.ShowTyping, true) {
-			return true
-		}
-	}
-	return false
-}
-
 func channelSessionName(cc config.ChannelConfig, msg IncomingMessage) string {
 	base := msg.Type + ":" + msg.Channel
 	if msg.Type != "slack" {
@@ -729,14 +719,9 @@ func (m *Manager) stopSharedSlackLocked(connKey string) {
 // RouteDelivery sends text to channelID via any running channel of channelType.
 // It tries all matching channels and returns on the first success.
 func (m *Manager) RouteDelivery(channelType, channelID, text string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	channels := m.snapshotChannelsOfType(channelType)
 	var lastErr error
-	for key, ch := range m.channels {
-		parts := strings.SplitN(key, "/", 3)
-		if len(parts) != 3 || parts[1] != channelType {
-			continue
-		}
+	for _, ch := range channels {
 		if err := ch.Send(channelID, text); err != nil {
 			lastErr = err
 		} else {
@@ -749,14 +734,27 @@ func (m *Manager) RouteDelivery(channelType, channelID, text string) error {
 	return fmt.Errorf("no active channel of type %q", channelType)
 }
 
+func (m *Manager) snapshotChannelsOfType(channelType string) []Channel {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var channels []Channel
+	for key, ch := range m.channels {
+		parts := strings.SplitN(key, "/", 3)
+		if len(parts) != 3 || parts[1] != channelType {
+			continue
+		}
+		channels = append(channels, ch)
+	}
+	return channels
+}
+
 // SendOnConfiguredChannel sends text using a specific configured channel
 // instance identified by agentName/channelType/configuredID.
 func (m *Manager) SendOnConfiguredChannel(agentName, channelType, configuredID, channelID, text string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	key := channelKey(agentName, channelType, configuredID)
 	ch, ok := m.channels[key]
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("configured channel %q not active", key)
 	}
@@ -767,10 +765,9 @@ func (m *Manager) SendOnConfiguredChannel(agentName, channelType, configuredID, 
 // specific configured channel instance.
 func (m *Manager) SendThreadOnConfiguredChannel(agentName, channelType, configuredID, channelID, threadTS, text string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	key := channelKey(agentName, channelType, configuredID)
 	ch, ok := m.channels[key]
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("configured channel %q not active", key)
 	}
@@ -793,8 +790,26 @@ func (m *Manager) RevalidateRoutedMessage(agentName, channelType, configuredID s
 	if !configured || ch == nil || !shouldProcessIncomingMessage(spec.metadata, msg) {
 		return nil, IncomingMessage{}, false
 	}
-	if channelType != "slack" {
-		return ch, msg, true
+	switch channelType {
+	case "signal":
+		signalCh, ok := ch.(*SignalChannel)
+		if !ok {
+			return nil, IncomingMessage{}, false
+		}
+		routed, allowed := signalCh.routeIncoming(msg)
+		return ch, routed, allowed
+	case "discord":
+		discordCh, ok := ch.(*DiscordChannel)
+		if !ok {
+			return nil, IncomingMessage{}, false
+		}
+		routed, allowed := discordCh.routeIncoming(msg, discordCh.discordBotUserID())
+		return ch, routed, allowed
+	case "slack":
+		// The full Slack selector below checks ownership, mention paths,
+		// reply policy and ambiguity against every current route.
+	default:
+		return nil, IncomingMessage{}, false
 	}
 	slackCh, ok := ch.(*SlackChannel)
 	if !ok {
@@ -804,7 +819,11 @@ func (m *Manager) RevalidateRoutedMessage(agentName, channelType, configuredID s
 	if botID == "" || teamID == "" || botID != msg.InstallationID || teamID != msg.WorkspaceID {
 		return nil, IncomingMessage{}, false
 	}
-	routed, allowed := routedSlackMessageOriginal(slackCh, spec, msg, msg.IsThreadReply)
+	var routed IncomingMessage
+	allowed := false
+	m.routeSlackMessageFor(slackCh, msg, nil, key, func(_, _, _ string, _ Channel, selected IncomingMessage) {
+		routed, allowed = selected, true
+	})
 	if !allowed {
 		return nil, IncomingMessage{}, false
 	}
@@ -815,10 +834,9 @@ func (m *Manager) RevalidateRoutedMessage(agentName, channelType, configuredID s
 // channel instance identified by agentName/channelType/configuredID.
 func (m *Manager) SendMediaOnConfiguredChannel(agentName, channelType, configuredID, channelID, caption, filePath string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	key := channelKey(agentName, channelType, configuredID)
 	ch, ok := m.channels[key]
+	m.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("configured channel %q not active", key)
 	}
@@ -833,14 +851,9 @@ func (m *Manager) SendMediaOnConfiguredChannel(agentName, channelType, configure
 // of channelType that implements MediaSender. Returns an error if no matching
 // channel supports media or all attempts fail.
 func (m *Manager) RouteMediaDelivery(channelType, channelID, caption, filePath string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	channels := m.snapshotChannelsOfType(channelType)
 	var lastErr error
-	for key, ch := range m.channels {
-		parts := strings.SplitN(key, "/", 3)
-		if len(parts) != 3 || parts[1] != channelType {
-			continue
-		}
+	for _, ch := range channels {
 		ms, ok := ch.(MediaSender)
 		if !ok {
 			continue
@@ -898,7 +911,6 @@ func newChannel(cc config.ChannelConfig, agentModel string, agentFallbacks []str
 		// Token = bot token (xoxb-…), URL = app-level token (xapp-…) for Socket Mode.
 		ch := NewSlackChannel(cc.URL, cc.Token, cc.AllowFrom, model, fallbacks)
 		ch.disabledTools = cc.DisabledTools
-		ch.showStatus = config.BoolOr(cc.ShowTyping, true)
 		return ch
 	case "discord":
 		if cc.ShowTyping != nil {

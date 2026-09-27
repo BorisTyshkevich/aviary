@@ -29,20 +29,28 @@ type admissionChannel struct {
 	threads []string
 }
 
-type drainingStatusChannel struct {
+type drainingPresenterChannel struct {
 	admissionChannel
-	clearEntered chan struct{}
-	releaseClear chan struct{}
-	clearOnce    sync.Once
+	terminalEntered chan struct{}
+	releaseTerminal chan struct{}
+	terminalOnce    sync.Once
 }
 
-func (c *drainingStatusChannel) ShowAssistantStatus() bool { return true }
-
-func (c *drainingStatusChannel) SendAssistantStatus(_, _, status string) error {
-	if status == "" {
-		c.clearOnce.Do(func() { close(c.clearEntered) })
-		<-c.releaseClear
+func (c *drainingPresenterChannel) PostThreadTextContext(_ context.Context, _, _, text string) (string, error) {
+	if text == "Stopped." {
+		c.terminalOnce.Do(func() { close(c.terminalEntered) })
+		<-c.releaseTerminal
 	}
+	return "notice", nil
+}
+
+func (*drainingPresenterChannel) EditThreadTextContext(context.Context, string, string, string) error {
+	return nil
+}
+func (*drainingPresenterChannel) DeleteThreadMessageContext(context.Context, string, string) error {
+	return nil
+}
+func (*drainingPresenterChannel) ShareThreadMarkdownFileContext(context.Context, string, string, string, string) error {
 	return nil
 }
 
@@ -78,7 +86,7 @@ func (c *admissionChannel) snapshot() ([]string, []string) {
 
 func signalAdmissionConfig(model string) *config.Config {
 	return &config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: model,
-		Channels: []config.ChannelConfig{{Type: "signal", ID: "route"}}}}}
+		Channels: []config.ChannelConfig{{Type: "signal", ID: "route", AllowFrom: []config.AllowFromEntry{{From: "+15550002222"}}}}}}}
 }
 
 func TestChannelAdmissionReloadRetriesOnlyRejectedRun(t *testing.T) {
@@ -171,7 +179,7 @@ func TestNonSlackIngressStopsBeforeRunnerAdmission(t *testing.T) {
 		Type: "signal", Channel: "+15550001111", From: "+15550002222", Text: "late request",
 	})
 	posts, threads := ch.snapshot()
-	require.Empty(t, posts)
+	require.Equal(t, []string{"Restarting; please resend your request."}, posts)
 	require.Empty(t, threads)
 	require.Zero(t, checkpointCountForServerTest("bot"))
 }
@@ -262,10 +270,10 @@ func TestServerRootCancellationDrainsAdmittedChannelRun(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
-	ch := &drainingStatusChannel{clearEntered: make(chan struct{}), releaseClear: make(chan struct{})}
+	ch := &drainingPresenterChannel{terminalEntered: make(chan struct{}), releaseTerminal: make(chan struct{})}
 	<-srv.routerReady
-	srv.msgFn("bot", "signal", "route", ch, channels.IncomingMessage{
-		Type: "signal", Channel: "+15550001111", ThreadTS: "original", From: "+15550002222", Text: "request",
+	srv.msgFn("bot", "slack", "route", ch, channels.IncomingMessage{
+		Type: "slack", Channel: "C1", ThreadTS: "1.000001", From: "U1", Text: "request",
 	})
 	select {
 	case <-modelEntered:
@@ -274,7 +282,7 @@ func TestServerRootCancellationDrainsAdmittedChannelRun(t *testing.T) {
 	}
 	cancel()
 	select {
-	case <-ch.clearEntered:
+	case <-ch.terminalEntered:
 	case <-time.After(2 * time.Second):
 		t.Fatal("runner stop did not enter terminal callback")
 	}
@@ -283,7 +291,7 @@ func TestServerRootCancellationDrainsAdmittedChannelRun(t *testing.T) {
 		t.Fatalf("server returned before terminal callback completed: %v", err)
 	default:
 	}
-	close(ch.releaseClear)
+	close(ch.releaseTerminal)
 	select {
 	case err := <-done:
 		require.NoError(t, err)

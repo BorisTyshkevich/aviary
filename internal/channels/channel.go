@@ -16,6 +16,9 @@ type IncomingMessage struct {
 	Channel        string // channel ID or name
 	ThreadTS       string // optional platform thread timestamp/root ID
 	IsThreadReply  bool   // true when the message is a reply inside a platform thread
+	IsGroup        bool   // trusted platform group/channel classification
+	WasMentioned   bool   // trusted platform mention signal
+	WasReplyToSelf bool   // trusted Signal quote-of-this-bot signal
 	Text           string
 	OriginalText   string // trusted, un-enriched text from the platform event
 	IsEdited       bool   // true when this event changes an existing message
@@ -77,8 +80,7 @@ type TypingSender interface {
 // AssistantStatusSender is an optional interface implemented by channels that
 // support native assistant progress/status indicators.
 type AssistantStatusSender interface {
-	ShowAssistantStatus() bool
-	SendAssistantStatus(channel, threadTS, status string) error
+	SendAssistantStatusContext(ctx context.Context, channel, threadTS, status string) error
 }
 
 // MediaSender is an optional interface implemented by channels that support
@@ -96,19 +98,6 @@ type MediaSender interface {
 // directly into the agent session.
 type GroupChatLogger interface {
 	OnGroupChatMessage(fn func(IncomingMessage))
-}
-
-// MessageSenderWithID posts a message and returns an opaque message ID that
-// can later be passed to MessageEditor.EditMessage. Channels that support
-// in-place message editing implement this interface alongside Channel.
-type MessageSenderWithID interface {
-	SendAndGetID(channel, text string) (msgID string, err error)
-}
-
-// MessageEditor is an optional interface for channels that support editing
-// previously posted messages in place.
-type MessageEditor interface {
-	EditMessage(channel, msgID, text string) error
 }
 
 // ThreadMessageSender posts a message into an existing platform thread and

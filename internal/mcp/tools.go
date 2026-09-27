@@ -358,8 +358,10 @@ func registerAgentTools(s *sdkmcp.Server) {
 			case agent.StreamEventTool:
 				if progressToken != nil && args.IncludeToolProgress && e.Tool != nil {
 					payload, err := json.Marshal(map[string]any{
-						"name": e.Tool.Name,
-						"args": e.Tool.Args,
+						"name":          e.Tool.Name,
+						"invocation_id": e.Tool.InvocationID,
+						"state":         e.Tool.State,
+						"args":          e.Tool.Args,
 					})
 					if err == nil {
 						progressCount++
@@ -384,7 +386,7 @@ func registerAgentTools(s *sdkmcp.Server) {
 				done <- nil
 			case agent.StreamEventStop:
 				if e.StopCause == agent.StopCauseRunner {
-					done <- fmt.Errorf("agent %q is restarting; retry the request", agentName)
+					done <- fmt.Errorf("agent %q run was interrupted by restart; recovery will resume the accepted request", agentName)
 				} else {
 					done <- context.Canceled
 				}

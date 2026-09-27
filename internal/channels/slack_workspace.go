@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/slack-go/slack"
 )
@@ -41,6 +42,8 @@ func listSlackWorkspaceChannelsWithClient(ctx context.Context, client *slack.Cli
 	if client == nil {
 		return nil, fmt.Errorf("slack client is required")
 	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
 
 	authResp, err := client.AuthTestContext(ctx)
 	if err != nil {

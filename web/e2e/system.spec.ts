@@ -159,6 +159,56 @@ test("system skills can disable and enable installed skills", async ({
 	).toBeVisible();
 });
 
+test("direct skills save omits Slack-only progress from other channels", async ({
+	page,
+}) => {
+	let savedChannels: Record<string, unknown>[] = [];
+	await mockMCP(page, {
+		config_get: {
+			server: { port: 16677, tls: { cert: "", key: "" } },
+			agents: [
+				{
+					name: "bot",
+					model: "test/model",
+					channels: [
+						{ type: "signal", id: "+15551234567" },
+						{ type: "discord", id: "guild" },
+					],
+					tasks: [],
+				},
+			],
+			models: { providers: {}, defaults: { model: "", fallbacks: [] } },
+			skills: { gogcli: { enabled: true } },
+		},
+		config_save: (args) => {
+			const savedConfig = JSON.parse(String(args?.config ?? "{}")) as {
+				agents?: { channels: Record<string, unknown>[] }[];
+			};
+			savedChannels = savedConfig.agents?.[0]?.channels ?? [];
+			return "ok";
+		},
+		skills_list: [
+			{
+				name: "gogcli",
+				description: "Control GOG Galaxy tasks.",
+				path: "skills/gogcli/SKILL.md",
+				source: "builtin",
+				enabled: true,
+			},
+		],
+	});
+	await page.goto("/system/skills");
+	await page
+		.locator("article")
+		.filter({ hasText: "gogcli" })
+		.getByRole("button", { name: "Disable" })
+		.click();
+	await expect(page.getByText("gogcli disabled.")).toBeVisible();
+	expect(savedChannels).toHaveLength(2);
+	for (const channel of savedChannels)
+		expect(channel).not.toHaveProperty("tool_progress");
+});
+
 test("settings leaves server and cdp ports unset until the user enters them", async ({
 	page,
 }) => {

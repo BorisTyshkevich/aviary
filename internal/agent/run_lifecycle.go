@@ -40,17 +40,38 @@ const (
 type runCancellation struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
+	mu     sync.Mutex
+	// A selected Done or Error remains terminal while its synchronous consumer
+	// delivers the outcome. A later runner stop cannot turn it into replay work.
+	completed bool
 }
 
 var errRunnerStopped = errors.New("runner stopped")
 var errUserStopped = errors.New("user stopped")
 
 func (r *runCancellation) stop(cause StopCause) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.completed {
+		return
+	}
 	if cause == StopCauseRunner {
 		r.cancel(errRunnerStopped)
 		return
 	}
 	r.cancel(errUserStopped)
+}
+
+func (r *runCancellation) complete() {
+	r.mu.Lock()
+	r.completed = true
+	r.mu.Unlock()
+}
+
+func (r *runCancellation) completedTerminal() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.completed
 }
 
 func (r *runCancellation) stopCause() StopCause {
@@ -67,9 +88,9 @@ var liveCheckpoints = struct {
 	sync.Mutex
 	paths      map[string]*liveCheckpoint
 	recovering map[string]struct{}
-	pending    map[string]func()
+	pending    map[string][]func()
 	retired    map[string]struct{}
-}{paths: make(map[string]*liveCheckpoint), recovering: make(map[string]struct{}), pending: make(map[string]func()), retired: make(map[string]struct{})}
+}{paths: make(map[string]*liveCheckpoint), recovering: make(map[string]struct{}), pending: make(map[string][]func()), retired: make(map[string]struct{})}
 
 type liveCheckpoint struct {
 	owners int
@@ -106,9 +127,9 @@ func claimLiveCheckpoint(path string) (func(), bool) {
 		if err := retireCheckpointIfIdleLocked(key); err != nil {
 			slog.Warn("agent: failed to retire stopped checkpoint", "path", key, "err", err)
 		}
-		wake := wakeCheckpointRecoveryLocked(key)
+		wakes := wakeCheckpointRecoveryLocked(key)
 		liveCheckpoints.Unlock()
-		if wake != nil {
+		for _, wake := range wakes {
 			go wake()
 		}
 	}, true
@@ -116,8 +137,9 @@ func claimLiveCheckpoint(path string) (func(), bool) {
 
 // ClaimCheckpointRecovery makes the live check and recovery decision atomic.
 // The caller holds the returned release function through recovery read and
-// handoff. If an old run or recovery owns the checkpoint, the newest pending
-// callback replaces an earlier one and runs after ownership ends.
+// handoff. If an old run or recovery owns the checkpoint, every pending
+// callback runs after ownership ends; each caller must recheck its own
+// readiness and claim again before touching the file.
 func ClaimCheckpointRecovery(path string, resume func()) (func(), bool) {
 	key := checkpointKey(path)
 	liveCheckpoints.Lock()
@@ -127,7 +149,9 @@ func ClaimCheckpointRecovery(path string, resume func()) (func(), bool) {
 	}
 	_, recovering := liveCheckpoints.recovering[key]
 	if liveCheckpoints.paths[key] != nil || recovering {
-		liveCheckpoints.pending[key] = resume
+		if resume != nil {
+			liveCheckpoints.pending[key] = append(liveCheckpoints.pending[key], resume)
+		}
 		liveCheckpoints.Unlock()
 		return nil, false
 	}
@@ -139,15 +163,15 @@ func ClaimCheckpointRecovery(path string, resume func()) (func(), bool) {
 		if err := retireCheckpointIfIdleLocked(key); err != nil {
 			slog.Warn("agent: failed to retire stopped checkpoint", "path", key, "err", err)
 		}
-		wake := wakeCheckpointRecoveryLocked(key)
+		wakes := wakeCheckpointRecoveryLocked(key)
 		liveCheckpoints.Unlock()
-		if wake != nil {
+		for _, wake := range wakes {
 			go wake()
 		}
 	}, true
 }
 
-func wakeCheckpointRecoveryLocked(key string) func() {
+func wakeCheckpointRecoveryLocked(key string) []func() {
 	if _, retired := liveCheckpoints.retired[key]; retired {
 		return nil
 	}
@@ -157,9 +181,9 @@ func wakeCheckpointRecoveryLocked(key string) func() {
 	if _, recovering := liveCheckpoints.recovering[key]; recovering {
 		return nil
 	}
-	wake := liveCheckpoints.pending[key]
+	wakes := liveCheckpoints.pending[key]
 	delete(liveCheckpoints.pending, key)
-	return wake
+	return wakes
 }
 
 // RetireCheckpointsForUserStop suppresses stale recovery before deleting the
@@ -184,6 +208,9 @@ func RetireCheckpointsForUserStop(agentID, sessionID string) error {
 		if sessionID != "" {
 			cp, readErr := store.ReadJSON[RunCheckpoint](path)
 			if readErr != nil {
+				if errors.Is(readErr, os.ErrNotExist) {
+					continue // a completing run removed it after ReadDir
+				}
 				failures = append(failures, readErr)
 				continue
 			}

@@ -145,6 +145,12 @@ func (m *Manager) Reconcile(cfg *config.Config) {
 // recoverCheckpoints scans the agent's running/ directory for interrupted
 // prompt checkpoints and either re-issues them or sends a timeout notification.
 func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
+	m.mu.RLock()
+	stopped := m.stopped
+	m.mu.RUnlock()
+	if stopped || runner.Stopping() {
+		return
+	}
 	timeout := config.DefaultFailedTaskTimeout
 	m.mu.RLock()
 	cfg := m.cfg
@@ -164,19 +170,47 @@ func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
+		m.mu.RLock()
+		stopped = m.stopped
+		m.mu.RUnlock()
+		if stopped || runner.Stopping() {
+			return
+		}
+		name := e.Name()
 		release, claimed := ClaimCheckpointRecovery(path, func() {
-			if !runner.Stopping() {
-				m.recoverCheckpoints(runner)
-			}
+			m.wakeCheckpointRecovery(runner, name, path, timeout)
 		})
 		if !claimed {
 			continue
 		}
 		func() {
 			defer release()
-			m.recoverCheckpoint(runner, e.Name(), path, timeout)
+			m.recoverCheckpoint(runner, name, path, timeout)
 		}()
 	}
+}
+
+// wakeCheckpointRecovery retries one file once after a live owner exits. It
+// does not rescan the directory or enqueue another wake behind a concurrent
+// recovery, so retained checkpoints cannot cause an unbounded wake loop.
+func (m *Manager) wakeCheckpointRecovery(runner *AgentRunner, name, path string, timeout time.Duration) {
+	m.mu.Lock()
+	if m.stopped || runner.Stopping() {
+		m.mu.Unlock()
+		return
+	}
+	m.recoveries.Add(1)
+	m.mu.Unlock()
+	defer m.recoveries.Done()
+	release, claimed := ClaimCheckpointRecovery(path, nil)
+	if !claimed {
+		return
+	}
+	defer release()
+	if runner.Stopping() {
+		return
+	}
+	m.recoverCheckpoint(runner, name, path, timeout)
 }
 
 func (m *Manager) recoverCheckpoint(runner *AgentRunner, name, path string, timeout time.Duration) {

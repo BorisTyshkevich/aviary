@@ -11,11 +11,41 @@ import (
 	"time"
 
 	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/slackevents"
 	"github.com/slack-go/slack/socketmode"
 	"github.com/stretchr/testify/require"
 
 	"github.com/lsegal/aviary/internal/config"
 )
+
+func TestSlackEventsAPIAcknowledgementRoutesOriginalMessage(t *testing.T) {
+	ch := NewSlackChannel("xapp-fake", "xoxb-fake", []config.AllowFromEntry{{From: "U1"}}, "", nil)
+	ch.botUserID, ch.teamID = "BOT", "TEAM"
+	var acknowledgements atomic.Int32
+	ch.ackEnvelope = func(context.Context, *socketmode.Request) error {
+		acknowledgements.Add(1)
+		return nil
+	}
+	routed := make(chan IncomingMessage, 1)
+	ch.OnMessage(func(msg IncomingMessage) { routed <- msg })
+	event := socketmode.Event{Type: socketmode.EventTypeEventsAPI, Request: &socketmode.Request{},
+		Data: slackevents.EventsAPIEvent{InnerEvent: slackevents.EventsAPIInnerEvent{
+			Data: &slackevents.MessageEvent{User: "U1", Channel: "D1", Text: "synthetic request", TimeStamp: "1710000000.123456"}}}}
+	ch.dispatch(event)
+	select {
+	case msg := <-routed:
+		require.Equal(t, "synthetic request", msg.OriginalText)
+		require.Equal(t, "D1", msg.Channel)
+		require.Equal(t, "BOT", msg.InstallationID)
+		require.Equal(t, "TEAM", msg.WorkspaceID)
+	case <-time.After(time.Second):
+		t.Fatal("acknowledged EventsAPI message was not routed")
+	}
+	require.EqualValues(t, 1, acknowledgements.Load())
+	ch.Stop()
+	ch.dispatch(event)
+	require.EqualValues(t, 1, acknowledgements.Load(), "closed ingress gate acknowledged another envelope")
+}
 
 func TestSlackIngressGateDrainsAcceptedEnvelopeAndKeepsOutgoingClient(t *testing.T) {
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -73,16 +73,6 @@
 								<input v-model="agent.working_dir" type="text" class="field-input"
 									placeholder="Default: process working directory (e.g. /home/user/projects/myrepo)" />
 							</div>
-							<div class="mt-2">
-								<label class="flex cursor-pointer items-center gap-3">
-									<input v-model="agent.verbose" type="checkbox"
-										class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
-									<span class="text-sm text-gray-700 dark:text-gray-300">
-										Verbose mode
-										<span class="ml-1 text-xs text-gray-400 dark:text-gray-500">(send live status updates before each tool call on channels that don't support streaming)</span>
-									</span>
-								</label>
-							</div>
 						</div>
 
 						<!-- Files content moved into General subtab -->
@@ -732,6 +722,11 @@
 										<input type="checkbox" v-model="ch.show_typing"
 											class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
 										Show typing indicator
+									</label>
+									<label v-if="ch.type === 'slack'" class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
+										<input type="checkbox" v-model="ch.tool_progress"
+											class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
+										Show tool progress
 									</label>
 									<label class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
 										<input type="checkbox" v-model="ch.reply_to_replies"

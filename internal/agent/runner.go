@@ -288,7 +288,7 @@ func (r *AgentRunner) promptCore(
 			if !checkpointOwned {
 				return
 			}
-			if state.stopCause() != StopCauseRunner {
+			if state.completedTerminal() || state.stopCause() != StopCauseRunner {
 				// Normal completion, user-stop, or provider error: remove checkpoint.
 				if err := store.DeleteJSON(checkpointPath); err != nil {
 					slog.Warn("agent: failed to delete run checkpoint", "agent", r.agent.Name, "err", err)
@@ -297,6 +297,9 @@ func (r *AgentRunner) promptCore(
 		}()
 
 		emit := func(e StreamEvent) {
+			if e.Type == StreamEventDone || e.Type == StreamEventError {
+				state.complete()
+			}
 			e.AgentID = r.agent.ID
 			e.Private = privateConnectionTurn(promptCtx)
 			if e.Type == StreamEventStop {
@@ -319,7 +322,7 @@ func (r *AgentRunner) promptCore(
 		// Guard: if this message was already successfully answered (e.g. by a
 		// concurrent run or on a retry), do not process it again.
 		if persistedPromptID != "" && HasMessageResponse(r.agent.ID, sessionID, persistedPromptID) {
-			emit(StreamEvent{Type: StreamEventDone})
+			emit(StreamEvent{Type: StreamEventDone, AlreadyAnswered: true})
 			return
 		}
 
@@ -327,14 +330,14 @@ func (r *AgentRunner) promptCore(
 			emit(StreamEvent{Type: StreamEventStop})
 		}
 
+		const publicFailureText = "Unable to complete this request."
 		deliverAssistantError := func(err error) {
 			if err == nil {
 				return
 			}
-			msg := fmt.Sprintf("Error: %v", err)
 			// Do NOT persist API errors as assistant messages — they would be
 			// re-sent in subsequent requests and perpetuate the failure loop.
-			deliver(msg)
+			deliver(publicFailureText)
 		}
 
 		if currentProvider == nil {
@@ -342,9 +345,9 @@ func (r *AgentRunner) promptCore(
 				emitCanceled()
 				return
 			}
-			// No LLM provider configured — surface as a message so the UI shows it but tests pass.
+			// Surface a fixed message without exposing model or configuration details.
 			slog.Warn("agent: no provider", "agent", r.agent.Name, "model", effectiveModel)
-			msg := fmt.Sprintf("[no LLM provider configured for %q — check credentials and model settings]", effectiveModel)
+			msg := publicFailureText
 			if !overrides.DeferAnswerPersistence && !privateConnectionTurn(promptCtx) {
 				r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, msg, "", effectiveModel)
 			}
@@ -426,12 +429,12 @@ func (r *AgentRunner) promptCore(
 				conversation = history
 			}
 		}
-		toolNames := make(map[string]struct{}, len(tools))
+		toolNames := make(map[string]string, len(tools))
 		if evidence != "" {
 			conversation = append(conversation, llm.Message{Role: llm.RoleUser, Content: evidence})
 		}
 		for _, t := range tools {
-			toolNames[t.Name] = struct{}{}
+			toolNames[t.Name] = t.Name
 		}
 		llmTools := buildLLMToolDefinitions(tools)
 
@@ -580,6 +583,7 @@ func (r *AgentRunner) promptCore(
 						unavailableTool = nativeCall.Name
 						break
 					}
+					invocationID := newID("tool")
 					resultText, canceled := r.executeToolCall(
 						promptCtx,
 						emit,
@@ -589,6 +593,8 @@ func (r *AgentRunner) promptCore(
 						toolEventRecord{Name: nativeCall.Name, Args: nativeCall.Arguments},
 						nativeCall.Name,
 						nativeCall.Arguments,
+						toolNames,
+						invocationID,
 					)
 					if canceled {
 						return
@@ -658,7 +664,7 @@ func (r *AgentRunner) promptCore(
 			return
 		}
 
-		errMsg := fmt.Sprintf("Error: tool loop exceeded %d rounds", maxToolRounds)
+		errMsg := publicFailureText
 		r.appendSessionMessage(sessionID, domain.MessageRoleAssistant, errMsg, "", effectiveModel)
 		usageRec.HasError = true
 		deliver(errMsg)
@@ -1170,65 +1176,6 @@ type toolEventRecord struct {
 	Error  string         `json:"error,omitempty"`
 }
 
-// IsVerbose reports whether verbose mode is enabled for this agent.
-// When true the runner emits StreamEventStatus events before each tool call.
-func (r *AgentRunner) IsVerbose() bool {
-	return r.cfg != nil && config.BoolOr(r.cfg.Verbose, false)
-}
-
-// verboseStatusText returns a user-friendly "I am doing X" message for a
-// tool call based on the tool name and its arguments.
-func verboseStatusText(toolName string, args map[string]any) string {
-	lower := strings.ToLower(toolName)
-	switch {
-	case strings.Contains(lower, "search") || strings.Contains(lower, "find") || strings.Contains(lower, "query"):
-		if q, ok := verboseStringArg(args, "query", "q", "search", "pattern", "text"); ok {
-			return fmt.Sprintf("I am searching for \"%s\"", q)
-		}
-		return "I am searching"
-	case strings.Contains(lower, "read") || strings.Contains(lower, "get") || strings.Contains(lower, "fetch"):
-		if path, ok := verboseStringArg(args, "path", "file", "url", "uri"); ok {
-			return fmt.Sprintf("I am reading `%s`", path)
-		}
-		return "I am reading"
-	case strings.Contains(lower, "write") || strings.Contains(lower, "create") || strings.Contains(lower, "edit") || strings.Contains(lower, "append"):
-		if path, ok := verboseStringArg(args, "path", "file"); ok {
-			return fmt.Sprintf("I am writing `%s`", path)
-		}
-		return "I am writing"
-	case strings.Contains(lower, "bash") || strings.Contains(lower, "exec") || strings.Contains(lower, "shell") || strings.Contains(lower, "run"):
-		if cmd, ok := verboseStringArg(args, "command", "cmd", "script"); ok {
-			return fmt.Sprintf("I am running `%s`", cmd)
-		}
-		return "I am running a command"
-	case strings.Contains(lower, "browser") || strings.Contains(lower, "navigate"):
-		if url, ok := verboseStringArg(args, "url"); ok {
-			return fmt.Sprintf("I am navigating to `%s`", url)
-		}
-		return "I am using the browser"
-	case strings.Contains(lower, "memory"):
-		return "I am accessing memory"
-	case strings.Contains(lower, "list") || strings.Contains(lower, "ls"):
-		if path, ok := verboseStringArg(args, "path", "directory", "dir"); ok {
-			return fmt.Sprintf("I am listing `%s`", path)
-		}
-		return "I am listing files"
-	default:
-		return fmt.Sprintf("I am using %s", strings.ReplaceAll(toolName, "_", " "))
-	}
-}
-
-func verboseStringArg(args map[string]any, keys ...string) (string, bool) {
-	for _, key := range keys {
-		if v, ok := args[key]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				return s, true
-			}
-		}
-	}
-	return "", false
-}
-
 func (r *AgentRunner) executeToolCall(
 	promptCtx context.Context,
 	emit func(StreamEvent),
@@ -1238,13 +1185,23 @@ func (r *AgentRunner) executeToolCall(
 	streamRec toolEventRecord,
 	name string,
 	args map[string]any,
+	registeredNames map[string]string,
+	invocationID string,
 ) (string, bool) {
 	args = normalizeSessionToolArguments(name, sessionID, args)
 	streamRec.Args = args
-	emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args}})
-	if r.IsVerbose() {
-		emit(StreamEvent{Type: StreamEventStatus, Text: verboseStatusText(streamRec.Name, streamRec.Args)})
+	emitToolState := func(state ToolState, result, errorText string) {
+		emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{
+			Name: streamRec.Name, InvocationID: invocationID, State: state,
+			Args: streamRec.Args, Result: result, Error: errorText,
+		}})
+		if !privateConnectionTurn(promptCtx) {
+			if public, ok := projectPublicToolEvent(registeredNames, name, invocationID, state); ok {
+				emit(StreamEvent{Type: StreamEventToolProgress, PublicTool: &public})
+			}
+		}
 	}
+	emitToolState(ToolStateStarted, "", "")
 	if usageRec != nil {
 		usageRec.ToolCalls++
 	}
@@ -1254,7 +1211,7 @@ func (r *AgentRunner) executeToolCall(
 			emit(StreamEvent{Type: StreamEventStop})
 			return "", true
 		}
-		emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args, Error: callErr.Error()}})
+		emitToolState(ToolStateFailed, "", callErr.Error())
 		errRec := toolEventRecord{Name: name, Args: args, Error: callErr.Error()}
 		errPayload, _ := json.Marshal(errRec)
 		if !privateConnectionTurn(promptCtx) {
@@ -1263,13 +1220,28 @@ func (r *AgentRunner) executeToolCall(
 		return "error: " + callErr.Error(), false
 	}
 
-	emit(StreamEvent{Type: StreamEventTool, Tool: &ToolEvent{Name: streamRec.Name, Args: streamRec.Args, Result: resultText}})
+	emitToolState(ToolStateSucceeded, resultText, "")
 	histRec := toolEventRecord{Name: name, Args: args, Result: resultText}
 	histPayload, _ := json.Marshal(histRec)
 	if !privateConnectionTurn(promptCtx) {
 		r.appendSessionMessage(sessionID, domain.MessageRoleTool, string(histPayload), "", "")
 	}
 	return resultText, false
+}
+
+// projectPublicToolEvent uses the runner's filtered registration snapshot, not
+// a model-provided label or a raw tool event, to construct channel progress.
+func projectPublicToolEvent(registeredNames map[string]string, proposedName, invocationID string, state ToolState) (PublicToolEvent, bool) {
+	switch state {
+	case ToolStateStarted, ToolStateSucceeded, ToolStateFailed:
+	default:
+		return PublicToolEvent{}, false
+	}
+	name, ok := registeredNames[proposedName]
+	if !ok || name == "" || invocationID == "" {
+		return PublicToolEvent{}, false
+	}
+	return PublicToolEvent{Name: name, InvocationID: invocationID, State: state}, true
 }
 
 func normalizeSessionToolArguments(toolName, sessionID string, args map[string]any) map[string]any {

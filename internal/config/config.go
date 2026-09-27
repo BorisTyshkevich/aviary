@@ -102,12 +102,6 @@ type AgentConfig struct {
 	Permissions *PermissionsConfig `yaml:"permissions,omitempty" json:"permissions,omitempty"`
 	Channels    []ChannelConfig    `yaml:"channels,omitempty"    json:"channels,omitempty"`
 	Tasks       []TaskConfig       `yaml:"tasks,omitempty"       json:"tasks,omitempty"`
-	// Verbose enables progress status messages before each tool call when the
-	// agent is responding via a channel (Slack, Signal, etc.). When true the
-	// agent emits a brief "I am doing X..." message before executing each tool,
-	// allowing channels that do not support real-time streaming to display
-	// incremental updates by sending or editing a status message.
-	Verbose *bool `yaml:"verbose,omitempty" json:"verbose,omitempty"`
 }
 
 // AllowFromEntry defines a set of allowed senders and optional group-chat
@@ -205,10 +199,12 @@ type ChannelConfig struct {
 	URL           string           `yaml:"url,omitempty"           json:"url,omitempty"`
 	AllowFrom     []AllowFromEntry `yaml:"allow_from,omitempty"     json:"allow_from,omitempty"`
 	DisabledTools []string         `yaml:"disabled_tools,omitempty" json:"disabled_tools,omitempty"`
-	// ShowTyping controls whether a typing indicator is shown while the agent
-	// processes a message. Defaults to true for channels that support it.
-	// Currently this is implemented for Signal only.
+	// ShowTyping controls Signal typing and generic Slack assistant status while
+	// the agent processes a message. Defaults to true on supported channels.
 	ShowTyping *bool `yaml:"show_typing,omitempty"     json:"show_typing,omitempty"`
+	// ToolProgress enables temporary, generic tool-state messages for Slack runs.
+	// It defaults to false and is valid only for Slack channels.
+	ToolProgress *bool `yaml:"tool_progress,omitempty" json:"tool_progress,omitempty"`
 	// SeparateTopLevelSessions controls Slack channel session naming. When true,
 	// every top-level Slack message gets its own session keyed by the Slack
 	// thread/root timestamp, so all replies in that Slack thread share a session.

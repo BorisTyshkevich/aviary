@@ -3,6 +3,8 @@ package mcp
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +19,7 @@ import (
 	"github.com/lsegal/aviary/internal/browser"
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/domain"
+	"github.com/lsegal/aviary/internal/llm"
 	"github.com/lsegal/aviary/internal/scheduler"
 	"github.com/lsegal/aviary/internal/store"
 )
@@ -561,10 +564,19 @@ func TestConfigGetSaveValidateTools(t *testing.T) {
 		!strings.HasPrefix(strings.TrimSpace(out), "[") && strings.TrimSpace(out) != "null")
 
 	// config_save with valid JSON config
-	cfgJSON := `{"agents":[{"name":"bot","model":"anthropic/claude-3-haiku","channels":[{"type":"slack","id":"alerts"}]}]}`
+	cfgJSON := `{"agents":[{"name":"bot","model":"anthropic/claude-3-haiku","channels":[{"type":"slack","id":"alerts","tool_progress":true}]}]}`
 	out, err = d.CallTool(context.Background(), "config_save", map[string]any{"config": cfgJSON})
 	assert.NoError(t, err)
 	assert.True(t, strings.Contains(out, "saved"))
+	loaded, err := config.Load("")
+	assert.NoError(t, err)
+	if assert.Len(t, loaded.Agents, 1) && assert.Len(t, loaded.Agents[0].Channels, 1) {
+		assert.True(t, config.BoolOr(loaded.Agents[0].Channels[0].ToolProgress, false))
+	}
+	out, err = d.CallTool(context.Background(), "config_get", map[string]any{})
+	assert.NoError(t, err)
+	assert.Contains(t, out, `"tool_progress": true`)
+	toolCallContains(t, d, "config_save", map[string]any{"config": `{"agents":[{"name":"bot","channels":[{"type":"signal","tool_progress":false}]}]}`}, "tool_progress is only supported for Slack")
 
 	state, err := store.ReadAppState()
 	assert.NoError(t, err)
@@ -1312,6 +1324,65 @@ func TestAgentRun_StoppedRunnerReturnsWithoutWaiting(t *testing.T) {
 		require.Contains(t, out, "restarting")
 	}
 	require.NoError(t, ctx.Err(), "rejected admission left MCP waiting for a callback")
+}
+
+func TestAgentRun_AcceptedRunnerStopDoesNotAskClientToRetry(t *testing.T) {
+	store.SetDataDir(t.TempDir())
+	t.Cleanup(func() { store.SetDataDir("") })
+	require.NoError(t, store.EnsureDirs())
+	old := GetDeps()
+	t.Cleanup(func() { SetDeps(old) })
+	started := make(chan struct{})
+	releaseProvider := make(chan struct{})
+	defer close(releaseProvider)
+	providerServer := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		close(started)
+		select {
+		case <-request.Context().Done():
+		case <-releaseProvider:
+		}
+	}))
+	t.Cleanup(providerServer.Close)
+	factory := llm.NewFactory(func(string) (string, error) { return "", nil }).WithProviderOptionsResolver(func(provider string) (llm.ProviderOptions, bool) {
+		if provider != "vllm" {
+			return llm.ProviderOptions{}, false
+		}
+		return llm.ProviderOptions{BaseURI: providerServer.URL}, true
+	})
+	mgr := agent.NewManager(factory)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test-model"}}})
+	SetDeps(&Deps{Agents: mgr})
+	client, err := NewInProcessClient(context.Background(), NewServer())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, client.Close()) })
+	result := make(chan string, 1)
+	go func() {
+		response, callErr := client.CallTool(context.Background(), "agent_run", map[string]any{"name": "bot", "message": "fake request"})
+		if callErr != nil {
+			result <- callErr.Error()
+			return
+		}
+		result <- extractText(response)
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("accepted MCP run did not reach provider")
+	}
+	runner, ok := mgr.Get("bot")
+	require.True(t, ok)
+	runner.Stop()
+	select {
+	case outcome := <-result:
+		require.Contains(t, outcome, "recovery will resume the accepted request")
+		require.NotContains(t, outcome, "retry the request")
+	case <-time.After(3 * time.Second):
+		t.Fatal("MCP run did not report runner stop")
+	}
+	runner.Wait()
+	entries, err := os.ReadDir(store.CheckpointDir("bot"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "accepted run remains available for recovery")
 }
 
 // ── job_run_now with nil scheduler ────────────────────────────────────────────

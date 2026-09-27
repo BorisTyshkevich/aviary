@@ -105,6 +105,16 @@ type recordingToolClient struct {
 	results map[string]string
 }
 
+type failingToolClient struct{}
+
+func (*failingToolClient) ListTools(context.Context) ([]ToolInfo, error) {
+	return []ToolInfo{{Name: "registered_tool"}}, nil
+}
+func (*failingToolClient) CallToolText(context.Context, string, map[string]any) (string, error) {
+	return "", errors.New("fake-secret error at /private/path")
+}
+func (*failingToolClient) Close() error { return nil }
+
 func (r *recordingToolClient) ListTools(_ context.Context) ([]ToolInfo, error) { return r.tools, nil }
 
 func (r *recordingToolClient) CallToolText(_ context.Context, name string, args map[string]any) (string, error) {
@@ -172,6 +182,7 @@ func TestAgentRunner_PersistsToolMessagesSeparately(t *testing.T) {
 
 	var gotText strings.Builder
 	var toolEvents []ToolEvent
+	var publicEvents []PublicToolEvent
 	done := make(chan struct{}, 1)
 	runner.Prompt(WithSessionID(context.Background(), sess.ID), "search", func(e StreamEvent) {
 		switch e.Type {
@@ -180,6 +191,10 @@ func TestAgentRunner_PersistsToolMessagesSeparately(t *testing.T) {
 		case StreamEventTool:
 			if e.Tool != nil {
 				toolEvents = append(toolEvents, *e.Tool)
+			}
+		case StreamEventToolProgress:
+			if e.PublicTool != nil {
+				publicEvents = append(publicEvents, *e.PublicTool)
 			}
 		case StreamEventDone, StreamEventError, StreamEventStop:
 			select {
@@ -194,8 +209,17 @@ func TestAgentRunner_PersistsToolMessagesSeparately(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		assert.FailNow(t, "timeout")
 	}
+	runner.Wait()
 
 	assert.Len(t, toolEvents, 2)
+	assert.Equal(t, ToolStateStarted, toolEvents[0].State)
+	assert.Equal(t, ToolStateSucceeded, toolEvents[1].State)
+	assert.NotEmpty(t, toolEvents[0].InvocationID)
+	assert.Equal(t, toolEvents[0].InvocationID, toolEvents[1].InvocationID)
+	assert.Equal(t, []PublicToolEvent{
+		{Name: "web_search", InvocationID: toolEvents[0].InvocationID, State: ToolStateStarted},
+		{Name: "web_search", InvocationID: toolEvents[0].InvocationID, State: ToolStateSucceeded},
+	}, publicEvents)
 	assert.Equal(t, "web_search", toolEvents[0].Name)
 	assert.Empty(t, toolEvents[0].Result)
 	assert.Equal(t, "web_search", toolEvents[1].Name)
@@ -216,6 +240,95 @@ func TestAgentRunner_PersistsToolMessagesSeparately(t *testing.T) {
 	assert.Contains(t, msgs[len(msgs)-2].Content, `"name":"web_search"`)
 	assert.Equal(t, domain.MessageRoleAssistant, msgs[len(msgs)-1].Role)
 	assert.Equal(t, "final answer", msgs[len(msgs)-1].Content)
+}
+
+func TestPublicToolProjectionRequiresRegisteredName(t *testing.T) {
+	registered := map[string]string{"web_search": "web_search"}
+	for _, state := range []ToolState{ToolStateStarted, ToolStateSucceeded, ToolStateFailed} {
+		public, ok := projectPublicToolEvent(registered, "web_search", "tool_1", state)
+		assert.True(t, ok)
+		assert.Equal(t, PublicToolEvent{Name: "web_search", InvocationID: "tool_1", State: state}, public)
+	}
+	_, ok := projectPublicToolEvent(registered, "model_invented_fake_secret", "tool_2", ToolStateStarted)
+	assert.False(t, ok)
+	_, ok = projectPublicToolEvent(registered, "web_search", "", ToolStateStarted)
+	assert.False(t, ok)
+	_, ok = projectPublicToolEvent(registered, "web_search", "tool_3", ToolState("unknown"))
+	assert.False(t, ok)
+}
+
+func TestRepeatedIdenticalToolCallsHaveDistinctIDsAndEmptySuccess(t *testing.T) {
+	setTestDataDir(t)
+	client := &recordingToolClient{tools: []ToolInfo{{Name: "empty_tool"}}}
+	SetToolClientFactory(func(context.Context) (ToolClient, error) { return client, nil })
+	t.Cleanup(func() { SetToolClientFactory(nil) })
+	provider := &sequenceProvider{responses: [][]llm.Event{
+		{
+			{Type: llm.EventTypeToolCall, ToolCall: &llm.ToolCall{Name: "empty_tool", Arguments: map[string]any{"value": "fake-secret"}}},
+			{Type: llm.EventTypeToolCall, ToolCall: &llm.ToolCall{Name: "empty_tool", Arguments: map[string]any{"value": "fake-secret"}}},
+			{Type: llm.EventTypeDone},
+		},
+		{{Type: llm.EventTypeText, Text: "done"}, {Type: llm.EventTypeDone}},
+	}}
+	runner := NewAgentRunner(&domain.Agent{ID: "repeat-tools", Model: "test/model"}, &config.AgentConfig{Name: "bot"}, provider, nil)
+	t.Cleanup(runner.Wait)
+	var raw []ToolEvent
+	var public []PublicToolEvent
+	done := make(chan struct{}, 1)
+	runner.Prompt(context.Background(), "run", func(e StreamEvent) {
+		if e.Tool != nil {
+			raw = append(raw, *e.Tool)
+		}
+		if e.PublicTool != nil {
+			public = append(public, *e.PublicTool)
+		}
+		if e.Type == StreamEventDone {
+			done <- struct{}{}
+		}
+	})
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		assert.FailNow(t, "timeout")
+	}
+	runner.Wait()
+	if assert.Len(t, raw, 4) && assert.Len(t, public, 4) {
+		assert.Equal(t, raw[0].InvocationID, raw[1].InvocationID)
+		assert.Equal(t, raw[2].InvocationID, raw[3].InvocationID)
+		assert.NotEqual(t, raw[0].InvocationID, raw[2].InvocationID)
+		assert.Equal(t, ToolStateSucceeded, raw[1].State)
+		assert.Empty(t, raw[1].Result)
+		assert.Equal(t, ToolStateSucceeded, public[1].State)
+		assert.Equal(t, raw[0].InvocationID, public[0].InvocationID)
+		assert.Equal(t, raw[2].InvocationID, public[2].InvocationID)
+		assert.Equal(t, "empty_tool", public[0].Name)
+	}
+}
+
+func TestFailedToolProjectsOnlyRegisteredNameAndState(t *testing.T) {
+	setTestDataDir(t)
+	runner := NewAgentRunner(&domain.Agent{ID: "failed-tool"}, &config.AgentConfig{Name: "bot"}, nil, nil)
+	var raw []ToolEvent
+	var public []PublicToolEvent
+	result, stopped := runner.executeToolCall(context.Background(), func(event StreamEvent) {
+		if event.Tool != nil {
+			raw = append(raw, *event.Tool)
+		}
+		if event.PublicTool != nil {
+			public = append(public, *event.PublicTool)
+		}
+	}, &failingToolClient{}, "main", nil,
+		toolEventRecord{Name: "registered_tool"}, "registered_tool",
+		map[string]any{"command": "fake-secret command", "path": "/private/path"},
+		map[string]string{"registered_tool": "registered_tool"}, "tool_failure")
+	assert.False(t, stopped)
+	assert.Contains(t, result, "fake-secret error")
+	if assert.Len(t, raw, 2) && assert.Len(t, public, 2) {
+		assert.Equal(t, ToolStateFailed, raw[1].State)
+		assert.Contains(t, raw[1].Error, "fake-secret error")
+		assert.Equal(t, PublicToolEvent{Name: "registered_tool", InvocationID: "tool_failure", State: ToolStateStarted}, public[0])
+		assert.Equal(t, PublicToolEvent{Name: "registered_tool", InvocationID: "tool_failure", State: ToolStateFailed}, public[1])
+	}
 }
 
 func TestAgentRunner_NormalizesSessionHistoryCurrentSessionID(t *testing.T) {
@@ -661,6 +774,7 @@ func TestAgentRunner_WithProvider(t *testing.T) {
 func TestAgentRunner_ErrorCases(t *testing.T) {
 	t.Run("stream setup error", func(t *testing.T) {
 		runner := NewAgentRunner(&domain.Agent{ID: "a1", Model: "anthropic/test"}, &config.AgentConfig{Name: "bot"}, &mockProvider{err: errors.New("boom")}, nil)
+		t.Cleanup(runner.Wait)
 		errCh := make(chan error, 1)
 		runner.Prompt(context.Background(), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
@@ -677,24 +791,27 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 
 	t.Run("stream setup error delivers to session channel", func(t *testing.T) {
 		var delivered string
-		RegisterSessionDelivery("a1", "sess-stream-setup-error", "signal", "+1", func(text string) { delivered = text })
+		RegisterSessionDelivery("a1", "sess-stream-setup-error", "slack", "C1", func(text string) { delivered = text })
+		const sensitiveError = "provider failed for fake-secret and /private/path"
 
 		runner := NewAgentRunner(
 			&domain.Agent{ID: "a1", Model: "anthropic/test"},
 			&config.AgentConfig{Name: "bot"},
-			&mockProvider{err: errors.New("boom")},
+			&mockProvider{err: errors.New(sensitiveError)},
 			nil,
 		)
+		t.Cleanup(runner.Wait)
 
 		done := make(chan struct{}, 1)
 		runner.Prompt(WithSessionID(context.Background(), "sess-stream-setup-error"), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
+				assert.ErrorContains(t, e.Err, sensitiveError)
 				done <- struct{}{}
 			}
 		})
 		select {
 		case <-done:
-			assert.Equal(t, "Error: boom", delivered)
+			assert.Equal(t, "Unable to complete this request.", delivered)
 		case <-time.After(2 * time.Second):
 			assert.FailNow(t, "timeout")
 		}
@@ -702,6 +819,7 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 
 	t.Run("stream event error", func(t *testing.T) {
 		runner := NewAgentRunner(&domain.Agent{ID: "a1", Model: "anthropic/test"}, &config.AgentConfig{Name: "bot"}, &mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New("event boom")}}}, nil)
+		t.Cleanup(runner.Wait)
 		errCh := make(chan error, 1)
 		runner.Prompt(context.Background(), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
@@ -718,24 +836,27 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 
 	t.Run("stream event error delivers to session channel", func(t *testing.T) {
 		var delivered string
-		RegisterSessionDelivery("a1", "sess-stream-event-error", "signal", "+1", func(text string) { delivered = text })
+		RegisterSessionDelivery("a1", "sess-stream-event-error", "slack", "C1", func(text string) { delivered = text })
+		const sensitiveError = "event failed for fake-secret and /private/path"
 
 		runner := NewAgentRunner(
 			&domain.Agent{ID: "a1", Model: "anthropic/test"},
 			&config.AgentConfig{Name: "bot"},
-			&mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New("event boom")}}},
+			&mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New(sensitiveError)}}},
 			nil,
 		)
+		t.Cleanup(runner.Wait)
 
 		done := make(chan struct{}, 1)
 		runner.Prompt(WithSessionID(context.Background(), "sess-stream-event-error"), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
+				assert.ErrorContains(t, e.Err, sensitiveError)
 				done <- struct{}{}
 			}
 		})
 		select {
 		case <-done:
-			assert.Equal(t, "Error: event boom", delivered)
+			assert.Equal(t, "Unable to complete this request.", delivered)
 		case <-time.After(2 * time.Second):
 			assert.FailNow(t, "timeout")
 		}
@@ -753,6 +874,7 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 			&mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New("429 rate limit")}}},
 			nil,
 		)
+		t.Cleanup(runner.Wait)
 
 		errCh := make(chan error, 1)
 		runner.Prompt(WithSessionID(context.Background(), sessionID), "hi", func(e StreamEvent) {
@@ -789,6 +911,28 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+}
+
+func TestNoProviderDoesNotExposeModelToSlackDelivery(t *testing.T) {
+	const sessionID = "sess-no-provider-public-error"
+	var delivered string
+	RegisterSessionDelivery("a1", sessionID, "slack", "C1", func(text string) { delivered = text })
+	runner := NewAgentRunner(&domain.Agent{ID: "a1", Model: "fake-secret-model"}, &config.AgentConfig{Name: "bot"}, nil, nil)
+	t.Cleanup(runner.Wait)
+	done := make(chan StreamEvent, 1)
+	runner.Prompt(WithSessionID(context.Background(), sessionID), "hi", func(e StreamEvent) {
+		if e.Type == StreamEventDone {
+			done <- e
+		}
+	})
+	select {
+	case event := <-done:
+		assert.Equal(t, "Unable to complete this request.", delivered)
+		assert.Equal(t, delivered, event.Text)
+		assert.NotContains(t, event.Text, "fake-secret-model")
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "timeout")
+	}
 }
 
 func TestAgentRunner_StopAndAccessors(t *testing.T) {

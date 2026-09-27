@@ -42,7 +42,7 @@ Covers the `server`, `models`, `browser`, `scheduler`, and `search` config secti
 
 Each configured agent has its own editor panel with tabs for:
 
-- **General** — name, model, fallbacks, working directory, rules, memory, and verbose mode.
+- **General** — name, model, fallbacks, working directory, rules, and memory.
 - **Permissions** — preset selector, tool allow/blocklist, filesystem paths, and exec rules.
 - **Channels** - add, edit, or remove Slack/Discord/Signal channel connections and their `allow_from` rules. Slack channels can also validate the bot token and browse visible workspace channels directly from the UI.
 - **Tasks** — add, edit, or remove scheduled and file-watch tasks.

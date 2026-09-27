@@ -13,7 +13,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 
 	"github.com/lsegal/aviary/internal/agent"
@@ -134,15 +136,48 @@ func TestAgentRunPreparationArtifactReadThroughMCP(t *testing.T) {
 	agent.SetToolClientFactory(NewAgentToolClient)
 	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
 
-	client, err := NewInProcessClient(context.Background(), NewServer())
+	toolProgress := make(chan map[string]any, 4)
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "test-client", Version: "1"}, &sdkmcp.ClientOptions{
+		ProgressNotificationHandler: func(_ context.Context, req *sdkmcp.ProgressNotificationClientRequest) {
+			if !strings.HasPrefix(req.Params.Message, "[tool]") {
+				return
+			}
+			var payload map[string]any
+			if json.Unmarshal([]byte(strings.TrimPrefix(req.Params.Message, "[tool]")), &payload) == nil {
+				toolProgress <- payload
+			}
+		},
+	})
+	clientTransport, serverTransport := sdkmcp.NewInMemoryTransports()
+	connectionCtx, cancelConnection := context.WithCancel(context.Background())
+	t.Cleanup(cancelConnection)
+	go func() { _, _ = NewServer().Connect(connectionCtx, serverTransport, nil) }()
+	mcpSession, err := client.Connect(connectionCtx, clientTransport, nil)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, client.Close()) })
-	result, err := client.CallTool(context.Background(), "agent_run", map[string]any{
-		"name": "prepared", "message": "Read the indexed evidence and answer.", "history": false,
+	t.Cleanup(func() { require.NoError(t, mcpSession.Close()) })
+	result, err := mcpSession.CallTool(context.Background(), &sdkmcp.CallToolParams{
+		Name:      "agent_run",
+		Arguments: map[string]any{"name": "prepared", "message": "Read the indexed evidence and answer.", "history": false, "include_tool_progress": true},
+		Meta:      sdkmcp.Meta{"progressToken": "tool-progress-test"},
 	})
 	require.NoError(t, err)
 	require.False(t, result.IsError, extractText(result))
 	require.Equal(t, "evidence read successfully", extractText(result))
+	var progress []map[string]any
+	for range 2 {
+		select {
+		case payload := <-toolProgress:
+			progress = append(progress, payload)
+		case <-time.After(3 * time.Second):
+			t.Fatal("missing authenticated MCP tool progress")
+		}
+	}
+	require.Equal(t, "artifact_read", progress[0]["name"])
+	require.Equal(t, "started", progress[0]["state"])
+	require.Equal(t, "succeeded", progress[1]["state"])
+	require.NotEmpty(t, progress[0]["invocation_id"])
+	require.Equal(t, progress[0]["invocation_id"], progress[1]["invocation_id"])
+	require.Equal(t, "evidence.txt", progress[0]["args"].(map[string]any)["path"])
 	session, err := agent.NewSessionManager().GetOrCreateNamed("prepared", "main")
 	require.NoError(t, err)
 	messages, err := store.ReadJSONL[domain.Message](store.SessionPath("prepared", session.ID))

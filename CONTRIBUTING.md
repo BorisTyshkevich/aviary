@@ -118,6 +118,8 @@ pnpm test             # Go tests + e2e; run pnpm lint separately for code change
 
 For direct connection fixtures and preparation/MCP smoke coverage, see
 [Direct connections verification](docs/testing/direct-connections.md).
+For Slack status checks and runner teardown test ordering, see
+[Slack lifecycle verification](docs/testing/slack-lifecycle.md).
 
 For prompt admission, shutdown ordering, and recovery limits, see
 [Runner lifecycle and shutdown](docs/testing/runner-lifecycle.md).

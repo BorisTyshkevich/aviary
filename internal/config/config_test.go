@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -25,6 +26,19 @@ func TestDefault(t *testing.T) {
 	assert.True(t, EffectivePrecomputeTasks(cfg.Scheduler))
 	assert.True(t, EffectiveBrowserReuseTabs(cfg.Browser))
 
+}
+
+func TestAgentConfigDropsRemovedVerboseSetting(t *testing.T) {
+	var agent AgentConfig
+	assert.NoError(t, yaml.Unmarshal([]byte("name: assistant\nmodel: test/model\nverbose: true\n"), &agent))
+
+	yamlData, err := yaml.Marshal(agent)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(yamlData), "verbose")
+
+	jsonData, err := json.Marshal(agent)
+	assert.NoError(t, err)
+	assert.NotContains(t, string(jsonData), "verbose")
 }
 
 func TestValidateConnections(t *testing.T) {
@@ -879,6 +893,40 @@ func TestValidate_ShowTypingAllowedOnSignal(t *testing.T) {
 	issues := Validate(cfg, nil)
 	assert.False(t, hasIssue(issues, "show_typing is only supported"))
 
+}
+
+func TestToolProgressSlackOnlyAndDefaultsOff(t *testing.T) {
+	assert.Nil(t, ChannelConfig{Type: "slack"}.ToolProgress)
+	for _, enabled := range []bool{false, true} {
+		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
+			channel := ChannelConfig{Type: "slack", ToolProgress: &enabled}
+			cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{channel}}}}
+			assert.False(t, hasIssue(Validate(&cfg, nil), "tool_progress"))
+			yamlData, err := yaml.Marshal(channel)
+			assert.NoError(t, err)
+			var fromYAML ChannelConfig
+			assert.NoError(t, yaml.Unmarshal(yamlData, &fromYAML))
+			assert.Equal(t, channel.ToolProgress, fromYAML.ToolProgress)
+			jsonData, err := json.Marshal(channel)
+			assert.NoError(t, err)
+			var fromJSON ChannelConfig
+			assert.NoError(t, json.Unmarshal(jsonData, &fromJSON))
+			assert.Equal(t, channel.ToolProgress, fromJSON.ToolProgress)
+		})
+	}
+	for _, typ := range []string{"signal", "discord"} {
+		for _, enabled := range []bool{false, true} {
+			cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{{Type: typ, ToolProgress: &enabled}}}}}
+			assert.True(t, hasIssue(Validate(&cfg, nil), "tool_progress is only supported for Slack channels"))
+			disabled := false
+			cfg.Agents[0].Channels[0].Enabled = &disabled
+			assert.True(t, hasIssue(Validate(&cfg, nil), "tool_progress is only supported for Slack channels"))
+		}
+	}
+	var fromYAML ChannelConfig
+	assert.Error(t, yaml.Unmarshal([]byte("type: slack\ntool_progress: yes-please\n"), &fromYAML))
+	var fromJSON ChannelConfig
+	assert.Error(t, json.Unmarshal([]byte(`{"type":"slack","tool_progress":"true"}`), &fromJSON))
 }
 
 func TestValidate_StdioModelMissingCommand(t *testing.T) {

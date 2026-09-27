@@ -376,7 +376,7 @@ func TestAgentRun_UsesExactSessionID(t *testing.T) {
 		"session_id": sess.ID,
 	})
 	require.NoError(t, err)
-	assert.Contains(t, extractText(res), "no LLM provider configured")
+	assert.Contains(t, extractText(res), "Unable to complete this request.")
 
 	lines, err := store.ReadJSONL[domain.Message](store.SessionPath("assistant", sess.ID))
 	require.NoError(t, err)

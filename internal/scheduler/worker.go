@@ -14,6 +14,7 @@ import (
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
+	"github.com/lsegal/aviary/internal/store"
 )
 
 var errUnadmittedJob = errors.New("scheduled agent run was not admitted")
@@ -28,6 +29,7 @@ type WorkerPool struct {
 	wg       sync.WaitGroup
 	stopOnce sync.Once
 	stop     chan struct{}
+	claimMu  sync.Mutex
 	ctxMu    sync.RWMutex
 	ctx      context.Context
 	deliver  func(agentName, route, text string) error
@@ -70,8 +72,16 @@ func (p *WorkerPool) Start(ctx context.Context) {
 
 // Stop signals all workers to exit and waits for them.
 func (p *WorkerPool) Stop() {
-	p.stopOnce.Do(func() { close(p.stop) })
+	p.StopClaims()
 	p.wg.Wait()
+}
+
+// StopClaims closes admission to the queue without canceling work already
+// claimed. The claim lock makes return from this method a claim barrier.
+func (p *WorkerPool) StopClaims() {
+	p.claimMu.Lock()
+	p.stopOnce.Do(func() { close(p.stop) })
+	p.claimMu.Unlock()
 }
 
 func (p *WorkerPool) run(ctx context.Context) {
@@ -85,7 +95,15 @@ func (p *WorkerPool) run(ctx context.Context) {
 		default:
 		}
 
+		p.claimMu.Lock()
+		select {
+		case <-p.stop:
+			p.claimMu.Unlock()
+			return
+		default:
+		}
 		job, err := p.queue.Claim()
+		p.claimMu.Unlock()
 		if err != nil {
 			slog.Warn("worker: claim error", "err", err)
 		}
@@ -122,13 +140,14 @@ func (p *WorkerPool) ExecuteNow(job *domain.Job) {
 }
 
 func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
+	defer releaseLiveJob(store.JobPath(job.AgentID, job.ID))
 	jobCtx, cancel := context.WithCancel(ctx)
 	p.registerActiveJob(job.ID, job.TaskID, job.AgentID, cancel)
 	defer p.unregisterActiveJob(job.ID)
 
 	stopHeartbeat := make(chan struct{})
 	defer close(stopHeartbeat)
-	go p.heartbeatJob(jobCtx, job.ID, stopHeartbeat)
+	go p.heartbeatJob(job.ID, stopHeartbeat)
 
 	slog.Info("executing job", "id", job.ID, "task", job.TaskID, "agent", job.AgentID)
 	if err := p.executeJob(jobCtx, job); err != nil {
@@ -165,7 +184,7 @@ func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
 	}
 }
 
-func (p *WorkerPool) heartbeatJob(ctx context.Context, jobID string, stop <-chan struct{}) {
+func (p *WorkerPool) heartbeatJob(jobID string, stop <-chan struct{}) {
 	ticker := time.NewTicker(lockHeartbeat)
 	defer ticker.Stop()
 
@@ -176,8 +195,6 @@ func (p *WorkerPool) heartbeatJob(ctx context.Context, jobID string, stop <-chan
 				slog.Warn("job: heartbeat failed", "id", jobID, "err", err)
 			}
 		case <-stop:
-			return
-		case <-ctx.Done():
 			return
 		}
 	}
@@ -245,8 +262,6 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 		switch e.Type {
 		case agent.StreamEventText:
 			reply.WriteString(e.Text)
-		case agent.StreamEventStatus:
-			logs.Addf("status: %s", e.Text)
 		case agent.StreamEventMedia:
 			logs.Addf("media: %s", e.MediaURL)
 		case agent.StreamEventDone, agent.StreamEventStop:
@@ -276,7 +291,10 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 		case lastErr = <-terminal:
 		default:
 			if runner.Stopping() {
-				return fmt.Errorf("scheduled agent run stopped: %s", agent.StopCauseRunner)
+				// A replacement server must not reclaim this job while the
+				// accepted run still owns its terminal callback.
+				lastErr = <-terminal
+				break
 			}
 			return ctx.Err()
 		}

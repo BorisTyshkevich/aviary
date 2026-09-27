@@ -4,7 +4,6 @@ package server
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -16,8 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/slack-go/slack"
 
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/auth"
@@ -388,7 +385,9 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		}
 		s.watcher.Stop()
 		s.skillsWatcher.Stop()
-		s.nonSlackIngressClosed.Store(true)
+		if s.sched != nil {
+			s.sched.StopClaims()
+		}
 		// Shutdown closes the HTTP listener immediately, but waiting for active
 		// requests must not postpone Socket Mode ingress quiescence.
 		httpStopped := make(chan error, 1)
@@ -403,6 +402,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Warn("server: HTTP listener stopped with error", "err", err)
 		}
+		s.nonSlackIngressClosed.Store(true)
 		s.agents.Stop()
 		if s.sched != nil {
 			stopped := make(chan struct{})
@@ -453,6 +453,7 @@ func (s *Server) terminalContext(runCtx context.Context, budget time.Duration) (
 
 func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, channelType, configuredID string, ch channels.Channel, msg channels.IncomingMessage) {
 	if channelType != "slack" && s.nonSlackIngressClosed.Load() {
+		s.sendAdmissionResendNotice(ch, msg)
 		return
 	}
 	originalChannel, originalMessage := ch, msg
@@ -494,60 +495,13 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	channelCfg, _ := s.findChannelConfig(agentName, channelType, configuredID)
 	msgCtx = attachSession(channelCfg, msg)
 
+	var stateMu sync.Mutex
+	var terminalSelected bool
+	var statusStarted bool
 	var stopTyping context.CancelFunc
 	var startTyping func()
-	configureTyping := func(candidate channels.Channel, cc config.ChannelConfig) {
-		startTyping = nil
-		ts, ok := candidate.(channels.TypingSender)
-		if !ok {
-			return
-		}
-		enabled := ts.ShowTyping()
-		if channelType == "slack" {
-			enabled = config.BoolOr(cc.ShowTyping, true)
-		}
-		if !enabled {
-			return
-		}
-		startTyping = func() {
-			_ = ts.SendTyping(msg.Channel, false)
-			typingCtx, cancel := context.WithCancel(ctx)
-			stopTyping = cancel
-			go func() {
-				ticker := time.NewTicker(10 * time.Second)
-				defer ticker.Stop()
-				defer ts.SendTyping(msg.Channel, true) //nolint:errcheck
-				for {
-					select {
-					case <-typingCtx.Done():
-						return
-					case <-ticker.C:
-						_ = ts.SendTyping(msg.Channel, false)
-					}
-				}
-			}()
-		}
-	}
-	configureTyping(ch, channelCfg)
-
-	var clearAssistantStatus, startAssistantStatus func()
-	var statusMu sync.Mutex
-	var terminalSelected bool
-	configureAssistantStatus := func(candidate channels.Channel, cc config.ChannelConfig) {
-		startAssistantStatus, clearAssistantStatus = nil, nil
-		as, ok := candidate.(channels.AssistantStatusSender)
-		if !ok || !as.ShowAssistantStatus() || (channelType == "slack" && !config.BoolOr(cc.ShowTyping, true)) || strings.TrimSpace(msg.ThreadTS) == "" {
-			return
-		}
-		sendAssistantStatus := func(status string) {
-			if err := as.SendAssistantStatus(msg.Channel, msg.ThreadTS, slackAssistantStatusText(status)); err != nil {
-				slog.Debug("server: failed to update assistant status", "type", channelType, "channel", msg.Channel, "err", err)
-			}
-		}
-		startAssistantStatus = func() { sendAssistantStatus("thinking") }
-		clearAssistantStatus = func() { sendAssistantStatus("") }
-	}
-	configureAssistantStatus(ch, channelCfg)
+	var assistantStatus *slackRunStatus
+	var presenter *slackPresenter
 
 	rOpts := agent.RunOverrides{
 		Model:         msg.Model,
@@ -556,112 +510,115 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		DisabledTools: msg.DisabledTools,
 	}
 
-	// If this message quotes another message, include the quoted author/text
-	// in the message text so it becomes part of the prompt/session history.
+	// Quoted context is part of the admitted prompt on either accepted attempt.
 	if strings.TrimSpace(msg.QuoteAuthor) != "" && strings.TrimSpace(msg.QuoteText) != "" {
-		// Prefix the incoming user text with the quoted line and author.
 		msg.Text = fmt.Sprintf("%s: %s\n\n%s", msg.QuoteAuthor, msg.QuoteText, msg.Text)
 	}
 
-	// Verbose mode: send/edit a live status message for each tool call.
-	var (
-		statusMsgID string
-		statusLines []string
-	)
-	sendOrEditStatus := func(newLine string) {
-		statusLines = append(statusLines, newLine)
-		text := strings.Join(statusLines, "\n")
-		if statusMsgID == "" {
-			if sender, ok := ch.(channels.MessageSenderWithID); ok {
-				id, err := sender.SendAndGetID(msg.Channel, text)
-				if err == nil {
-					statusMsgID = id
+	configureRun := func(candidate channels.Channel, cc config.ChannelConfig, incoming channels.IncomingMessage) {
+		startTyping = nil
+		stopTyping = nil
+		assistantStatus = nil
+		statusStarted = false
+		presenter = nil
+		if ts, ok := candidate.(channels.TypingSender); ok {
+			enabled := ts.ShowTyping()
+			if channelType == "slack" {
+				enabled = config.BoolOr(cc.ShowTyping, true)
+			}
+			if enabled {
+				startTyping = func() {
+					_ = ts.SendTyping(incoming.Channel, false)
+					typingCtx, cancel := context.WithCancel(ctx)
+					stopTyping = cancel
+					go func() {
+						ticker := time.NewTicker(10 * time.Second)
+						defer ticker.Stop()
+						defer ts.SendTyping(incoming.Channel, true) //nolint:errcheck
+						for {
+							select {
+							case <-typingCtx.Done():
+								return
+							case <-ticker.C:
+								_ = ts.SendTyping(incoming.Channel, false)
+							}
+						}
+					}()
 				}
-			} else {
-				_ = ch.Send(msg.Channel, newLine)
 			}
-		} else if editor, ok := ch.(channels.MessageEditor); ok {
-			_ = editor.EditMessage(msg.Channel, statusMsgID, text)
-		} else {
-			_ = ch.Send(msg.Channel, newLine)
 		}
-	}
-	var slackStreamer *slackThreadStreamer
-	configurePresenter := func(candidate channels.Channel, incoming channels.IncomingMessage) {
-		slackStreamer = newSlackThreadStreamer(channelType, candidate, incoming)
-		rOpts.SuppressDelivery = slackStreamer != nil
-		rOpts.DeferAnswerPersistence = false
-		if slackStreamer != nil {
-			slackStreamer.summarize = func(ctx context.Context, model, answer string) (string, error) {
-				return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+		if channelType == "slack" && config.BoolOr(cc.ShowTyping, true) && strings.TrimSpace(incoming.ThreadTS) != "" {
+			if sender, ok := candidate.(channels.AssistantStatusSender); ok {
+				assistantStatus = newSlackRunStatus(sender, incoming.Channel, incoming.ThreadTS)
 			}
+		}
+		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
+			if sender, ok := candidate.(slackPresenterSender); ok {
+				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, config.BoolOr(cc.ToolProgress, false))
+				presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {
+					return summarizeSlackAnswer(ctx, s.llmFactory, model, answer)
+				}
+			}
+		}
+		rOpts.SuppressDelivery = presenter != nil
+		rOpts.DeferAnswerPersistence = false
+		if presenter != nil {
 			execution, _ := connections.ExecutionFromContext(msgCtx)
 			rOpts.DeferAnswerPersistence = execution.Personal()
 		}
 	}
-	configurePresenter(ch, msg)
+	configureRun(ch, channelCfg, msg)
 
 	consumer := func(e agent.StreamEvent) {
-		if e.Type == agent.StreamEventDone || e.Type == agent.StreamEventStop || e.Type == agent.StreamEventError {
-			statusMu.Lock()
-			terminalSelected = true
-			clearStatus := clearAssistantStatus
-			stopActivity := stopTyping
-			clearAssistantStatus = nil
-			stopTyping = nil
-			statusMu.Unlock()
-			if stopActivity != nil {
-				defer stopActivity()
+		if e.Type == agent.StreamEventToolProgress {
+			if presenter != nil && !e.Private && e.PublicTool != nil {
+				presenter.Tool(e.PublicTool.Name, e.PublicTool.InvocationID, string(e.PublicTool.State))
 			}
-			if clearStatus != nil {
-				defer clearStatus()
-			}
+			return
 		}
+		if e.Type != agent.StreamEventDone && e.Type != agent.StreamEventStop && e.Type != agent.StreamEventError {
+			return
+		}
+		stateMu.Lock()
+		if terminalSelected {
+			stateMu.Unlock()
+			return
+		}
+		terminalSelected = true
+		activeStatus := (*slackRunStatus)(nil)
+		if statusStarted {
+			activeStatus = assistantStatus
+		}
+		stopActivity := stopTyping
+		stopTyping = nil
+		selectedPresenter := presenter
+		selectedCtx := msgCtx
+		deferPersistence := rOpts.DeferAnswerPersistence
+		stateMu.Unlock()
+		if stopActivity != nil {
+			stopActivity()
+		}
+		if selectedPresenter == nil {
+			if activeStatus != nil {
+				activeStatus.Finish(false)
+			}
+			return
+		}
+		terminalCtx, cancel := s.terminalContext(selectedCtx, slackTerminalTimeout)
+		selectedPresenter.terminalContext = terminalCtx
+		kind := "done"
 		switch e.Type {
-		case agent.StreamEventTool:
-			if e.Private {
-				return
-			}
-			if slackStreamer != nil && e.Tool != nil {
-				if status := slackToolStatusText(e.Tool); status != "" {
-					if as, ok := ch.(channels.AssistantStatusSender); ok && as.ShowAssistantStatus() && strings.TrimSpace(msg.ThreadTS) != "" {
-						if err := as.SendAssistantStatus(msg.Channel, msg.ThreadTS, status); err != nil {
-							slog.Debug("server: failed to update assistant status", "type", channelType, "channel", msg.Channel, "err", err)
-						}
-					}
-				}
-				if runner.IsVerbose() {
-					slackStreamer.UpsertToolOutput(e.Tool)
-				}
-			}
-		case agent.StreamEventStatus:
-			if e.Private {
-				return
-			}
-			if slackStreamer == nil {
-				sendOrEditStatus(e.Text)
-			}
-			if as, ok := ch.(channels.AssistantStatusSender); ok && as.ShowAssistantStatus() && strings.TrimSpace(msg.ThreadTS) != "" {
-				if err := as.SendAssistantStatus(msg.Channel, msg.ThreadTS, slackAssistantStatusText(e.Text)); err != nil {
-					slog.Debug("server: failed to update assistant status", "type", channelType, "channel", msg.Channel, "err", err)
-				}
-			}
-		case agent.StreamEventError:
-			if slackStreamer != nil && e.Err != nil {
-				slackStreamer.SendPlain("Error: " + e.Err.Error())
-			}
 		case agent.StreamEventStop:
-			if slackStreamer != nil {
-				slackStreamer.SendPlain("Stopped.")
-			}
-		case agent.StreamEventDone:
-			if slackStreamer != nil {
-				if slackStreamer.SendAnswer(msgCtx, e.Model, e.Text) && rOpts.DeferAnswerPersistence {
-					if sessionID, ok := agent.SessionIDFromContext(msgCtx); ok {
-						if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {
-							slog.Warn("server: failed to record delivered answer")
-						}
-					}
+			kind = "stop"
+		case agent.StreamEventError:
+			kind = "error"
+		}
+		result, first := selectedPresenter.Terminal(activeStatus, kind, e.Model, e.Text, e.AlreadyAnswered)
+		cancel()
+		if first && result.Outcome == slackOutcomeAnswer && deferPersistence {
+			if sessionID, ok := agent.SessionIDFromContext(selectedCtx); ok {
+				if err := agent.AppendMessageToSessionWithSender(agentID, sessionID, domain.MessageRoleAssistant, e.Text, nil); err != nil {
+					slog.Warn("server: failed to record delivered answer")
 				}
 			}
 		}
@@ -671,8 +628,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	}
 	admission := submit(runner)
 	if admission.Status == agent.AdmissionRejectedStopping {
-		// Retry only the rejected handoff. A successful admission must never be
-		// submitted again, even if its terminal delivery later fails.
+		// Only rejected handoff is retried. An accepted run owns its outcome.
 		if currentCh, routed, valid := s.channels.RevalidateRoutedMessage(agentName, channelType, configuredID, originalMessage); valid {
 			if replacement, exists := s.agents.Get(agentName); exists {
 				ch = currentCh
@@ -682,10 +638,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				rOpts.RestrictTools, rOpts.DisabledTools = routed.RestrictTools, routed.DisabledTools
 				channelCfg, _ = s.findChannelConfig(agentName, channelType, configuredID)
 				msgCtx = attachSession(channelCfg, routed)
-				configureTyping(ch, channelCfg)
-				configureAssistantStatus(ch, channelCfg)
-				configurePresenter(ch, routed)
-				runner = replacement
+				configureRun(ch, channelCfg, routed)
 				admission = submit(replacement)
 			}
 		}
@@ -694,16 +647,19 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			return
 		}
 	}
-	statusMu.Lock()
+	// The accepted callback can arrive before Prompt returns. Serialize optional
+	// activity startup with terminal selection so it never starts afterward.
+	stateMu.Lock()
 	if !terminalSelected {
 		if startTyping != nil {
 			startTyping()
 		}
-		if startAssistantStatus != nil {
-			startAssistantStatus()
+		if assistantStatus != nil {
+			statusStarted = true
+			assistantStatus.Start()
 		}
 	}
-	statusMu.Unlock()
+	stateMu.Unlock()
 }
 
 func (s *Server) sendAdmissionResendNotice(ch channels.Channel, msg channels.IncomingMessage) {
@@ -780,337 +736,6 @@ func channelSessionNameForIncoming(agentID string, cc config.ChannelConfig, msg 
 		return baseName
 	}
 	return sessionName
-}
-
-type slackThreadStreamer struct {
-	thread    channels.ThreadMessageSender
-	editor    channels.MessageEditor
-	blocks    slackBlockMessageSender
-	answer    slackAnswerSender
-	summarize func(context.Context, string, string) (string, error)
-	channel   string
-	threadTS  string
-	toolMsgID string
-	tools     []slackToolDisclosure
-}
-
-type slackAnswerSender interface {
-	SendThreadPlainText(channel, threadTS, text string) error
-	SendThreadMarkdownFile(ctx context.Context, channel, threadTS, introduction, answer string) error
-}
-
-type slackBlockMessageSender interface {
-	SendThreadBlocksAndGetID(channel, threadTS, fallbackText string, blocks ...slack.Block) (msgID string, err error)
-	EditMessageBlocks(channel, msgID, fallbackText string, blocks ...slack.Block) error
-}
-
-type slackToolDisclosure struct {
-	Name   string
-	Args   map[string]any
-	Result string
-	Error  string
-}
-
-func newSlackThreadStreamer(channelType string, ch channels.Channel, msg channels.IncomingMessage) *slackThreadStreamer {
-	if channelType != "slack" || strings.TrimSpace(msg.ThreadTS) == "" {
-		return nil
-	}
-	thread, ok := ch.(channels.ThreadMessageSender)
-	if !ok {
-		return nil
-	}
-	streamer := &slackThreadStreamer{
-		thread:   thread,
-		channel:  msg.Channel,
-		threadTS: strings.TrimSpace(msg.ThreadTS),
-	}
-	if blocks, ok := ch.(slackBlockMessageSender); ok {
-		streamer.blocks = blocks
-	}
-	if editor, ok := ch.(channels.MessageEditor); ok {
-		streamer.editor = editor
-	}
-	if answer, ok := ch.(slackAnswerSender); ok {
-		streamer.answer = answer
-	}
-	return streamer
-}
-
-func (s *slackThreadStreamer) UpsertToolOutput(tool *agent.ToolEvent) {
-	if s == nil || tool == nil || strings.TrimSpace(tool.Name) == "" {
-		return
-	}
-	if tool.Name == "agent_file_read" {
-		return
-	}
-	disclosure := slackToolDisclosure{
-		Name:   tool.Name,
-		Args:   tool.Args,
-		Result: tool.Result,
-		Error:  tool.Error,
-	}
-	for i := len(s.tools) - 1; i >= 0; i-- {
-		if s.tools[i].Name == tool.Name && sameToolArgs(s.tools[i].Args, tool.Args) {
-			s.tools[i] = disclosure
-			s.FlushTools()
-			return
-		}
-	}
-	s.tools = append(s.tools, disclosure)
-	s.FlushTools()
-}
-
-func (s *slackThreadStreamer) SendAnswer(ctx context.Context, model, answer string) bool {
-	if s == nil || strings.TrimSpace(answer) == "" {
-		return false
-	}
-	if !shouldAttachSlackAnswer(answer) || s.answer == nil {
-		return s.SendPlain(answer)
-	}
-	introduction := "Full answer attached."
-	if s.summarize != nil {
-		if summary, err := s.summarize(ctx, model, answer); err == nil && summary != "" {
-			introduction = summary
-		} else if err != nil {
-			slog.Warn("server: failed to summarize Slack answer", "err", err)
-		}
-	}
-	if err := s.answer.SendThreadMarkdownFile(ctx, s.channel, s.threadTS, introduction, answer); err != nil {
-		slog.Warn("server: failed to upload Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
-		return s.SendPlain(answer)
-	}
-	return true
-}
-
-func (s *slackThreadStreamer) SendPlain(answer string) bool {
-	if s == nil || answer == "" {
-		return false
-	}
-	for _, part := range splitSlackPlainText(answer, 3900) {
-		var err error
-		if s.answer != nil {
-			err = s.answer.SendThreadPlainText(s.channel, s.threadTS, part)
-		} else {
-			_, err = s.thread.SendThreadMessageAndGetID(s.channel, s.threadTS, part)
-		}
-		if err != nil {
-			slog.Warn("server: failed to send Slack answer", "channel", s.channel, "thread", s.threadTS, "err", err)
-			return false
-		}
-	}
-	return true
-}
-
-func (s *slackThreadStreamer) FlushTools() {
-	if s == nil || len(s.tools) == 0 {
-		return
-	}
-	blocks := s.toolBlocks()
-	if len(blocks) == 0 {
-		return
-	}
-	fallback := "Tool calls"
-	if s.toolMsgID == "" {
-		var (
-			id  string
-			err error
-		)
-		if s.blocks != nil {
-			id, err = s.blocks.SendThreadBlocksAndGetID(s.channel, s.threadTS, fallback, blocks...)
-		} else {
-			id, err = s.thread.SendThreadMessageAndGetID(s.channel, s.threadTS, formatToolDisclosuresBlock(s.tools, 2900))
-		}
-		if err == nil {
-			s.toolMsgID = id
-		} else {
-			slog.Debug("server: failed to send Slack tool calls", "channel", s.channel, "thread", s.threadTS, "err", err)
-		}
-		return
-	}
-	if s.blocks != nil {
-		if err := s.blocks.EditMessageBlocks(s.channel, s.toolMsgID, fallback, blocks...); err != nil {
-			slog.Debug("server: failed to edit Slack tool calls", "channel", s.channel, "thread", s.threadTS, "err", err)
-		}
-	}
-}
-
-func (s *slackThreadStreamer) toolBlocks() []slack.Block {
-	if s == nil || len(s.tools) == 0 {
-		return nil
-	}
-	toolText := formatToolDisclosuresBlock(s.tools, 2900)
-	return []slack.Block{slack.NewSectionBlock(slack.NewTextBlockObject(slack.MarkdownType, toolText, false, false), nil, nil, slack.SectionBlockOptionExpand(false))}
-}
-
-func formatToolDisclosuresBlock(tools []slackToolDisclosure, limit int) string {
-	var b strings.Builder
-	b.WriteString(":hammer_and_wrench: *Tool Calls*")
-	for i, tool := range tools {
-		part := formatToolDisclosureEntry(tool)
-		if b.Len()+len(part) > limit {
-			b.WriteString("\n... truncated")
-			return b.String()
-		}
-		b.WriteString(part)
-		if i == 7 && len(tools) > 8 {
-			fmt.Fprintf(&b, "\n... %d more", len(tools)-8)
-			break
-		}
-	}
-	return b.String()
-}
-
-func formatToolSummaryLine(tool slackToolDisclosure) string {
-	status := slackToolDisclosureStatus(tool)
-	input := compactToolInput(tool.Args, 180)
-	if input == "" {
-		return fmt.Sprintf("%s `%s`", status, tool.Name)
-	}
-	return fmt.Sprintf("%s `%s` :arrow_right: `%s`", status, tool.Name, escapeSlackInlineCode(input))
-}
-
-func formatToolDisclosureEntry(tool slackToolDisclosure) string {
-	var b strings.Builder
-	b.WriteString("\n")
-	b.WriteString(formatToolSummaryLine(tool))
-	output := toolOutputText(tool)
-	if output == "" {
-		return b.String()
-	}
-	b.WriteString("\n\n")
-	if strings.TrimSpace(tool.Error) != "" {
-		b.WriteString("Error:")
-	} else {
-		b.WriteString("Output:")
-	}
-	b.WriteString("\n```")
-	b.WriteString(truncateSlackCodeBlock(output, 700))
-	b.WriteString("```")
-	return b.String()
-}
-
-func slackToolDisclosureStatus(tool slackToolDisclosure) string {
-	if strings.TrimSpace(tool.Error) != "" {
-		return ":warning:"
-	}
-	if strings.TrimSpace(tool.Result) == "" {
-		return ":thinking_face:"
-	}
-	return ":white_check_mark:"
-}
-
-func toolOutputText(tool slackToolDisclosure) string {
-	if strings.TrimSpace(tool.Error) != "" {
-		return strings.TrimSpace(tool.Error)
-	}
-	if strings.TrimSpace(tool.Result) != "" && tool.Name != "agent_file_read" {
-		return strings.TrimSpace(tool.Result)
-	}
-	return ""
-}
-
-func compactToolInput(args map[string]any, limit int) string {
-	if len(args) == 0 {
-		return ""
-	}
-	data, err := json.Marshal(args)
-	if err != nil {
-		return ""
-	}
-	return singleLineToolText(string(data), limit)
-}
-
-func singleLineToolText(text string, limit int) string {
-	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-	if limit > 0 && len(text) > limit {
-		if limit <= 3 {
-			return strings.Repeat(".", limit)
-		}
-		return text[:limit-3] + "..."
-	}
-	return text
-}
-
-func truncateSlackCodeBlock(text string, limit int) string {
-	text = strings.TrimSpace(text)
-	text = strings.ReplaceAll(text, "```", "`\u200b``")
-	if limit > 0 && len(text) > limit {
-		if limit <= 3 {
-			return strings.Repeat(".", limit)
-		}
-		return text[:limit-3] + "..."
-	}
-	return text
-}
-
-func escapeSlackInlineCode(text string) string {
-	text = strings.ReplaceAll(text, "&", "&amp;")
-	text = strings.ReplaceAll(text, "`", "'")
-	text = strings.ReplaceAll(text, "<", "&lt;")
-	text = strings.ReplaceAll(text, ">", "&gt;")
-	return text
-}
-
-func sameToolArgs(a, b map[string]any) bool {
-	left, leftErr := json.Marshal(a)
-	right, rightErr := json.Marshal(b)
-	return leftErr == nil && rightErr == nil && string(left) == string(right)
-}
-
-func slackToolStatusText(tool *agent.ToolEvent) string {
-	if tool == nil || tool.Result != "" || tool.Error != "" {
-		return ""
-	}
-	switch tool.Name {
-	case "agent_file_read":
-		file := toolArgString(tool.Args, "file", "path")
-		if file == "" {
-			return "is reading a file"
-		}
-		return "is reading " + file
-	default:
-		name := strings.TrimSpace(tool.Name)
-		if name == "" {
-			return ""
-		}
-		return "is using " + name
-	}
-}
-
-func toolArgString(args map[string]any, keys ...string) string {
-	for _, key := range keys {
-		value, ok := args[key]
-		if !ok {
-			continue
-		}
-		switch v := value.(type) {
-		case string:
-			if text := strings.TrimSpace(v); text != "" {
-				return text
-			}
-		case fmt.Stringer:
-			if text := strings.TrimSpace(v.String()); text != "" {
-				return text
-			}
-		}
-	}
-	return ""
-}
-
-func slackAssistantStatusText(status string) string {
-	status = strings.TrimSpace(status)
-	if status == "" {
-		return ""
-	}
-	status = strings.TrimPrefix(status, "I am ")
-	status = strings.TrimPrefix(status, "I'm ")
-	if status == "thinking" {
-		return "is thinking"
-	}
-	if strings.HasPrefix(status, "is ") {
-		return status
-	}
-	return "is " + status
 }
 
 func (s *Server) listen() (net.Listener, error) {
