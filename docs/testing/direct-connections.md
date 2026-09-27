@@ -14,14 +14,19 @@ set) and a complete server settings profile such as:
 
 ```sql
 ALTER USER example_test_reader SETTINGS
-    readonly = 1 MIN 1 MAX 1,
-    max_execution_time = 30 MAX 30,
-    max_memory_usage = 268435456 MAX 268435456,
-    max_result_rows = 10000 MAX 10000,
-    max_result_bytes = 1048576 MAX 1048576,
+    readonly = 2 MIN 2 MAX 2,
+    max_execution_time = 30 MIN 1 MAX 30,
+    max_memory_usage = 268435456 MIN 1 MAX 268435456,
+    max_result_rows = 10000 MIN 1 MAX 10000,
+    max_result_bytes = 1048576 MIN 1 MAX 1048576,
     result_overflow_mode = 'break',
     cancel_http_readonly_queries_on_client_close = 1 MIN 1 MAX 1;
 ```
+
+The adapter accepts server-enforced `readonly=1` or `readonly=2` alongside
+verified read-only grants. Mode 2 allows setting changes; positive resource
+minimums prevent setting a limit to zero (unlimited), while maximums cap it.
+Pin `readonly` itself to the selected mode.
 
 Apply the complete settings list together: on the tested server,
 `ALTER USER ... SETTINGS` replaces the previous list. Adding just the disconnect
@@ -39,7 +44,8 @@ AVIARY_CLICKHOUSE_SMOKE_FILE=/private/accounts.json go test ./internal/clickhous
 ```
 
 The adapter smoke checks account restrictions, typed/bounded query results,
-forbidden statements and cancellation. The MCP smoke verifies live identities
+forbidden statements, rejected zero resource limits and execution-time overrides
+above the example profile maximum, and cancellation. The MCP smoke verifies live identities
 and schema inspection for both owners, including concurrent calls, stale
 namespaces, permission denial, and non-personal execution restrictions. Fixtures
 and returned identities are not printed on test failure. The smoke derives a

@@ -6,12 +6,43 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 type slackConnectionCommand struct {
 	verb      string
 	transport string
 	endpoint  string
+	username  string
+}
+
+func validSlackDBUsername(username string) bool {
+	if username == "" || len(username) > 256 || !utf8.ValidString(username) {
+		return false
+	}
+	lower := strings.ToLower(username)
+	if strings.HasPrefix(lower, "password=") || strings.HasPrefix(lower, "pass=") || strings.HasPrefix(lower, "pwd=") {
+		return false
+	}
+	for _, r := range username {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '<' || r == '>' || r == '|' {
+			return false
+		}
+	}
+	return true
+}
+
+func unwrapSlackEmail(raw string) string {
+	if !strings.HasPrefix(raw, "<mailto:") || !strings.HasSuffix(raw, ">") {
+		return raw
+	}
+	inner := strings.TrimSuffix(strings.TrimPrefix(raw, "<mailto:"), ">")
+	address, label, hasLabel := strings.Cut(inner, "|")
+	if hasLabel && address != label {
+		return raw
+	}
+	return address
 }
 
 // parseSlackConnectionCommand recognizes only a whole message command. URLs in
@@ -43,16 +74,21 @@ func parseSlackConnectionCommand(raw, botID string, isDM bool) (slackConnectionC
 		}
 		return cmd, true, nil
 	}
-	if len(fields) == 3 {
-		cmd.transport = strings.ToLower(fields[1])
-		if cmd.transport != "mcp" && cmd.transport != "clickhouse" {
-			return cmd, true, fmt.Errorf("transport must be mcp or clickhouse")
+	args := fields[1:]
+	if len(args) > 0 && (strings.EqualFold(args[0], "mcp") || strings.EqualFold(args[0], "clickhouse")) {
+		cmd.transport = strings.ToLower(args[0])
+		args = args[1:]
+	}
+	if len(args) < 1 || len(args) > 2 {
+		return cmd, true, fmt.Errorf("use connect [mcp|clickhouse] HTTPS_URL [username]")
+	}
+	cmd.endpoint = args[0]
+	if len(args) == 2 {
+		username := unwrapSlackEmail(args[1])
+		if !validSlackDBUsername(username) {
+			return cmd, true, fmt.Errorf("username must be one nonempty token of at most 256 bytes without whitespace, controls or Slack markup")
 		}
-		cmd.endpoint = fields[2]
-	} else if len(fields) == 2 {
-		cmd.endpoint = fields[1]
-	} else {
-		return cmd, true, fmt.Errorf("use connect [mcp|clickhouse] HTTPS_URL")
+		cmd.username = username
 	}
 	cmd.endpoint = unwrapSlackURL(cmd.endpoint)
 	u, err := url.Parse(cmd.endpoint)

@@ -131,7 +131,16 @@ func TestLiveRestrictedAccounts(t *testing.T) {
 			if err != nil || len(result.Rows) != 0 || !result.Truncated || len(result.Columns) != 1 {
 				t.Fatal("byte-bounded result failed")
 			}
-			for _, statement := range []string{"CREATE TEMPORARY TABLE aviary_smoke_forbidden (x UInt8)", "SET readonly = 0", "GRANT SELECT ON *.* TO default"} {
+			for _, statement := range []string{
+				"CREATE TEMPORARY TABLE aviary_smoke_forbidden (x UInt8)",
+				"SET readonly = 0",
+				"GRANT SELECT ON *.* TO default",
+				"SELECT 1 SETTINGS max_execution_time = 0",
+				"SELECT 1 SETTINGS max_execution_time = 31",
+				"SELECT 1 SETTINGS max_memory_usage = 0",
+				"SELECT 1 SETTINGS max_result_rows = 0",
+				"SELECT 1 SETTINGS max_result_bytes = 0",
+			} {
 				if _, err := adapter.Query(ctx, target, credential, Request{SQL: statement, MaxRows: 1, MaxBytes: 1024, Timeout: 10 * time.Second}); err == nil {
 					t.Fatal("restricted account accepted forbidden operation")
 				}
