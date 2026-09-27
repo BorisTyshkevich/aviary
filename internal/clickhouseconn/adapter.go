@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
@@ -76,7 +75,7 @@ type Adapter struct {
 
 // noDriverDeadline retains cancellation while hiding an operation deadline
 // from clickhouse-go. The driver otherwise turns it into max_execution_time,
-// which may violate an immutable server-side readonly profile.
+// adding a query setting beyond the connection's readonly=2 setting.
 type noDriverDeadline struct{ context.Context }
 
 func (noDriverDeadline) Deadline() (time.Time, bool) { return time.Time{}, false }
@@ -182,44 +181,20 @@ func (a Adapter) Query(ctx context.Context, target Target, credential Credential
 	return result, nil
 }
 
-// ValidateReadOnly confirms the server's readonly setting. Grant inspection is
-// intentionally conservative and deployment must provide a least-privilege account.
+// ValidateReadOnly confirms that the server honored this connection's readonly=2 setting.
 func (a Adapter) ValidateReadOnly(ctx context.Context, target Target, credential Credentials) error {
 	r, err := a.Query(ctx, target, credential, Request{SQL: "SELECT value FROM system.settings WHERE name = 'readonly'", MaxRows: 1, MaxBytes: 1024, Timeout: 10 * time.Second})
 	if err != nil {
-		return fmt.Errorf("ClickHouse readonly verification query failed")
+		return fmt.Errorf("ClickHouse readonly=2 verification failed: %w", err)
 	}
 	if r.Truncated || len(r.Rows) != 1 || len(r.Rows[0]) != 1 {
 		return fmt.Errorf("ClickHouse readonly setting is not enforced")
 	}
 	readonly := fmt.Sprint(r.Rows[0][0])
-	if readonly != "1" && readonly != "2" {
+	if readonly != "2" {
 		return fmt.Errorf("ClickHouse readonly setting is not enforced")
 	}
-	grants, err := a.Query(ctx, target, credential, Request{SQL: "SHOW GRANTS FINAL", MaxRows: 128, MaxBytes: 32 * 1024, Timeout: 10 * time.Second})
-	if err != nil {
-		return fmt.Errorf("ClickHouse grant verification query failed")
-	}
-	if grants.Truncated || !safeGrants(grants.Rows) {
-		return fmt.Errorf("ClickHouse account grants are not verified read-only")
-	}
 	return nil
-}
-
-func safeGrants(rows [][]any) bool {
-	if len(rows) == 0 {
-		return false
-	}
-	for _, row := range rows {
-		if len(row) != 1 {
-			return false
-		}
-		grant := strings.ToUpper(strings.TrimSpace(fmt.Sprint(row[0])))
-		if strings.Contains(grant, ",") || strings.Contains(grant, "WITH GRANT OPTION") || (!strings.HasPrefix(grant, "GRANT SELECT ON ") && !strings.HasPrefix(grant, "GRANT SHOW ON ")) {
-			return false
-		}
-	}
-	return true
 }
 
 func (a Adapter) open(ctx context.Context, target Target, credential Credentials) (*sql.DB, error) {
@@ -243,7 +218,7 @@ func (a Adapter) open(ctx context.Context, target Target, credential Credentials
 	if path == "" {
 		path = "/"
 	}
-	db := clickhouse.OpenDB(&clickhouse.Options{Protocol: clickhouse.HTTP, Addr: []string{plan.URL.Host}, TLS: transport.TLSClientConfig, Auth: clickhouse.Auth{Database: "default", Username: target.Username, Password: credential.password}, HttpUrlPath: path, MaxOpenConns: 1, MaxIdleConns: 0, TransportFunc: func(*http.Transport) (http.RoundTripper, error) {
+	db := clickhouse.OpenDB(&clickhouse.Options{Protocol: clickhouse.HTTP, Addr: []string{plan.URL.Host}, TLS: transport.TLSClientConfig, Auth: clickhouse.Auth{Database: "default", Username: target.Username, Password: credential.password}, Settings: clickhouse.Settings{"readonly": 2}, HttpUrlPath: path, MaxOpenConns: 1, MaxIdleConns: 0, TransportFunc: func(*http.Transport) (http.RoundTripper, error) {
 		return redirectRejecting{base: transport, host: plan.URL.Host, path: path}, nil
 	}})
 	return db, nil

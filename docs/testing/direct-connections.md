@@ -6,15 +6,16 @@ artifact confinement, and a complete MCP `agent_run` → preparation → model �
 `artifact_read` path using a local model stub. No test-only impersonation tool is
 registered in the production MCP server.
 
-## Live restricted-account smoke
+## Live connection smoke
 
-Create two dedicated test accounts using an administrator connection. Each must
-have only `SELECT ON system.*` (or another explicitly supported read-only grant
-set) and a complete server settings profile such as:
+Use two test accounts that can inspect `system.tables`. The adapter sends
+`readonly=2` on every HTTPS connection and verifies its effective value; it
+does not inspect or change grants. Test with an account that has broader grants
+as well as a restricted account when possible. Operators can separately apply
+server-side resource constraints, for example:
 
 ```sql
 ALTER USER example_test_reader SETTINGS
-    readonly = 2 MIN 2 MAX 2,
     max_execution_time = 30 MIN 1 MAX 30,
     max_memory_usage = 268435456 MIN 1 MAX 268435456,
     max_result_rows = 10000 MIN 1 MAX 10000,
@@ -23,29 +24,32 @@ ALTER USER example_test_reader SETTINGS
     cancel_http_readonly_queries_on_client_close = 1 MIN 1 MAX 1;
 ```
 
-The adapter accepts server-enforced `readonly=1` or `readonly=2` alongside
-verified read-only grants. Mode 2 allows setting changes; positive resource
-minimums prevent setting a limit to zero (unlimited), while maximums cap it.
-Pin `readonly` itself to the selected mode.
+Mode 2 allows setting changes; positive resource minimums prevent setting a
+limit to zero (unlimited), while maximums cap it. Readonly users can still use
+`KILL QUERY` on their own queries. On the tested cluster,
+`INSERT INTO FUNCTION null(...)` succeeds with a broad-grant account despite
+`readonly=2`; mode 2 is not a universal SQL write filter.
 
 Apply the complete settings list together: on the tested server,
 `ALTER USER ... SETTINGS` replaces the previous list. Adding just the disconnect
-setting otherwise removes the readonly/resource profile. Re-run the readonly
-and forbidden-operation smoke after any account/profile change.
+setting otherwise removes the existing resource profile. Re-run the connection
+smoke after any account/profile change.
 
 Keep credentials in an owner-only JSON file outside Git:
 
 ```json
-{"endpoint":"https://cluster.example:8443","accounts":[{"username":"test_alice","password":"FAKE-REPLACE-LOCALLY"},{"username":"test_bob","password":"FAKE-REPLACE-LOCALLY"}]}
+{"endpoint":"https://cluster.example:8443","accounts":[{"username":"test_alice","password":"FAKE-REPLACE-LOCALLY"},{"username":"test_bob","password":"FAKE-REPLACE-LOCALLY","expect_readonly_system_denial":true}]}
 ```
 
 ```sh
 AVIARY_CLICKHOUSE_SMOKE_FILE=/private/accounts.json go test ./internal/clickhouseconn ./internal/mcp -run TestLive -count=1
 ```
 
-The adapter smoke checks account restrictions, typed/bounded query results,
-forbidden statements, rejected zero resource limits and execution-time overrides
-above the example profile maximum, and cancellation. The MCP smoke verifies live identities
+The adapter smoke checks the effective `readonly=2` setting, typed/bounded query
+results, rejected changes to `readonly`, and cancellation. For an account with
+SYSTEM privilege, set `expect_readonly_system_denial` to check that the server
+rejects `SYSTEM FLUSH LOGS` with READONLY code 164. The MCP smoke verifies live
+identities
 and schema inspection for both owners, including concurrent calls, stale
 namespaces, permission denial, and non-personal execution restrictions. Fixtures
 and returned identities are not printed on test failure. The smoke derives a

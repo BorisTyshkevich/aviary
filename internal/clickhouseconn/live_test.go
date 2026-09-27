@@ -20,9 +20,10 @@ import (
 type smokeFixture struct {
 	Endpoint string `json:"endpoint"`
 	Accounts []struct {
-		Name     string `json:"name"`
-		Username string `json:"username"`
-		Password string `json:"password"`
+		Name                       string `json:"name"`
+		Username                   string `json:"username"`
+		Password                   string `json:"password"`
+		ExpectReadonlySystemDenial bool   `json:"expect_readonly_system_denial"`
 	} `json:"accounts"`
 }
 
@@ -60,7 +61,7 @@ func livePolicy(raw string) (endpointpolicy.Policy, error) {
 	return endpointpolicy.Policy{Allow: []endpointpolicy.Rule{{Host: u.Hostname(), Ports: []int{port}, CIDRs: cidrs}}}, nil
 }
 
-func TestLiveRestrictedAccounts(t *testing.T) {
+func TestLiveReadonlyConnections(t *testing.T) {
 	path := os.Getenv("AVIARY_CLICKHOUSE_SMOKE_FILE")
 	if path == "" {
 		t.Skip("AVIARY_CLICKHOUSE_SMOKE_FILE is not set")
@@ -117,7 +118,7 @@ func TestLiveRestrictedAccounts(t *testing.T) {
 			}
 			result, err := adapter.Query(ctx, target, credential, Request{SQL: "SELECT currentUser()", MaxRows: 1, MaxBytes: 1024, Timeout: 10 * time.Second})
 			if err != nil || result.QueryID == "" || len(result.Columns) != 1 || len(result.Rows) != 1 || !strings.EqualFold(strings.TrimSpace(result.Rows[0][0].(string)), account.Username) {
-				t.Fatal("restricted account identity query failed")
+				t.Fatal("connection identity query failed")
 			}
 			result, err = adapter.Query(ctx, target, credential, Request{SQL: "SELECT name FROM system.tables LIMIT 1", MaxRows: 1, MaxBytes: 1024, Timeout: 10 * time.Second})
 			if err != nil || len(result.Columns) != 1 {
@@ -132,17 +133,19 @@ func TestLiveRestrictedAccounts(t *testing.T) {
 				t.Fatal("byte-bounded result failed")
 			}
 			for _, statement := range []string{
-				"CREATE TEMPORARY TABLE aviary_smoke_forbidden (x UInt8)",
 				"SET readonly = 0",
-				"GRANT SELECT ON *.* TO default",
-				"SELECT 1 SETTINGS max_execution_time = 0",
-				"SELECT 1 SETTINGS max_execution_time = 31",
-				"SELECT 1 SETTINGS max_memory_usage = 0",
-				"SELECT 1 SETTINGS max_result_rows = 0",
-				"SELECT 1 SETTINGS max_result_bytes = 0",
+				"SELECT 1 SETTINGS readonly = 0",
 			} {
 				if _, err := adapter.Query(ctx, target, credential, Request{SQL: statement, MaxRows: 1, MaxBytes: 1024, Timeout: 10 * time.Second}); err == nil {
-					t.Fatal("restricted account accepted forbidden operation")
+					t.Fatal("connection allowed readonly to be disabled")
+				}
+			}
+			if account.ExpectReadonlySystemDenial {
+				// A broad-grant account must reach READONLY (164). If the
+				// setting regresses, flushing logs is harmless to stored data.
+				_, err := adapter.Query(ctx, target, credential, Request{SQL: "SYSTEM FLUSH LOGS", MaxRows: 1, MaxBytes: 1024, Timeout: 10 * time.Second})
+				if err == nil || !strings.Contains(err.Error(), "server error code 164") {
+					t.Fatalf("broad-grant account SYSTEM command was not denied by readonly=2: %v", err)
 				}
 			}
 			canceled, stop := context.WithCancel(context.Background())

@@ -103,21 +103,26 @@ results. The standard library HTTP client would require custom result decoding
 and connection/query management. Pin the dependency and document its HTTP
 transport behavior during implementation; update both Go manifests.
 
-Expose schema inspection and bounded SQL queries. ClickHouse enforces read-only
-access; prompt instructions and SQL-prefix checks are insufficient. Include query
-IDs, cancellation, timeouts and bounded output. Tool arguments cannot override
-the selected endpoint. Effective agent/message/script permissions apply during
+Expose schema inspection and bounded SQL queries. ClickHouse `readonly=2`
+blocks ordinary table writes and DDL; prompt instructions and SQL-prefix checks
+are insufficient. Include query IDs, cancellation, timeouts and bounded output.
+Tool arguments cannot override the selected endpoint. Effective
+agent/message/script permissions apply during
 both discovery and invocation.
 
-The supported database account has least-privilege read/inspection grants and
-server-enforced read-only restrictions. A client-side `readonly` flag alone is
-not a promise that an administrator credential becomes safe: ClickHouse has
-privileged operations outside that setting's boundary. Deployment documentation
-must specify the account/profile requirements, and live verification must cover
-write, administration and settings-override rejection with the supported account.
-The database administrator remains responsible for its grants, source access,
-and server-side resource limits. Do not silently weaken query safeguards when a
-profile rejects requested settings; report the limitation explicitly.
+Each direct HTTPS connection sends ClickHouse `readonly=2`, and setup verifies
+that the effective setting is 2. Aviary does not inspect or change grants.
+ClickHouse blocks ordinary table writes and DDL in this mode, but it permits
+setting changes and temporary tables. On the tested cluster,
+`INSERT INTO FUNCTION null(...)` also succeeds. Readonly users can still use
+`KILL QUERY` on their own queries. Broader grants can expose external table
+functions and sources, and mode 2 may allow changing audit and resource settings.
+Credential-forwarding preparation hooks are separate executables and must
+apply `readonly=2` to their own database requests.
+Deployment documentation must state this limit. The database administrator
+remains responsible for grant scope, source access, and server-side resource
+limits. Do not silently weaken the setting if a profile rejects it; report the
+connection failure explicitly.
 
 Apply endpoint and network policy while preserving logical Host/SNI and TLS
 verification. Report failures without fallback to another cluster or user, and
@@ -176,8 +181,7 @@ argument overrides the email; there is no private username-confirmation step.
 The thread retains one unambiguous cluster and transport while participants use
 their own credentials. Direct ClickHouse is useful before MCP OAuth is available.
 
-Read-only account verification accepts `readonly=1` and `readonly=2`, with the
-same conservative read-only grant checks. Mode 2 allows ordinary setting changes;
-deployment profiles pin readonly and use positive minima plus maxima for bounded
-resources, preventing zero from disabling a limit. Credentials with write grants
-remain unacceptable in either mode.
+Direct connections send and verify `readonly=2`; grants are neither inspected
+nor changed. Mode 2 allows ordinary setting changes, so deployment profiles can
+use positive minima and maxima for server-side resource limits. Accounts with
+broader grants can connect, subject to the documented limits of `readonly=2`.

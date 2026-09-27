@@ -1,6 +1,6 @@
 # Before-turn preparation hooks
 
-An agent can run an administrator-configured executable once before its first model request in a turn. It receives trusted execution and target metadata and can publish bounded evidence files. The executable is deployment code: Aviary does not sandbox its filesystem or network access. A collector that connects to a database must enforce its own endpoint and read-only policies.
+An agent can run an administrator-configured executable once before its first model request in a turn. It receives trusted execution and target metadata and can publish bounded evidence files. The executable is deployment code: Aviary does not sandbox its filesystem or network access. A collector that receives a ClickHouse credential must apply `readonly=2` to its own database requests and enforce its own endpoint policy. Aviary's direct adapter setting does not carry over to a separate executable.
 
 ```yaml
 agents:
