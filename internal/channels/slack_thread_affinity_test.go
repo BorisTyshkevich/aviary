@@ -74,6 +74,105 @@ func formatSlackTestTS(ts time.Time) string {
 	return fmt.Sprintf("%d.%06d", ts.Unix(), ts.Nanosecond()/1000)
 }
 
+func TestSlackMentionOfAnotherUser(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want bool
+	}{
+		{"plain reply", false},
+		{"@someone and <!here> and <!channel>", false},
+		{"<@BOTA> and <@!BOTA|owner>", false},
+		{"<@USER> please check", true},
+		{"thanks <@!USER>", true},
+		{"thanks <@USER|alice>", true},
+		{"<@!USER|alice> thanks", true},
+		{"<@BOTA> and <@USER>", true},
+		{"<@USER missing closing bracket", false},
+	} {
+		t.Run(tc.text, func(t *testing.T) {
+			require.Equal(t, tc.want, mentionsSlackUserOtherThan(tc.text, "BOTA"))
+		})
+	}
+}
+
+func TestSlackClaimedThreadIgnoresRepliesTaggingOthersWhenEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		text   string
+		want   []string
+		optOut bool
+	}{
+		{name: "untagged continuation", text: "continue", want: []string{"A"}},
+		{name: "owner mention", text: "<@BOTA> continue", want: []string{"A"}},
+		{name: "owner labeled mention", text: "<@BOTA|owner> continue", want: []string{"A"}},
+		{name: "person at start", text: "<@USER> please check"},
+		{name: "person in middle", text: "thanks <@!USER|alice> for looking"},
+		{name: "person at end", text: "please check <@USER>"},
+		{name: "owner and person", text: "<@BOTA> please check <@USER>"},
+		{name: "other bot", text: "<@BOTB> please check", want: []string{"B"}},
+		{name: "other bot and owner", text: "<@BOTA> <@BOTB> please check", want: []string{"B"}},
+		{name: "broadcast", text: "<!here> please check", want: []string{"A"}},
+		{name: "plain at sign", text: "@alice please check", want: []string{"A"}},
+		{name: "option disabled", text: "thanks <@USER>", want: []string{"A"}, optOut: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store.SetDataDir(t.TempDir())
+			t.Cleanup(func() { store.SetDataDir("") })
+			m := NewManager()
+			a := NewSlackChannel("xapp-a", "xoxb-a", nil, "", nil)
+			b := NewSlackChannel("xapp-b", "xoxb-b", nil, "", nil)
+			a.botUserID, b.botUserID = "BOTA", "BOTB"
+			a.teamID, b.teamID = "TEAM", "TEAM"
+			for name, ch := range map[string]*SlackChannel{"A": a, "B": b} {
+				spec := channelSpec{agentName: name, channelConfig: config.ChannelConfig{Type: "slack", ID: name,
+					IgnoreOtherUserMentions: name == "A" && !tc.optOut,
+					AllowFrom:               []config.AllowFromEntry{{From: "U1", AllowedGroups: "C1", RespondToMentions: true}}}}
+				m.slack[name] = &sharedSlackChannel{ch: ch, specs: []channelSpec{spec}}
+			}
+			root := formatSlackTestTS(time.Now().Add(-time.Minute))
+			message := func(text string, reply bool) IncomingMessage {
+				return IncomingMessage{Type: "slack", From: "U1", Channel: "C1", ThreadTS: root,
+					IsThreadReply: reply, OriginalText: text, Text: text, ReceivedAt: time.Now()}
+			}
+			var routed []string
+			deliver := func(name, _, _ string, _ Channel, _ IncomingMessage) { routed = append(routed, name) }
+			m.routeSlackMessage(a, message("<@BOTA> start", false), &slackConnectionIntake{}, deliver)
+			require.Equal(t, []string{"A"}, routed)
+			routed = nil
+			m.routeSlackMessage(a, message(tc.text, true), &slackConnectionIntake{}, deliver)
+			m.routeSlackMessage(b, message(tc.text, true), &slackConnectionIntake{}, deliver)
+			require.Equal(t, tc.want, routed)
+		})
+	}
+}
+
+func TestSlackClaimedThreadMentionDoesNotFallThroughToAnotherAgentOnSameBot(t *testing.T) {
+	store.SetDataDir(t.TempDir())
+	t.Cleanup(func() { store.SetDataDir("") })
+	m := NewManager()
+	ch := NewSlackChannel("xapp", "xoxb", nil, "", nil)
+	ch.botUserID, ch.teamID = "BOTA", "TEAM"
+	ownerSpec := channelSpec{agentName: "owner", channelConfig: config.ChannelConfig{Type: "slack", ID: "owner",
+		IgnoreOtherUserMentions: true,
+		AllowFrom:               []config.AllowFromEntry{{From: "*", AllowedGroups: "C1", RespondToMentions: true}}}}
+	siblingSpec := channelSpec{agentName: "sibling", channelConfig: config.ChannelConfig{Type: "slack", ID: "sibling",
+		AllowFrom: []config.AllowFromEntry{{From: "*", AllowedGroups: "C1", RespondToMentions: true}}}}
+	m.slack["shared"] = &sharedSlackChannel{ch: ch, specs: []channelSpec{ownerSpec, siblingSpec}}
+	root := formatSlackTestTS(time.Now().Add(-time.Minute))
+	_, err := m.affinity.claim(slackThreadOwner{TeamID: "TEAM", ChannelID: "C1", RootTS: root,
+		BotUserID: "BOTA", AgentName: "owner", ConfiguredID: "owner"})
+	require.NoError(t, err)
+	for _, text := range []string{"<@BOTA> please check <@USER>", "<@USER> please check"} {
+		msg := IncomingMessage{Type: "slack", From: "U1", Channel: "C1", ThreadTS: root,
+			IsThreadReply: true, OriginalText: text, Text: text, ReceivedAt: time.Now()}
+		var routed []string
+		m.routeSlackMessage(ch, msg, &slackConnectionIntake{}, func(name, _, _ string, _ Channel, _ IncomingMessage) {
+			routed = append(routed, name)
+		})
+		require.Empty(t, routed)
+	}
+}
+
 func TestSlackThreadAffinitySharedBotsAndCurrentPolicy(t *testing.T) {
 	store.SetDataDir(t.TempDir())
 	t.Cleanup(func() { store.SetDataDir("") })

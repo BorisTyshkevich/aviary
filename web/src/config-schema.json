@@ -124,6 +124,7 @@
 								"show_typing": { "type": "boolean" },
 								"separate_top_level_sessions": { "type": "boolean" },
 								"reply_to_replies": { "type": "boolean" },
+								"ignore_other_user_mentions": { "type": "boolean" },
 								"react_to_emoji": { "type": "boolean" },
 								"send_read_receipts": { "type": "boolean" },
 								"group_chat_history": {

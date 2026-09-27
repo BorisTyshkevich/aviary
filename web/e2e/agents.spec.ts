@@ -805,6 +805,45 @@ test("saving settings preserves default-on signal channel checkboxes", async ({
 	await expect(page.getByLabel("Send read receipts")).toBeChecked();
 });
 
+test("Slack other-user mention rule survives settings save", async ({
+	page,
+}) => {
+	let savedConfig: unknown = null;
+	await mockMCP(page, {
+		config_get: {
+			...CONFIG,
+			agents: [
+				{
+					...CONFIG.agents[0],
+					channels: [
+						{ type: "slack", id: "workspace-bot", allow_from: [{ from: "*" }] },
+					],
+				},
+			],
+		},
+		config_save: (args) => {
+			savedConfig = JSON.parse(String(args?.config ?? "{}"));
+			return "ok";
+		},
+	});
+
+	await page.goto("/settings");
+	await page.getByRole("link", { name: "Agents & Tasks", exact: true }).click();
+	await page
+		.getByRole("button", { name: "Channels", exact: true })
+		.first()
+		.click();
+	const checkbox = page.getByLabel("Ignore replies tagging other people");
+	await expect(checkbox).not.toBeChecked();
+	await checkbox.check();
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	await expect(checkbox).toBeChecked();
+	expect(savedConfig).toMatchObject({
+		agents: [{ channels: [{ ignore_other_user_mentions: true }] }],
+	});
+});
+
 test("saving settings preserves task prompt newlines", async ({ page }) => {
 	let savedConfig: unknown = null;
 
