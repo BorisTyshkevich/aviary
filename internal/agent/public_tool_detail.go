@@ -176,7 +176,19 @@ func redactPublicSQL(input string) (string, bool) {
 		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
 			space()
 			i++
-		case isSQLIdentByte(c) || strings.ContainsRune("(),;.=<>!+-*/%|&^[]?", rune(c)):
+		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_':
+			start := i
+			for i < len(input) && isSQLIdentByte(input[i]) {
+				i++
+			}
+			token := input[start:i]
+			// ClickHouse can parse the rest of an INSERT or FORMAT query as
+			// unquoted row data. Its bytes must never enter public progress.
+			if strings.EqualFold(token, "INSERT") || strings.EqualFold(token, "FORMAT") {
+				return "", false
+			}
+			out.WriteString(token)
+		case strings.ContainsRune("(),;.=<>!+-*/%|&^[]?", rune(c)):
 			out.WriteByte(c)
 			i++
 		default:

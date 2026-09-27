@@ -565,10 +565,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
 			if sender, ok := candidate.(slackPresenterSender); ok {
 				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, config.BoolOr(cc.ToolProgress, false))
-				if cc.ToolProgressMaxCalls != nil {
+				if cc.ToolProgressMaxCalls != nil && *cc.ToolProgressMaxCalls >= config.MinToolProgressMaxCalls && *cc.ToolProgressMaxCalls <= config.MaxToolProgressMaxCalls {
 					presenter.maxCalls = *cc.ToolProgressMaxCalls
 				}
-				if cc.ToolProgressMaxChars != nil {
+				if cc.ToolProgressMaxChars != nil && *cc.ToolProgressMaxChars >= config.MinToolProgressMaxChars && *cc.ToolProgressMaxChars <= config.MaxToolProgressMaxChars {
 					presenter.maxChars = *cc.ToolProgressMaxChars
 				}
 				presenter.summarize = func(ctx context.Context, model, answer string) (string, error) {

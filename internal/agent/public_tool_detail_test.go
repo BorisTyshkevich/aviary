@@ -64,6 +64,10 @@ func TestPublicToolSQLDetailFailsClosedOnUncertainLexing(t *testing.T) {
 		"SELECT $fake-secret-dollar$",
 		"SELECT {fake-secret-template}",
 		"SELECT 1\\fake-secret-escape",
+		"INSERT INTO creds FORMAT CSV\nalice,fake-secret-value,sk_live_fake",
+		"insert into creds format TabSeparated\nalice\tfake-secret-value",
+		"INSERT INTO creds VALUES (fake-secret-value)",
+		"SELECT 1 FORMAT LineAsString\nfake-secret-value",
 		strings.Repeat("SELECT 1 ", maxPublicSQLInput/9+1),
 	}
 	for _, sql := range cases {
