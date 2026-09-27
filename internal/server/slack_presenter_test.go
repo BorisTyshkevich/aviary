@@ -225,8 +225,45 @@ func TestSlackPresenterTerminalFlushIsBounded(t *testing.T) {
 	require.Less(t, time.Since(start), time.Second)
 	require.Equal(t, slackOutcomeAnswer, result.Outcome)
 	posts, _, deletes, _ := sender.snapshot()
-	require.Len(t, posts, 2, "terminal budget limits queued progress before final answer")
-	require.Len(t, deletes, 1)
+	require.Equal(t, []string{"final"}, posts, "a short budget must not start a post it cannot observe")
+	require.Empty(t, deletes)
+}
+
+func TestSlackPresenterTerminalFlushKeepsDispatchedPostAliveAfterBudget(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	sender := &presenterTestSender{postStarted: started, postRelease: release}
+	p := newSlackPresenter(sender, "C123", "1710000000.123456", true)
+	p.delay = time.Second
+	p.editGap = time.Millisecond
+	p.flushBudget = time.Second
+	var cancelFlush context.CancelFunc
+	p.terminalContextFactory = func(budget time.Duration) (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancel(context.Background())
+		if budget == p.flushBudget {
+			cancelFlush = cancel
+		}
+		return ctx, cancel
+	}
+	p.Tool(agent.PublicToolEvent{Name: "web_search", InvocationID: "id-1", State: agent.ToolStateStarted})
+	done := make(chan slackTerminalResult, 1)
+	go func() { result, _ := p.Terminal(nil, "done", "", "final", false); done <- result }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("terminal flush did not begin progress post")
+	}
+	cancelFlush()
+	close(release)
+	select {
+	case result := <-done:
+		require.Equal(t, slackOutcomeAnswer, result.Outcome)
+		require.Equal(t, []string{"ts-1"}, result.ProgressTimestamps)
+	case <-time.After(time.Second):
+		t.Fatal("terminal delivery stalled after flush budget expired")
+	}
+	posts, _, deletes, _ := sender.snapshot()
+	require.Equal(t, []string{"Tool progress\n• 1. web_search started", "final"}, posts)
+	require.Equal(t, []string{"ts-1"}, deletes)
 }
 
 func TestSlackPresenterProgressOffIgnoresToolEvents(t *testing.T) {

@@ -394,10 +394,15 @@ func (p *slackPresenter) flushTerminalProgress() {
 		if budgetCtx.Err() != nil {
 			return
 		}
+		if deadline, ok := budgetCtx.Deadline(); ok && time.Until(deadline) < slackProgressTimeout {
+			return
+		}
 		p.mu.Lock()
 		p.pages[index].attempted = true
 		p.mu.Unlock()
-		callCtx, cancel := context.WithTimeout(channels.WithSlackPreDispatchStop(budgetCtx, budgetCtx.Done()), slackProgressTimeout)
+		// The flush budget limits new posts. Once dispatched, this call keeps
+		// its own deadline so terminal delivery can capture an accepted TS.
+		callCtx, cancel := context.WithTimeout(channels.WithSlackPreDispatchStop(context.Background(), budgetCtx.Done()), slackProgressTimeout)
 		ts, err := p.sender.PostThreadTextContext(callCtx, p.channel, p.threadTS, body)
 		cancel()
 		if err != nil {
