@@ -2,6 +2,7 @@ package channels
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"strings"
@@ -29,6 +30,10 @@ type slackConnectionIntake struct {
 	workerCtx        context.Context
 	queues           [4]chan func()
 }
+
+const slackEmailUnavailableMessage = "Slack email unavailable; add users:read.email or provide username after URL"
+
+var errSlackEmailUnavailable = errors.New("slack email unavailable")
 
 func (i *slackConnectionIntake) start(ctx context.Context) {
 	i.startMu.Lock()
@@ -116,10 +121,12 @@ func (i *slackConnectionIntake) ensureSetupNow(agentName string, msg IncomingMes
 	principal := connections.Principal{InstallationID: scope.InstallationID, WorkspaceID: scope.WorkspaceID, UserID: msg.From}
 	i.promptMu.Lock()
 	defer i.promptMu.Unlock()
-	if i.service.HasCredential(principal, target) || i.service.HasActivePrompt(principal, target) {
+	if _, active := i.service.ActivePromptFor(principal, target); active || i.service.HasCredential(principal, target) {
 		return
 	}
-	_ = i.startSetup(principal, target)
+	if err := i.startSetup(principal, target, ""); errors.Is(err, errSlackEmailUnavailable) {
+		i.reply(msg.Channel, msg.ThreadTS, slackEmailUnavailableMessage)
+	}
 }
 
 func (i *slackConnectionIntake) redactReference(channelID, rootTS string) bool {
@@ -234,20 +241,37 @@ func (i *slackConnectionIntake) executeCommand(in slackIngress, selected channel
 			i.reply(in.ChannelID, in.RootTS, connectionActionError(err))
 			return
 		}
+		i.promptMu.Lock()
+		if active, ok := i.service.ActivePromptFor(principal, target); ok {
+			i.promptMu.Unlock()
+			if cmd.username != "" && cmd.username != active.Username {
+				i.reply(in.ChannelID, in.RootTS, "An existing private setup is pending. To change the username, disconnect and reconnect in this thread.")
+			} else {
+				i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete the existing private setup prompt.")
+			}
+			return
+		}
 		if i.service.HasCredential(principal, target) {
+			if cmd.username != "" {
+				credential, ok := i.service.CredentialFor(connections.Execution{Kind: connections.Interactive, Scope: scope, Principal: principal}, target)
+				if !ok || credential.Username != cmd.username {
+					i.promptMu.Unlock()
+					i.reply(in.ChannelID, in.RootTS, "Existing credentials use another username. To change it, disconnect and reconnect in this thread.")
+					return
+				}
+			}
+			i.promptMu.Unlock()
 			i.reply(in.ChannelID, in.RootTS, "Connection attached. Your credentials are ready.")
 			return
 		}
-		i.promptMu.Lock()
-		if i.service.HasActivePrompt(principal, target) {
-			i.promptMu.Unlock()
-			i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete the existing private setup prompt.")
-			return
-		}
-		setupErr := i.startSetup(principal, target)
+		setupErr := i.startSetup(principal, target, cmd.username)
 		i.promptMu.Unlock()
 		if setupErr != nil {
-			i.reply(in.ChannelID, in.RootTS, "Connection attached, but private setup could not start. Retry connect in this thread.")
+			if errors.Is(setupErr, errSlackEmailUnavailable) {
+				i.reply(in.ChannelID, in.RootTS, slackEmailUnavailableMessage)
+			} else {
+				i.reply(in.ChannelID, in.RootTS, "Connection attached, but private setup could not start. Retry connect in this thread.")
+			}
 		} else {
 			i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete private setup in the bot DM.")
 		}
@@ -275,25 +299,24 @@ func (i *slackConnectionIntake) reply(channel, thread, text string) {
 	}
 }
 
-func (i *slackConnectionIntake) startSetup(principal connections.Principal, target connections.Target) error {
+func (i *slackConnectionIntake) startSetup(principal connections.Principal, target connections.Target, username string) error {
 	ctx, cancel := context.WithTimeout(i.baseContext(), 5*time.Second)
 	defer cancel()
+	if username == "" {
+		if user, err := i.channel.client.GetUserInfoContext(ctx, principal.UserID); err == nil && user != nil {
+			username = strings.TrimSpace(user.Profile.Email)
+		}
+		if !validSlackDBUsername(username) {
+			return errSlackEmailUnavailable
+		}
+	}
 	dm, err := i.channel.openDirectConversation(ctx, principal.UserID)
 	if err != nil {
 		return err
 	}
-	username := ""
-	if user, err := i.channel.client.GetUserInfoContext(ctx, principal.UserID); err == nil && user != nil {
-		username = strings.TrimSpace(user.Profile.Email)
-	}
-	label := fmt.Sprintf("Database setup for %s in channel %s, thread %s. ", target.Endpoint, target.Scope.ChannelID, target.Scope.RootThreadID)
-	if username != "" {
-		label += fmt.Sprintf("Proposed username: %s. Reply `use proposed` in this thread to confirm, or reply with another database username.", username)
-	} else {
-		label += "Reply in this thread with your database username."
-	}
+	label := fmt.Sprintf("Database setup for %s in channel %s, thread %s. Username: %s. Reply in this thread with only your database password; your entire reply will be used exactly as sent.", target.Endpoint, target.Scope.ChannelID, target.Scope.RootThreadID, username)
 	return i.postClassifiedPrompt(dm, label, connections.Prompt{Principal: principal, DMChannelID: dm,
-		Target: target, Stage: "username", Username: username, ExpiresAt: time.Now().Add(15 * time.Minute)})
+		Target: target, Stage: "password", Username: username, ExpiresAt: time.Now().Add(15 * time.Minute)})
 }
 
 // Slack assigns the thread timestamp when posting. First post an inert message,
@@ -341,22 +364,4 @@ func (i *slackConnectionIntake) handleSetupReply(in slackIngress) {
 		}
 		return
 	}
-	if prompt.Stage != "username" {
-		return
-	}
-	username := strings.TrimSpace(in.Text)
-	if username == "use proposed" {
-		username = prompt.Username
-	}
-	if username == "" || len(username) > 256 {
-		i.reply(in.ChannelID, in.RootTS, "Reply with a database username, or `use proposed` when one is shown.")
-		return
-	}
-	if err := i.service.FinishPrompt(principal, in.ChannelID, in.RootTS); err != nil {
-		return
-	}
-	_ = i.postClassifiedPrompt(in.ChannelID, "Reply to this password prompt thread with only your database password. Your entire reply will be used exactly as sent.", connections.Prompt{
-		Principal: principal, DMChannelID: in.ChannelID, Target: prompt.Target,
-		Stage: "password", Username: username, ExpiresAt: time.Now().Add(15 * time.Minute),
-	})
 }

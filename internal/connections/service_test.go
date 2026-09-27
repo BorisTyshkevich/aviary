@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -139,12 +140,145 @@ func TestStaleCompletionAndExpiredTombstones(t *testing.T) {
 	require.True(t, s.ClassifyReply("install", "workspace", "dm", "prompt"))
 	require.ErrorIs(t, s.CompletePassword(context.Background(), p, "dm", "prompt", "fake-secret", nil), ErrPrompt)
 
-	expired := Prompt{Principal: p, DMChannelID: "dm", DMRootID: "expired", Target: next, Stage: "username", ExpiresAt: time.Now().Add(-time.Second)}
+	expired := Prompt{Principal: p, DMChannelID: "dm", DMRootID: "expired", Target: next, Stage: "password", ExpiresAt: time.Now().Add(-time.Second)}
 	require.NoError(t, s.PutPrompt(expired))
 	require.True(t, s.ClassifyReply("install", "workspace", "dm", "expired"))
 	_, ok := s.PromptFor(p, "dm", "expired")
 	require.False(t, ok)
 	require.ErrorIs(t, s.FinishPrompt(p, "dm", "expired"), ErrPrompt)
+}
+
+func TestActivePromptForExactCurrentPrincipalAndTarget(t *testing.T) {
+	s, err := Open(t.TempDir())
+	require.NoError(t, err)
+	alice := testPrincipal("alice")
+	bob := testPrincipal("bob")
+	target, _, err := s.Select(testScope("thread"), "clickhouse", "https://cluster.example")
+	require.NoError(t, err)
+	other, _, err := s.Select(testScope("other-thread"), "clickhouse", "https://other.example")
+	require.NoError(t, err)
+	newPrompt := func(root string, principal Principal, target Target, expires time.Time) Prompt {
+		return Prompt{Principal: principal, DMChannelID: "dm", DMRootID: root, Target: target, Stage: "password", Username: " exact username ", ExpiresAt: expires}
+	}
+	active := newPrompt("active", alice, target, time.Now().Add(time.Hour))
+	require.NoError(t, s.PutPrompt(active))
+	require.NoError(t, s.PutPrompt(newPrompt("expired", alice, target, time.Now().Add(-time.Second))))
+	require.NoError(t, s.PutPrompt(newPrompt("bob", bob, target, time.Now().Add(time.Hour))))
+	require.NoError(t, s.PutPrompt(newPrompt("other", alice, other, time.Now().Add(time.Hour))))
+
+	got, ok := s.ActivePromptFor(alice, target)
+	require.True(t, ok)
+	require.Equal(t, active, got)
+	require.True(t, s.HasActivePrompt(alice, target))
+	_, ok = s.ActivePromptFor(alice, Target{})
+	require.False(t, ok)
+	_, ok = s.PromptFor(alice, "dm", "expired")
+	require.False(t, ok)
+	require.True(t, s.ClassifyReply("install", "workspace", "dm", "expired"))
+
+	require.NoError(t, s.FinishPrompt(alice, "dm", "active"))
+	_, ok = s.ActivePromptFor(alice, target)
+	require.False(t, ok, "completed and expired prompts must not be reused")
+	require.False(t, s.HasActivePrompt(alice, target))
+	require.True(t, s.ClassifyReply("install", "workspace", "dm", "active"))
+	got, ok = s.ActivePromptFor(bob, target)
+	require.True(t, ok)
+	require.Equal(t, bob, got.Principal)
+	got, ok = s.ActivePromptFor(alice, other)
+	require.True(t, ok)
+	require.Equal(t, other, got.Target)
+
+	replacement, _, err := s.Select(target.Scope, "clickhouse", "https://replacement.example")
+	require.NoError(t, err)
+	_, ok = s.ActivePromptFor(bob, target)
+	require.False(t, ok, "a replaced generation invalidates old prompts")
+	_, ok = s.ActivePromptFor(bob, replacement)
+	require.False(t, ok, "an old prompt must not migrate to a new generation")
+	require.True(t, s.ClassifyReply("install", "workspace", "dm", "bob"))
+}
+
+func TestActivePromptForWhilePasswordValidationRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		validation error
+	}{
+		{name: "success"},
+		{name: "failure", validation: errors.New("fake validation failure")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := Open(t.TempDir())
+			require.NoError(t, err)
+			p := testPrincipal("alice")
+			target, _, err := s.Select(testScope("thread"), "clickhouse", "https://cluster.example")
+			require.NoError(t, err)
+			prompt := Prompt{Principal: p, DMChannelID: "dm", DMRootID: "password-prompt", Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Hour)}
+			require.NoError(t, s.PutPrompt(prompt))
+			started := make(chan struct{})
+			release := make(chan struct{})
+			releaseValidation := sync.OnceFunc(func() { close(release) })
+			t.Cleanup(releaseValidation)
+			done := make(chan error, 1)
+			go func() {
+				done <- s.CompletePassword(context.Background(), p, "dm", "password-prompt", "fake-password", func(context.Context, Target, Credential) error {
+					close(started)
+					<-release
+					return tc.validation
+				})
+			}()
+			select {
+			case <-started: // Prompt has already been durably marked Completed.
+			case err := <-done:
+				t.Fatalf("validation did not start: %v", err)
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for validation to start")
+			}
+			active, ok := s.ActivePromptFor(p, target)
+			require.True(t, ok)
+			require.Equal(t, prompt.DMRootID, active.DMRootID)
+			require.True(t, active.Completed)
+			require.True(t, s.HasActivePrompt(p, target))
+			_, ok = s.ActivePromptFor(testPrincipal("bob"), target)
+			require.False(t, ok)
+			releaseValidation()
+			select {
+			case err = <-done:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for validation to finish")
+			}
+			if tc.validation == nil {
+				require.NoError(t, err)
+				require.True(t, s.HasCredential(p, target))
+			} else {
+				require.ErrorIs(t, err, ErrValidation)
+				require.False(t, s.HasCredential(p, target))
+			}
+			_, ok = s.ActivePromptFor(p, target)
+			require.False(t, ok)
+			require.False(t, s.HasActivePrompt(p, target))
+		})
+	}
+}
+
+func TestPutPromptRejectsUsernameStageButRetainsHistoricalClassification(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	require.NoError(t, err)
+	p := testPrincipal("alice")
+	target, _, err := s.Select(testScope("thread"), "clickhouse", "https://cluster.example")
+	require.NoError(t, err)
+	old := Prompt{Principal: p, DMChannelID: "dm", DMRootID: "old-username", Target: target, Stage: "username", ExpiresAt: time.Now().Add(time.Hour)}
+	require.ErrorIs(t, s.PutPrompt(old), ErrInvalid)
+	// A prompt written before the password-only change still classifies late
+	// replies after restart, but cannot resume a username collection stage.
+	s.state.Prompts[promptKey("install", "workspace", "dm", "old-username")] = old
+	require.NoError(t, s.saveState())
+	restarted, err := Open(dir)
+	require.NoError(t, err)
+	require.True(t, restarted.ClassifyReply("install", "workspace", "dm", "old-username"))
+	_, ok := restarted.PromptFor(p, "dm", "old-username")
+	require.False(t, ok)
+	_, ok = restarted.ActivePromptFor(p, target)
+	require.False(t, ok)
 }
 
 func TestValidationFailureNeverLeaksSecret(t *testing.T) {

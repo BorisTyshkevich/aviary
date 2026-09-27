@@ -55,11 +55,14 @@ transport as unavailable; they do not fall through to the database driver.
 The original command's trusted Slack metadata supplies the sender and destination
 thread; no thread-link argument is needed. Apply sender/channel authorization.
 The bot opens a one-to-one DM and identifies the target, destination thread and
-proposed database username. Default the username to the sender's Slack profile
-email, requiring `users:read` and `users:read.email`. If unavailable or the user
-requests another username, collect it privately through deterministic
-setup, then issue the password prompt. Email is a database login default, not the
-credential ownership key; ownership remains the trusted Slack principal.
+selected database username. `connect [transport] URL [username]` accepts an
+optional non-secret database username immediately after the URL. Otherwise use
+the sender's Slack profile email, requiring `users:read` and `users:read.email`.
+Send exactly one private password prompt, without a username-confirmation step.
+If the email cannot be read, explain how to add the Slack scope or supply the
+username argument; do not ask for a password with an unknown username. Email is
+a database login default, not the credential ownership key; ownership remains
+the trusted Slack principal.
 
 The user replies in the DM password prompt's thread with only the password.
 Treat the entire reply as the password, preserving spaces and punctuation.
@@ -163,7 +166,13 @@ restrictions. Verify the implementation through Aviary's MCP control plane.
 ## Consequences
 
 Users connect in the destination thread and reply to a private password prompt.
-Slack email access requires the additional scope. A private username confirmation
-accepts `use proposed` or a different username before the separate password prompt.
+Slack email access requires the additional scope. An optional public username
+argument overrides the email; there is no private username-confirmation step.
 The thread retains one unambiguous cluster and transport while participants use
 their own credentials. Direct ClickHouse is useful before MCP OAuth is available.
+
+Read-only account verification accepts `readonly=1` and `readonly=2`, with the
+same conservative read-only grant checks. Mode 2 allows ordinary setting changes;
+deployment profiles pin readonly and use positive minima plus maxima for bounded
+resources, preventing zero from disabling a limit. Credentials with write grants
+remain unacceptable in either mode.

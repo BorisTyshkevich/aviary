@@ -373,24 +373,44 @@ func (s *Service) HasCredential(p Principal, t Target) bool {
 	return ok
 }
 
-// HasActivePrompt reports whether private setup is already pending for this
-// principal and exact target, across both username and password stages.
-func (s *Service) HasActivePrompt(p Principal, t Target) bool {
+// ActivePromptFor returns a pending or validating password prompt for the
+// exact principal and current target. In-flight validation remains active even
+// after the prompt is durably consumed or expires, preventing duplicate setup.
+func (s *Service) ActivePromptFor(p Principal, t Target) (Prompt, bool) {
 	if !p.valid() {
-		return false
+		return Prompt{}, false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.currentLocked(t) {
-		return false
+		return Prompt{}, false
 	}
 	now := time.Now()
+	var active Prompt
+	found := false
+	activeCompleting := false
 	for _, prompt := range s.state.Prompts {
-		if prompt.Principal == p && prompt.Target == t && !prompt.Completed && now.Before(prompt.ExpiresAt) {
-			return true
+		if prompt.Principal != p || prompt.Target != t || prompt.Stage != "password" {
+			continue
+		}
+		completing := s.completing[promptKey(p.InstallationID, p.WorkspaceID, prompt.DMChannelID, prompt.DMRootID)]
+		if !completing && (prompt.Completed || !now.Before(prompt.ExpiresAt)) {
+			continue
+		}
+		if !found || (completing && !activeCompleting) || (completing == activeCompleting && prompt.ExpiresAt.After(active.ExpiresAt)) {
+			active = prompt
+			found = true
+			activeCompleting = completing
 		}
 	}
-	return false
+	return active, found
+}
+
+// HasActivePrompt reports whether a password prompt is pending or validating
+// for the exact principal and current target.
+func (s *Service) HasActivePrompt(p Principal, t Target) bool {
+	_, ok := s.ActivePromptFor(p, t)
+	return ok
 }
 
 // CredentialFor returns a login only for the matching interactive principal.
@@ -417,7 +437,7 @@ func promptKey(installation, workspace, channel, root string) string {
 
 // PutPrompt durably records non-secret private prompt correlation metadata.
 func (s *Service) PutPrompt(p Prompt) error {
-	if !p.Principal.valid() || p.DMChannelID == "" || p.DMRootID == "" || (p.Stage != "username" && p.Stage != "password") || p.ExpiresAt.IsZero() || p.Target.Scope.InstallationID != p.Principal.InstallationID || p.Target.Scope.WorkspaceID != p.Principal.WorkspaceID {
+	if !p.Principal.valid() || p.DMChannelID == "" || p.DMRootID == "" || p.Stage != "password" || p.ExpiresAt.IsZero() || p.Target.Scope.InstallationID != p.Principal.InstallationID || p.Target.Scope.WorkspaceID != p.Principal.WorkspaceID {
 		return ErrInvalid
 	}
 	s.mu.Lock()
@@ -471,10 +491,10 @@ func (s *Service) PromptFor(p Principal, dmChannel, dmRoot string) (Prompt, bool
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	v, ok := s.state.Prompts[promptKey(p.InstallationID, p.WorkspaceID, dmChannel, dmRoot)]
-	return v, ok && v.Principal == p && !v.Completed && time.Now().Before(v.ExpiresAt) && s.currentLocked(v.Target)
+	return v, ok && v.Principal == p && v.Stage == "password" && !v.Completed && time.Now().Before(v.ExpiresAt) && s.currentLocked(v.Target)
 }
 
-// FinishPrompt durably tombstones a completed username prompt.
+// FinishPrompt durably tombstones a private prompt after a delivery failure.
 func (s *Service) FinishPrompt(p Principal, dmChannel, dmRoot string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

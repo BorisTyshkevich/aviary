@@ -601,15 +601,26 @@ func (c *SlackChannel) normalizeMessageRepliedEvent(ctx context.Context, event *
 		Timestamp: threadTS,
 		Inclusive: true,
 		Oldest:    latestReply,
-		Limit:     1,
+		Latest:    latestReply,
+		Limit:     15,
 	})
 	if err != nil || len(msgs) == 0 {
 		c.logf("slack: failed to fetch latest thread reply channel=%s thread=%s reply=%s: %v", channelID, threadTS, latestReply, err)
 		return event, false
 	}
-	reply := msgs[len(msgs)-1]
-	if reply.Timestamp != latestReply {
-		c.logf("slack: latest thread reply fetch returned ts=%s expected=%s", reply.Timestamp, latestReply)
+	// Slack may include the parent alongside replies. Only the exact requested
+	// reply may enter intake, regardless of response ordering.
+	var reply slack.Message
+	found := false
+	for _, msg := range msgs {
+		if msg.Timestamp == latestReply && (msg.ThreadTimestamp == "" || msg.ThreadTimestamp == threadTS) {
+			reply, found = msg, true
+			break
+		}
+	}
+	if !found {
+		c.logf("slack: ignoring thread response without expected reply ts=%s", latestReply)
+		return event, false
 	}
 
 	return &slackevents.MessageEvent{

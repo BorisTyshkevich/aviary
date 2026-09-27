@@ -5,7 +5,7 @@ standard HTTP client does not provide ClickHouse's typed result decoding and
 query lifecycle. It accepts only HTTPS endpoints approved by `connections`.
 
 Deploy a dedicated account with least-privilege read and inspection grants and
-a server profile enforcing `readonly = 1`. The initial verifier accepts only
+a server profile enforcing `readonly = 1` or `readonly = 2`. The initial verifier accepts only
 the effective `SHOW GRANTS FINAL` forms `GRANT SELECT ON ...` and `GRANT SHOW
 ON ...`; it fails closed for role, `ALL`, administrative, or unrecognized
 grants, including comma-separated access lists. Do not give this account
@@ -54,3 +54,15 @@ client disconnect, also set `cancel_http_readonly_queries_on_client_close = 1`
 in the database profile. Require server `max_execution_time`, memory and result
 limits regardless: disconnects and network failures are not a substitute for
 server limits. These are profile requirements, not query settings sent by Aviary.
+
+Slack connection setup uses `connect [clickhouse] URL [username]`. The optional
+username is not a secret and belongs in the command. Otherwise the login comes
+from the authenticated sender's Slack profile email. There is exactly one DM
+password prompt, never a separate username prompt. An unavailable email produces
+an actionable setup error instead of treating a password as a username.
+
+Mode 2 permits setting changes while retaining the read-only boundary. Keep
+`readonly` pinned and constrain resource settings with both positive minima and
+maximums: zero disables several limits. For example, use
+`max_execution_time=30 MIN 1 MAX 30`. The adapter retains compatibility with
+mode 1 and does not rely on client-side SQL classification to establish safety.

@@ -189,7 +189,11 @@ func (a Adapter) ValidateReadOnly(ctx context.Context, target Target, credential
 	if err != nil {
 		return fmt.Errorf("ClickHouse readonly verification query failed")
 	}
-	if len(r.Rows) != 1 || len(r.Rows[0]) != 1 || fmt.Sprint(r.Rows[0][0]) != "1" {
+	if r.Truncated || len(r.Rows) != 1 || len(r.Rows[0]) != 1 {
+		return fmt.Errorf("ClickHouse readonly setting is not enforced")
+	}
+	readonly := fmt.Sprint(r.Rows[0][0])
+	if readonly != "1" && readonly != "2" {
 		return fmt.Errorf("ClickHouse readonly setting is not enforced")
 	}
 	grants, err := a.Query(ctx, target, credential, Request{SQL: "SHOW GRANTS FINAL", MaxRows: 128, MaxBytes: 32 * 1024, Timeout: 10 * time.Second})

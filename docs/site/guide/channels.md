@@ -69,7 +69,7 @@ You usually need to be a workspace admin, app manager, or someone allowed to ins
 3. Choose **From scratch**.
 4. Give the app a name like `Aviary` and choose the Slack workspace where you want the bot to live.
 5. Open **OAuth & Permissions**.
-6. Under **Bot Token Scopes**, add the permissions Aviary needs. A practical starting set is `chat:write`, `files:write`, `channels:history`, `groups:history`, `im:history`, `im:write`, `channels:read`, `groups:read`, `users:read`, `users:read.email`, and `app_mentions:read`. Aviary uses `files:write` to attach complete Markdown answers to longer conversational replies. Private database setup needs the DM scopes; `users:read.email` supplies the proposed database username.
+6. Under **Bot Token Scopes**, add the permissions Aviary needs. A practical starting set is `chat:write`, `files:write`, `channels:history`, `groups:history`, `im:history`, `im:write`, `channels:read`, `groups:read`, `users:read`, `users:read.email`, and `app_mentions:read`. Aviary uses `files:write` to attach complete Markdown answers to longer conversational replies. Private database setup needs the DM scopes; `users:read.email` supplies the default database username.
 7. Still on **OAuth & Permissions**, click **Install to Workspace** or **Reinstall to Workspace**.
 8. After installation, copy the **Bot User OAuth Token**. This is the value that starts with `xoxb-`. Put that into Aviary's `token` field.
 9. Open **Socket Mode** in the Slack app settings and turn on **Enable Socket Mode**.
@@ -128,7 +128,7 @@ Slack-specific notes:
 
 ### Connect a Database in a Slack Thread
 
-In the destination channel thread, send `@Aviary connect https://cluster.example.com:8443`. Aviary selects that ClickHouse endpoint for the thread and sends you a private DM. Confirm the proposed username with `use proposed`, or reply with another username in the username prompt thread. Then reply to the separate password prompt thread with only your password. Spaces and punctuation in that reply are part of the password. Send it as plain text: Slack's rich-text composer can interpret `*`, `_`, `~`, and backticks as formatting, making the typed characters ambiguous. Return to the original thread for database work.
+In the destination channel thread, send `@Aviary connect https://cluster.example.com:8443`. Aviary uses your Slack email as the database username and sends one private password prompt. To use another login, append the non-secret username: `@Aviary connect https://cluster.example.com:8443 reporting_reader`. An explicit transport also works: `@Aviary connect clickhouse https://cluster.example.com:8443 reporting_reader`. If Slack email is unavailable, supply the username argument or add `users:read.email` and reinstall the Slack app. Reply in the private password prompt's thread with only your password. Spaces and punctuation in that reply are part of the password. Send it as plain text: Slack's rich-text composer can interpret `*`, `_`, `~`, and backticks as formatting, making the typed characters ambiguous. Return to the original thread for database work.
 
 Use `@Aviary status` to see the thread target and whether your own credentials are ready. Use `@Aviary disconnect` to detach it. Each participant supplies their own credentials for the shared target. A connection command must match one authorized agent when the bot is shared across agents. The endpoint must pass the configured connection network policy. An inferred or explicit MCP target reports unsupported transport until outbound MCP support is available.
 
