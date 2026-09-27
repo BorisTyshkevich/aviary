@@ -309,6 +309,7 @@ func TestAgentRunner_BareOverrideClearsSystemPrompt(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		assert.FailNow(t, "timeout")
 	}
+	runner.Wait()
 
 	if assert.Len(t, provider.requests, 1) {
 		assert.Equal(t, "", provider.requests[0].System)
@@ -547,6 +548,7 @@ func TestAgentRunner_NonInteractiveJobPrompt(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		assert.FailNow(t, "timeout")
 	}
+	runner.Wait()
 
 	if assert.Len(t, provider.requests, 1) {
 		assert.Contains(t, provider.requests[0].System, "IMPORTANT: This is a non-interactive job run.")
@@ -796,12 +798,12 @@ func TestAgentRunner_StopAndAccessors(t *testing.T) {
 
 	runner.Stop()
 	typCh := make(chan StreamEventType, 1)
-	runner.Prompt(context.Background(), "hi", func(e StreamEvent) { typCh <- e.Type })
+	admission := runner.Prompt(context.Background(), "hi", func(e StreamEvent) { typCh <- e.Type })
+	assert.Equal(t, AdmissionRejectedStopping, admission.Status)
 	select {
 	case typ := <-typCh:
-		assert.Equal(t, StreamEventStop, typ)
-	case <-time.After(1 * time.Second):
-		assert.FailNow(t, "timeout")
+		assert.Fail(t, "rejected admission emitted a stream event", "type=%s", typ)
+	default:
 	}
 	assert.Equal(t, a, runner.Agent())
 	assert.Equal(t, cfg, runner.Config())
@@ -810,6 +812,7 @@ func TestAgentRunner_StopAndAccessors(t *testing.T) {
 
 func TestManager_ReconcileAndLookup(t *testing.T) {
 	mgr := NewManager(nil)
+	t.Cleanup(func() { mgr.recoveries.Wait() })
 
 	cfg := &config.Config{Agents: []config.AgentConfig{{Name: "bot1", Model: "anthropic/claude"}, {Name: "bot2", Model: "openai/gpt-4"}}}
 	mgr.Reconcile(cfg)
@@ -836,6 +839,7 @@ func TestManager_ReconcileAndLookup(t *testing.T) {
 
 func TestManager_Reconcile_UsesGlobalDefaults(t *testing.T) {
 	mgr := NewManager(nil)
+	t.Cleanup(func() { mgr.recoveries.Wait() })
 
 	cfg := &config.Config{
 		Agents: []config.AgentConfig{{Name: "bot", Model: ""}},
@@ -881,6 +885,7 @@ func TestManager_Reconcile_UsesGlobalDefaults(t *testing.T) {
 
 func TestManager_Reconcile_UpdatesOnPermissionsChange(t *testing.T) {
 	mgr := NewManager(nil)
+	t.Cleanup(func() { mgr.recoveries.Wait() })
 
 	cfg := &config.Config{
 		Agents: []config.AgentConfig{{

@@ -538,6 +538,64 @@ func TestWorkerPool_ExecuteJob(t *testing.T) {
 
 }
 
+func TestWorkerPool_RejectedRunnerDoesNotWaitForCallback(t *testing.T) {
+	setupSchedulerDataDir(t)
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	runner.Stop()
+	p := NewWorkerPool(NewJobQueue(), mgr, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err := p.executeJob(ctx, &domain.Job{ID: "job_rejected", AgentID: "alpha", TaskID: "task/alpha", Prompt: "hello"})
+	assert.ErrorContains(t, err, "stopping")
+	assert.NoError(t, ctx.Err(), "rejected admission left the job waiting for a callback")
+}
+
+func TestWorkerPool_RejectedAdmissionDoesNotSpendRetry(t *testing.T) {
+	setupSchedulerDataDir(t)
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	runner.Stop()
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("task/alpha", "alpha", "hello", "", 1, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	assert.Equal(t, job.ID, claimed.ID)
+	assert.Equal(t, 1, claimed.Attempts)
+	p := NewWorkerPool(queue, mgr, 1)
+	p.processJob(context.Background(), claimed)
+	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusPending, saved.Status)
+	assert.Zero(t, saved.Attempts)
+	assert.NotNil(t, saved.NextRetryAt)
+}
+
+func TestWorkerPool_CanceledUnadmittedJobDoesNotRequeue(t *testing.T) {
+	setupSchedulerDataDir(t)
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "alpha", Model: "m"}}})
+	runner, ok := mgr.Get("alpha")
+	assert.True(t, ok)
+	runner.Stop()
+	queue := NewJobQueue()
+	job, err := queue.Enqueue("task/alpha", "alpha", "hello", "", 1, "", "")
+	assert.NoError(t, err)
+	claimed, err := queue.Claim()
+	assert.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	NewWorkerPool(queue, mgr, 1).processJob(ctx, claimed)
+	saved, err := store.ReadJSON[domain.Job](store.JobPath("alpha", job.ID))
+	assert.NoError(t, err)
+	assert.Equal(t, domain.JobStatusCanceled, saved.Status)
+}
+
 func TestWorkerPool_ExecuteJob_RepliesToSessionDelivery(t *testing.T) {
 	setupSchedulerDataDir(t)
 

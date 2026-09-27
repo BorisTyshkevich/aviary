@@ -116,3 +116,8 @@ type MessageEditor interface {
 type ThreadMessageSender interface {
 	SendThreadMessageAndGetID(channel, threadTS, text string) (msgID string, err error)
 }
+
+// ContextThreadMessageSender sends a plain terminal notice with a deadline.
+type ContextThreadMessageSender interface {
+	SendThreadPlainTextContext(ctx context.Context, channel, threadTS, text string) error
+}

@@ -91,7 +91,10 @@ func TestAgentStop_FoundAndStopped(t *testing.T) {
 
 	mgr := agent.NewManager(nil)
 	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "test/x"}}})
+	assert.NoError(t, mgr.Drain(context.Background()))
 	SetDeps(&Deps{Agents: mgr})
+	stale := store.CheckpointPath("bot", "old-run")
+	assert.NoError(t, store.WriteJSON(stale, agent.RunCheckpoint{AgentName: "bot", SessionID: "old-session", Message: "fake request"}))
 
 	d := NewDispatcher("https://localhost:16677", "")
 
@@ -99,6 +102,7 @@ func TestAgentStop_FoundAndStopped(t *testing.T) {
 	out, err := d.CallTool(context.Background(), "agent_stop", map[string]any{"name": "bot"})
 	assert.NoError(t, err)
 	assert.True(t, strings.Contains(out, "stopped"))
+	assert.NoFileExists(t, stale, "explicit agent stop must prevent stale request replay")
 
 	// stop unknown agent
 	toolCallContains(t, d, "agent_stop", map[string]any{"name": "unknown-agent"}, "not found")
@@ -1281,6 +1285,33 @@ func TestAgentRun_AgentNotFound(t *testing.T) {
 
 	d := NewDispatcher("https://localhost:16677", "")
 	toolCallContains(t, d, "agent_run", map[string]any{"name": "unknown", "message": "hello"}, "not found")
+}
+
+func TestAgentRun_StoppedRunnerReturnsWithoutWaiting(t *testing.T) {
+	old := GetDeps()
+	t.Cleanup(func() { SetDeps(old) })
+	prevChecker := checkServerRunning
+	t.Cleanup(func() { checkServerRunning = prevChecker })
+	SetServerChecker(func() bool { return false })
+
+	mgr := agent.NewManager(nil)
+	mgr.Reconcile(&config.Config{Agents: []config.AgentConfig{{Name: "bot", Model: "test/x"}}})
+	runner, ok := mgr.Get("bot")
+	require.True(t, ok)
+	runner.Stop()
+	SetDeps(&Deps{Agents: mgr})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, err := NewDispatcher("https://localhost:16677", "").CallTool(ctx, "agent_run", map[string]any{
+		"name": "bot", "message": "hello",
+	})
+	if err != nil {
+		require.ErrorContains(t, err, "restarting")
+	} else {
+		require.Contains(t, out, "restarting")
+	}
+	require.NoError(t, ctx.Err(), "rejected admission left MCP waiting for a callback")
 }
 
 // ── job_run_now with nil scheduler ────────────────────────────────────────────

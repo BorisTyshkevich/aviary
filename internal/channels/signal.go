@@ -249,11 +249,11 @@ type SignalChannel struct {
 	replyToReplies   bool // respond to quoted replies targeting agent's messages
 	sendReadReceipts bool // send read receipts for messages the agent will respond to
 
-	// daemon is set in managed mode; nil in external mode.
-	// It is the shared subprocess for this phone number.
+	// daemon is set in managed mode; nil in external mode. addrMu protects
+	// publication to callers that inspect the channel while Start is running.
 	daemon *sharedDaemon
 
-	// addr and addrMu are used in external mode only.
+	// addrMu also protects the external address.
 	addrMu sync.RWMutex
 	addr   string
 
@@ -310,12 +310,13 @@ func (c *SignalChannel) SetLogSink(s *LogSink) {
 // getAddr returns the current daemon TCP address. In managed mode it reads
 // from the shared daemon; in external mode it reads from the channel's own addr.
 func (c *SignalChannel) getAddr() string {
-	if c.daemon != nil {
-		return c.daemon.getAddr()
-	}
 	c.addrMu.RLock()
-	defer c.addrMu.RUnlock()
-	return c.addr
+	daemon, addr := c.daemon, c.addr
+	c.addrMu.RUnlock()
+	if daemon != nil {
+		return daemon.getAddr()
+	}
+	return addr
 }
 
 // ShowTyping reports whether the typing-indicator feature is enabled for this channel.
@@ -701,7 +702,9 @@ func (c *SignalChannel) Start(ctx context.Context) error {
 
 	// Managed mode: share one signal-cli daemon per phone number.
 	d := globalDaemonHub.acquire(c.phone)
+	c.addrMu.Lock()
 	c.daemon = d
+	c.addrMu.Unlock()
 	d.addSub(c)
 	d.once.Do(func() {
 		dCtx, cancel := context.WithCancel(ctx)
@@ -735,16 +738,19 @@ func (c *SignalChannel) DaemonInfo() *DaemonInfo {
 	if c.initAddr != "" {
 		return &DaemonInfo{Addr: c.initAddr, External: true}
 	}
-	if c.daemon == nil {
+	c.addrMu.RLock()
+	daemon := c.daemon
+	c.addrMu.RUnlock()
+	if daemon == nil {
 		return nil
 	}
-	c.daemon.procMu.RLock()
-	pid := c.daemon.procPID
-	started := c.daemon.procStarted
-	c.daemon.procMu.RUnlock()
+	daemon.procMu.RLock()
+	pid := daemon.procPID
+	started := daemon.procStarted
+	daemon.procMu.RUnlock()
 	// Return a non-nil DaemonInfo even when PID==0 so the daemons handler can
 	// deduplicate entries for channels sharing the same managed daemon.
-	return &DaemonInfo{PID: pid, Addr: c.daemon.getAddr(), Started: started}
+	return &DaemonInfo{PID: pid, Addr: daemon.getAddr(), Started: started}
 }
 
 // runLoop runs the reconnect loop against a known daemon address.

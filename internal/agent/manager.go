@@ -30,6 +30,9 @@ type Manager struct {
 	cfg         *config.Config // latest reconciled config, for checkpoint timeout
 	connections *connections.Service
 	preparation *preparation.Engine
+	owned       map[*AgentRunner]struct{}
+	recoveries  sync.WaitGroup
+	stopped     bool
 }
 
 // SetPreparationEngine installs scoped artifact storage before reconciliation.
@@ -55,6 +58,7 @@ func (m *Manager) SetConnectionService(service *connections.Service) {
 func NewManager(factory *llm.Factory) *Manager {
 	return &Manager{
 		runners: make(map[string]*AgentRunner),
+		owned:   make(map[*AgentRunner]struct{}),
 		session: NewSessionManager(),
 		factory: factory,
 	}
@@ -65,6 +69,9 @@ func NewManager(factory *llm.Factory) *Manager {
 func (m *Manager) Reconcile(cfg *config.Config) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopped {
+		return
+	}
 
 	m.cfg = cfg
 
@@ -78,7 +85,7 @@ func (m *Manager) Reconcile(cfg *config.Config) {
 	for name, runner := range m.runners {
 		if _, ok := desired[name]; !ok {
 			slog.Info("agent removed", "name", name)
-			runner.Stop()
+			m.retireRunner(runner)
 			delete(m.runners, name)
 		}
 	}
@@ -101,7 +108,7 @@ func (m *Manager) Reconcile(cfg *config.Config) {
 				continue
 			}
 			slog.Info("agent updated", "name", name)
-			existing.Stop()
+			m.retireRunner(existing)
 		} else {
 			slog.Info("agent started", "name", name)
 		}
@@ -126,7 +133,12 @@ func (m *Manager) Reconcile(cfg *config.Config) {
 		runner.connections = m.connections
 		runner.preparation = m.preparation
 		m.runners[name] = runner
-		go m.recoverCheckpoints(runner)
+		m.owned[runner] = struct{}{}
+		m.recoveries.Add(1)
+		go func() {
+			defer m.recoveries.Done()
+			m.recoverCheckpoints(runner)
+		}()
 	}
 }
 
@@ -134,8 +146,11 @@ func (m *Manager) Reconcile(cfg *config.Config) {
 // prompt checkpoints and either re-issues them or sends a timeout notification.
 func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
 	timeout := config.DefaultFailedTaskTimeout
-	if m.cfg != nil {
-		timeout = m.cfg.Server.EffectiveFailedTaskTimeout()
+	m.mu.RLock()
+	cfg := m.cfg
+	m.mu.RUnlock()
+	if cfg != nil {
+		timeout = cfg.Server.EffectiveFailedTaskTimeout()
 	}
 
 	dir := store.CheckpointDir(runner.agent.ID)
@@ -149,66 +164,92 @@ func (m *Manager) recoverCheckpoints(runner *AgentRunner) {
 			continue
 		}
 		path := filepath.Join(dir, e.Name())
-		cp, err := store.ReadJSON[RunCheckpoint](path)
-		if err != nil {
-			slog.Warn("agent: ignoring unreadable checkpoint", "path", path, "err", err)
-			_ = store.DeleteJSON(path)
-			continue
-		}
-		if cp.requiresTrustedIngress() {
-			// Deferred/suppressed turns depend on their original trusted channel
-			// consumer. Replaying them here could expose private context or mark
-			// an answer complete without delivering it.
-			slog.Info("agent: checkpoint needs trusted ingress, notifying session",
-				"agent", runner.agent.Name, "session", cp.SessionID)
-			msg := "I was interrupted. Please resend your request if it is still needed."
-			runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
-			deliverToSession(runner.agent.ID, cp.SessionID, msg)
-			_ = store.DeleteJSON(path)
-			continue
-		}
-
-		age := time.Since(cp.CreatedAt)
-		if age > timeout {
-			slog.Info("agent: checkpoint timed out, notifying session",
-				"agent", runner.agent.Name, "session", cp.SessionID, "age", age)
-			msg := fmt.Sprintf("I was interrupted %s ago and the recovery window (%s) has passed. Please resend your request if it is still needed.", age.Round(time.Second), timeout)
-			runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
-			deliverToSession(runner.agent.ID, cp.SessionID, msg)
-			_ = store.DeleteJSON(path)
-			continue
-		}
-		if cp.RetryCount >= maxCheckpointRecoveryRetries {
-			slog.Info("agent: checkpoint retry limit reached, notifying session",
-				"agent", runner.agent.Name, "session", cp.SessionID,
-				"retry", cp.RetryCount, "limit", maxCheckpointRecoveryRetries)
-			msg := fmt.Sprintf("I was interrupted and retry recovery %d times without finishing, so I stopped retrying. Please resend your request if it is still needed.", cp.RetryCount)
-			runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
-			deliverToSession(runner.agent.ID, cp.SessionID, msg)
-			_ = store.DeleteJSON(path)
-			continue
-		}
-		if !cp.LastRecoveredAt.IsZero() {
-			sinceLastRecovery := time.Since(cp.LastRecoveredAt)
-			if sinceLastRecovery < checkpointRecoveryCooldown {
-				slog.Debug("agent: skipping recent checkpoint recovery",
-					"agent", runner.agent.Name, "session", cp.SessionID,
-					"retry", cp.RetryCount, "since_last_recovery", sinceLastRecovery)
-				continue
+		release, claimed := ClaimCheckpointRecovery(path, func() {
+			if !runner.Stopping() {
+				m.recoverCheckpoints(runner)
 			}
+		})
+		if !claimed {
+			continue
 		}
+		func() {
+			defer release()
+			m.recoverCheckpoint(runner, e.Name(), path, timeout)
+		}()
+	}
+}
 
-		slog.Info("agent: recovering interrupted prompt",
+func (m *Manager) recoverCheckpoint(runner *AgentRunner, name, path string, timeout time.Duration) {
+	cp, err := store.ReadJSON[RunCheckpoint](path)
+	if err != nil {
+		slog.Warn("agent: ignoring unreadable checkpoint", "path", path, "err", err)
+		_ = store.DeleteJSON(path)
+		return
+	}
+	if cp.requiresTrustedIngress() {
+		// Deferred/suppressed turns depend on their original trusted channel
+		// consumer. Replaying them here could expose private context or mark
+		// an answer complete without delivering it.
+		slog.Info("agent: checkpoint needs trusted ingress, notifying session",
+			"agent", runner.agent.Name, "session", cp.SessionID)
+		msg := "I was interrupted. Please resend your request if it is still needed."
+		runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
+		deliverToSession(runner.agent.ID, cp.SessionID, msg)
+		_ = store.DeleteJSON(path)
+		return
+	}
+
+	age := time.Since(cp.CreatedAt)
+	if age > timeout {
+		slog.Info("agent: checkpoint timed out, notifying session",
+			"agent", runner.agent.Name, "session", cp.SessionID, "age", age)
+		msg := fmt.Sprintf("I was interrupted %s ago and the recovery window (%s) has passed. Please resend your request if it is still needed.", age.Round(time.Second), timeout)
+		runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
+		deliverToSession(runner.agent.ID, cp.SessionID, msg)
+		_ = store.DeleteJSON(path)
+		return
+	}
+	if cp.RetryCount >= maxCheckpointRecoveryRetries {
+		slog.Info("agent: checkpoint retry limit reached, notifying session",
 			"agent", runner.agent.Name, "session", cp.SessionID,
-			"age", age, "retry", cp.RetryCount)
-		// Increment retry count and re-write checkpoint before re-issuing.
-		cp.RetryCount++
-		cp.LastRecoveredAt = time.Now()
-		_ = store.WriteJSON(path, cp)
+			"retry", cp.RetryCount, "limit", maxCheckpointRecoveryRetries)
+		msg := fmt.Sprintf("I was interrupted and retry recovery %d times without finishing, so I stopped retrying. Please resend your request if it is still needed.", cp.RetryCount)
+		runner.appendSessionMessage(cp.SessionID, domain.MessageRoleAssistant, msg, "", "")
+		deliverToSession(runner.agent.ID, cp.SessionID, msg)
+		_ = store.DeleteJSON(path)
+		return
+	}
+	if !cp.LastRecoveredAt.IsZero() {
+		sinceLastRecovery := time.Since(cp.LastRecoveredAt)
+		if sinceLastRecovery < checkpointRecoveryCooldown {
+			slog.Debug("agent: skipping recent checkpoint recovery",
+				"agent", runner.agent.Name, "session", cp.SessionID,
+				"retry", cp.RetryCount, "since_last_recovery", sinceLastRecovery)
+			return
+		}
+	}
 
-		ctx := WithSessionID(context.Background(), cp.SessionID)
-		checkpointID := strings.TrimSuffix(e.Name(), filepath.Ext(e.Name()))
-		runner.recoverPrompt(ctx, checkpointID, path, cp)
+	slog.Info("agent: recovering interrupted prompt",
+		"agent", runner.agent.Name, "session", cp.SessionID,
+		"age", age, "retry", cp.RetryCount)
+	// Increment retry count and re-write checkpoint before re-issuing.
+	original := cp
+	cp.RetryCount++
+	cp.LastRecoveredAt = time.Now()
+	if err := store.WriteJSON(path, cp); err != nil {
+		slog.Warn("agent: could not save recovery attempt", "path", path, "err", err)
+		return
+	}
+
+	ctx := WithSessionID(context.Background(), cp.SessionID)
+	checkpointID := strings.TrimSuffix(name, filepath.Ext(name))
+	if admission := runner.recoverPrompt(ctx, checkpointID, path, cp); admission.Status == AdmissionRejectedStopping {
+		if checkpointRetired(path) {
+			return
+		}
+		if err := store.WriteJSON(path, original); err != nil {
+			slog.Warn("agent: could not restore rejected recovery", "path", path, "err", err)
+		}
 	}
 }
 
@@ -241,8 +282,44 @@ func (m *Manager) List() []*domain.Agent {
 // Stop stops all agents.
 func (m *Manager) Stop() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.stopped = true
 	for _, r := range m.runners {
 		r.Stop()
 	}
+	m.mu.Unlock()
+}
+
+// Drain waits for every runner this manager still owns, including replaced
+// runners whose terminal callbacks may remain active after a config reload.
+func (m *Manager) Drain(ctx context.Context) error {
+	m.mu.RLock()
+	runners := make([]*AgentRunner, 0, len(m.owned))
+	for r := range m.owned {
+		runners = append(runners, r)
+	}
+	m.mu.RUnlock()
+	done := make(chan struct{})
+	go func() {
+		m.recoveries.Wait()
+		for _, r := range runners {
+			r.Wait()
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) retireRunner(r *AgentRunner) {
+	r.Stop()
+	go func() {
+		r.Wait()
+		m.mu.Lock()
+		delete(m.owned, r)
+		m.mu.Unlock()
+	}()
 }

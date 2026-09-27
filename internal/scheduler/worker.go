@@ -16,6 +16,8 @@ import (
 	"github.com/lsegal/aviary/internal/domain"
 )
 
+var errUnadmittedJob = errors.New("scheduled agent run was not admitted")
+
 const pollInterval = 5 * time.Second
 
 // WorkerPool pulls jobs from the queue and executes them via agent runners.
@@ -130,6 +132,22 @@ func (p *WorkerPool) processJob(ctx context.Context, job *domain.Job) {
 
 	slog.Info("executing job", "id", job.ID, "task", job.TaskID, "agent", job.AgentID)
 	if err := p.executeJob(jobCtx, job); err != nil {
+		if errors.Is(err, errUnadmittedJob) {
+			// Serialize the final queue state with StopJobs. If the user stop
+			// won, cancellation remains final; otherwise this job is no longer
+			// active when it returns to pending.
+			p.activeMu.Lock()
+			if jobCtx.Err() != nil {
+				if cancelErr := p.queue.Cancel(job.ID); cancelErr != nil {
+					slog.Warn("marking job canceled", "id", job.ID, "err", cancelErr)
+				}
+			} else if requeueErr := p.queue.RequeueUnadmitted(job.ID); requeueErr != nil {
+				slog.Warn("requeueing unadmitted job", "id", job.ID, "err", requeueErr)
+			}
+			delete(p.active, job.ID)
+			p.activeMu.Unlock()
+			return
+		}
 		if errors.Is(err, context.Canceled) {
 			if cancelErr := p.queue.Cancel(job.ID); cancelErr != nil {
 				slog.Warn("marking job canceled", "id", job.ID, "err", cancelErr)
@@ -219,12 +237,11 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 		prompt = "Continue the unfinished scheduled task from this existing session. Complete any remaining work for the original request:\n\n" + job.Prompt
 	}
 
-	var lastErr error
 	var reply strings.Builder
 	var logs jobLogBuilder
 	startedAt := time.Now().UTC()
-	done := make(chan struct{}, 1)
-	runner.Prompt(ctx, prompt, func(e agent.StreamEvent) {
+	terminal := make(chan error, 1)
+	admission := runner.Prompt(ctx, prompt, func(e agent.StreamEvent) {
 		switch e.Type {
 		case agent.StreamEventText:
 			reply.WriteString(e.Text)
@@ -234,25 +251,35 @@ func (p *WorkerPool) executeJob(ctx context.Context, job *domain.Job) error {
 			logs.Addf("media: %s", e.MediaURL)
 		case agent.StreamEventDone, agent.StreamEventStop:
 			if e.Type == agent.StreamEventStop {
-				logs.Addf("stopped")
-			}
-			select {
-			case done <- struct{}{}:
-			default:
+				logs.Addf("stopped: %s", e.StopCause)
+				if e.StopCause == agent.StopCauseUser {
+					terminal <- context.Canceled
+				} else {
+					terminal <- fmt.Errorf("scheduled agent run stopped: %s", e.StopCause)
+				}
+			} else {
+				terminal <- nil
 			}
 		case agent.StreamEventError:
-			lastErr = e.Err
 			logs.Addf("error: %v", e.Err)
-			select {
-			case done <- struct{}{}:
-			default:
-			}
+			terminal <- e.Err
 		}
 	})
+	if admission.Status == agent.AdmissionRejectedStopping {
+		return fmt.Errorf("%w: agent %q is stopping", errUnadmittedJob, job.AgentID)
+	}
+	var lastErr error
 	select {
-	case <-done:
+	case lastErr = <-terminal:
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case lastErr = <-terminal:
+		default:
+			if runner.Stopping() {
+				return fmt.Errorf("scheduled agent run stopped: %s", agent.StopCauseRunner)
+			}
+			return ctx.Err()
+		}
 	}
 	if sessionID != "" {
 		sessionLogs, err := collectJobSessionToolLogs(job.AgentID, sessionID, startedAt, time.Now().UTC().Add(time.Second))

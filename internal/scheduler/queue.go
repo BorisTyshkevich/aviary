@@ -202,6 +202,33 @@ func (q *JobQueue) Cancel(id string) error {
 	return q.updateStatus(id, domain.JobStatusCanceled)
 }
 
+// RequeueUnadmitted returns a claimed job to pending without spending a retry.
+// No runner took ownership, so the queue claim is the only attempt to undo.
+func (q *JobQueue) RequeueUnadmitted(id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	path := store.FindJobPath(id)
+	if path == "" {
+		return fmt.Errorf("job %s not found", id)
+	}
+	job, err := store.ReadJSON[domain.Job](path)
+	if err != nil {
+		return fmt.Errorf("reading job %s: %w", id, err)
+	}
+	if job.Status != domain.JobStatusInProgress {
+		return fmt.Errorf("job %s is no longer in progress", id)
+	}
+	if job.Attempts > 0 {
+		job.Attempts--
+	}
+	next := time.Now().Add(time.Second)
+	job.Status = domain.JobStatusPending
+	job.LockedAt = nil
+	job.NextRetryAt = &next
+	job.UpdatedAt = time.Now()
+	return store.WriteJSON(path, &job)
+}
+
 // Fail marks a job as failed and schedules a retry if attempts remain.
 func (q *JobQueue) Fail(id string, cause error) error {
 	q.mu.Lock()

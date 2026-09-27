@@ -25,14 +25,15 @@ type ToolEvent struct {
 
 // StreamEvent is a single event emitted during an agent response.
 type StreamEvent struct {
-	Private  bool // tool details and progress are private and must not be published to shared channels
-	Type     StreamEventType
-	AgentID  string
-	Text     string // set for StreamEventText
-	Model    string // model that completed the run; set for StreamEventDone
-	Tool     *ToolEvent
-	MediaURL string // set for StreamEventMedia (image data URL or remote URL)
-	Err      error  // set for StreamEventError
+	Private   bool // tool details and progress are private and must not be published to shared channels
+	Type      StreamEventType
+	AgentID   string
+	Text      string // set for StreamEventText
+	Model     string // model that completed the run; set for StreamEventDone
+	Tool      *ToolEvent
+	MediaURL  string    // set for StreamEventMedia (image data URL or remote URL)
+	Err       error     // set for StreamEventError
+	StopCause StopCause // set for StreamEventStop
 }
 
 // StreamConsumer receives StreamEvents.
