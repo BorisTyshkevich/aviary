@@ -37,6 +37,8 @@ type PublicToolEvent struct {
 	// Detail is a bounded projection of explicitly allowed input fields.
 	Detail   string
 	Duration time.Duration // populated only after the invocation finishes
+	// PrivateSafe marks a reviewed projection from a leased personal turn.
+	PrivateSafe bool
 }
 
 // ToolEvent carries structured tool execution details for debug-oriented UIs.
@@ -51,13 +53,13 @@ type ToolEvent struct {
 
 // StreamEvent is a single event emitted during an agent response.
 type StreamEvent struct {
-	Private         bool // tool details and progress are private and must not be published to shared channels
+	Private         bool // raw turn evidence is private; only an explicitly marked projection may be published
 	Type            StreamEventType
 	AgentID         string
 	Text            string // set for StreamEventText
 	Model           string // model that completed the run; set for StreamEventDone
 	Tool            *ToolEvent
-	PublicTool      *PublicToolEvent // set only for non-private registered tool calls
+	PublicTool      *PublicToolEvent // registered and bounded progress projection
 	AlreadyAnswered bool             // StreamEventDone is a no-op for an already answered prompt
 	MediaURL        string           // set for StreamEventMedia (image data URL or remote URL)
 	Err             error            // set for StreamEventError

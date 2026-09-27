@@ -520,7 +520,12 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		msg.Text = fmt.Sprintf("%s: %s\n\n%s", msg.QuoteAuthor, msg.QuoteText, msg.Text)
 	}
 
+	progressMode := config.ToolProgressOff
 	configureRun := func(candidate channels.Channel, cc config.ChannelConfig, incoming channels.IncomingMessage) {
+		progressMode = config.ToolProgressOff
+		if cc.ToolProgress != nil {
+			progressMode = *cc.ToolProgress
+		}
 		startTyping = nil
 		stopTyping = nil
 		assistantStatus = nil
@@ -564,7 +569,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		}
 		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
 			if sender, ok := candidate.(slackPresenterSender); ok {
-				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, config.BoolOr(cc.ToolProgress, false))
+				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, progressMode != config.ToolProgressOff)
 				if cc.ToolProgressMaxCalls != nil && *cc.ToolProgressMaxCalls >= config.MinToolProgressMaxCalls && *cc.ToolProgressMaxCalls <= config.MaxToolProgressMaxCalls {
 					presenter.maxCalls = *cc.ToolProgressMaxCalls
 				}
@@ -603,8 +608,12 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 
 	consumer := func(e agent.StreamEvent) {
 		if e.Type == agent.StreamEventToolProgress {
-			if presenter != nil && !e.Private && e.PublicTool != nil {
-				presenter.Tool(*e.PublicTool)
+			if presenter != nil && progressMode != config.ToolProgressOff && e.PublicTool != nil && (!e.Private || e.PublicTool.PrivateSafe) {
+				public := *e.PublicTool
+				if progressMode != config.ToolProgressSQL {
+					public.Detail = ""
+				}
+				presenter.Tool(public)
 			}
 			return
 		}

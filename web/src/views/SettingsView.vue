@@ -1608,7 +1608,7 @@ function hydrateDraftConfig(config: AppConfig): AppConfig {
 			if (ch.enabled === undefined) ch.enabled = true;
 			if (ch.show_typing === undefined) ch.show_typing = true;
 			if (ch.type === "slack" && ch.tool_progress === undefined)
-				ch.tool_progress = false;
+				ch.tool_progress = "off";
 			if (ch.type === "slack") {
 				if (ch.tool_progress_max_calls === undefined)
 					ch.tool_progress_max_calls = 100;
@@ -2771,7 +2771,9 @@ function normalizedDraftConfig(): AppConfig {
 				.filter(Boolean),
 			show_typing: ch.show_typing === false ? false : undefined,
 			tool_progress:
-				ch.type === "slack" && ch.tool_progress === true ? true : undefined,
+				ch.type === "slack" && ch.tool_progress !== "off"
+					? ch.tool_progress
+					: undefined,
 			tool_progress_max_calls:
 				ch.type === "slack" ? ch.tool_progress_max_calls : undefined,
 			tool_progress_max_chars:

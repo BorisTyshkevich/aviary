@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -324,15 +325,26 @@ func TestSlackNoReplyClearsStatusWithoutPosting(t *testing.T) {
 	require.Equal(t, []string{"is thinking", ""}, ch.snapshotStatuses())
 }
 
-type slowDeliveryToolClient struct{ delay time.Duration }
+type slowDeliveryToolClient struct {
+	delay  time.Duration
+	name   string
+	result string
+}
 
 func (c *slowDeliveryToolClient) ListTools(context.Context) ([]agent.ToolInfo, error) {
-	return []agent.ToolInfo{{Name: "synthetic_tool", InputSchema: map[string]any{"type": "object"}}}, nil
+	name := c.name
+	if name == "" {
+		name = "synthetic_tool"
+	}
+	return []agent.ToolInfo{{Name: name, InputSchema: map[string]any{"type": "object"}}}, nil
 }
 
 func (c *slowDeliveryToolClient) CallToolText(ctx context.Context, _ string, _ map[string]any) (string, error) {
 	select {
 	case <-time.After(c.delay):
+		if c.result != "" {
+			return c.result, nil
+		}
 		return "synthetic result", nil
 	case <-ctx.Done():
 		return "", ctx.Err()
@@ -357,7 +369,7 @@ func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
 		}
 	}))
 	t.Cleanup(model.Close)
-	on, off := true, false
+	on, off := config.ToolProgressName, config.ToolProgressOff
 	cfg := &config.Config{
 		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
 		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Channels: []config.ChannelConfig{
@@ -391,38 +403,67 @@ func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
 	require.Equal(t, []string{"posted"}, shared.deletedMessages())
 }
 
-func TestSlackPrivateTurnSuppressesEnabledToolProgress(t *testing.T) {
-	setupServerDataDir(t)
-	resetSlogForTest()
-	var rounds int
-	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		rounds++
-		if rounds == 1 {
-			writeDeliveryToolCall(w, "synthetic_tool", map[string]any{"path": "/fake-private-path"})
-		} else {
-			writeDeliveryText(w, "synthetic private answer")
-		}
-	}))
-	t.Cleanup(model.Close)
-	on := true
-	cfg := &config.Config{
-		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
-		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Channels: []config.ChannelConfig{{Type: "slack", ID: "active", ToolProgress: &on}}}},
+func TestSlackPrivateTurnToolProgressModes(t *testing.T) {
+	for _, mode := range []string{config.ToolProgressOff, config.ToolProgressName, config.ToolProgressSQL} {
+		t.Run(mode, func(t *testing.T) {
+			setupServerDataDir(t)
+			resetSlogForTest()
+			var rounds int
+			var generation string
+			model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				rounds++
+				if rounds == 1 {
+					writeDeliveryToolCall(w, "clickhouse_query", map[string]any{
+						"sql":  "SELECT count() FROM events WHERE password = 'fake-secret-literal' /* fake-secret-comment */",
+						"path": "/fake-secret-private-path", "token": "fake-secret-token", "generation": generation, "max_rows": 10,
+					})
+				} else {
+					writeDeliveryText(w, "synthetic private answer")
+				}
+			}))
+			t.Cleanup(model.Close)
+			cfg := &config.Config{
+				Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+				Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Channels: []config.ChannelConfig{{Type: "slack", ID: "active", ToolProgress: &mode}}}},
+			}
+			srv := New(cfg, "fake-token")
+			selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
+			target, selected := srv.connections.Current(privateSlackDeliveryScope())
+			require.True(t, selected)
+			generation = target.Generation
+			tool := &slowDeliveryToolClient{delay: 10 * time.Millisecond, name: "clickhouse_query", result: "fake-secret-raw-result"}
+			agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
+			t.Cleanup(func() { agent.SetToolClientFactory(nil) })
+			ch := &deliveryTestChannel{}
+			srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "active", ch, channels.IncomingMessage{
+				Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
+			})
+			runner, ok := srv.agents.Get("bot")
+			require.True(t, ok)
+			runner.Wait()
+			posted := ch.posted()
+			if mode == config.ToolProgressOff {
+				require.Equal(t, []string{"synthetic private answer"}, posted)
+				require.Empty(t, ch.deletedMessages())
+				return
+			}
+			require.Len(t, posted, 2)
+			require.Equal(t, "synthetic private answer", posted[1])
+			require.Equal(t, []string{"posted"}, ch.deletedMessages())
+			require.Contains(t, posted[0], "Tool progress")
+			require.Contains(t, posted[0], "clickhouse_query")
+			if mode == config.ToolProgressSQL {
+				require.Contains(t, posted[0], "SELECT count() FROM events WHERE password = ?")
+				require.Contains(t, posted[0], "max_rows=10")
+			} else {
+				require.NotContains(t, posted[0], "SELECT")
+				require.NotContains(t, posted[0], "max_rows")
+			}
+			for _, secret := range []string{"fake-secret-literal", "fake-secret-comment", "/fake-secret-private-path", "fake-secret-token", "fake-secret-raw-result", target.Generation, target.Endpoint} {
+				require.NotContains(t, strings.Join(posted, "\n"), secret)
+			}
+		})
 	}
-	srv := New(cfg, "fake-token")
-	selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
-	tool := &slowDeliveryToolClient{delay: 2 * time.Second}
-	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
-	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
-	ch := &deliveryTestChannel{}
-	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "active", ch, channels.IncomingMessage{
-		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
-	})
-	runner, ok := srv.agents.Get("bot")
-	require.True(t, ok)
-	runner.Wait()
-	require.Equal(t, []string{"synthetic private answer"}, ch.posted())
-	require.Empty(t, ch.deletedMessages())
 }
 
 type statusDeliveryChannel struct {

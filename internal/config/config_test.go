@@ -897,9 +897,9 @@ func TestValidate_ShowTypingAllowedOnSignal(t *testing.T) {
 
 func TestToolProgressSlackOnlyAndDefaultsOff(t *testing.T) {
 	assert.Nil(t, ChannelConfig{Type: "slack"}.ToolProgress)
-	for _, enabled := range []bool{false, true} {
-		t.Run(strconv.FormatBool(enabled), func(t *testing.T) {
-			channel := ChannelConfig{Type: "slack", ToolProgress: &enabled}
+	for _, mode := range []string{ToolProgressOff, ToolProgressName, ToolProgressSQL} {
+		t.Run(mode, func(t *testing.T) {
+			channel := ChannelConfig{Type: "slack", ToolProgress: &mode}
 			cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{channel}}}}
 			assert.False(t, hasIssue(Validate(&cfg, nil), "tool_progress"))
 			yamlData, err := yaml.Marshal(channel)
@@ -915,18 +915,23 @@ func TestToolProgressSlackOnlyAndDefaultsOff(t *testing.T) {
 		})
 	}
 	for _, typ := range []string{"signal", "discord"} {
-		for _, enabled := range []bool{false, true} {
-			cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{{Type: typ, ToolProgress: &enabled}}}}}
+		for _, mode := range []string{ToolProgressOff, ToolProgressName, ToolProgressSQL} {
+			cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{{Type: typ, ToolProgress: &mode}}}}}
 			assert.True(t, hasIssue(Validate(&cfg, nil), "tool_progress is only supported for Slack channels"))
 			disabled := false
 			cfg.Agents[0].Channels[0].Enabled = &disabled
 			assert.True(t, hasIssue(Validate(&cfg, nil), "tool_progress is only supported for Slack channels"))
 		}
 	}
+	invalidMode := "names"
+	cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{{Type: "slack", ToolProgress: &invalidMode}}}}}
+	assert.True(t, hasIssue(Validate(&cfg, nil), "tool_progress must be one of"))
 	var fromYAML ChannelConfig
-	assert.Error(t, yaml.Unmarshal([]byte("type: slack\ntool_progress: yes-please\n"), &fromYAML))
+	assert.NoError(t, yaml.Unmarshal([]byte("type: slack\ntool_progress: true\n"), &fromYAML))
+	cfg.Agents[0].Channels[0] = fromYAML
+	assert.True(t, hasIssue(Validate(&cfg, nil), "tool_progress must be one of"))
 	var fromJSON ChannelConfig
-	assert.Error(t, json.Unmarshal([]byte(`{"type":"slack","tool_progress":"true"}`), &fromJSON))
+	assert.Error(t, json.Unmarshal([]byte(`{"type":"slack","tool_progress":true}`), &fromJSON))
 }
 
 func TestToolProgressCapsValidationAndRoundTrip(t *testing.T) {

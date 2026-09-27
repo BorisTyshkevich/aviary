@@ -860,7 +860,7 @@ test("Slack tool progress loads and saves independently of typing", async ({
 							type: "slack",
 							id: "workspace-bot",
 							show_typing: false,
-							tool_progress: true,
+							tool_progress: "sql",
 							tool_progress_max_calls: 150,
 							tool_progress_max_chars: 3000,
 							allow_from: [{ from: "*" }],
@@ -880,14 +880,14 @@ test("Slack tool progress loads and saves independently of typing", async ({
 		.getByRole("button", { name: "Channels", exact: true })
 		.first()
 		.click();
-	const progress = page.getByLabel("Show tool progress");
-	await expect(progress).toBeChecked();
+	const progress = page.getByLabel("Tool progress");
+	await expect(progress).toHaveValue("sql");
 	const maxCalls = page.getByLabel("Max tool calls");
 	const maxChars = page.getByLabel("Max UTF-8 bytes");
 	await expect(maxCalls).toHaveValue("150");
 	await expect(maxChars).toHaveValue("3000");
 	await expect(page.getByLabel("Show typing indicator")).not.toBeChecked();
-	await progress.uncheck();
+	await progress.selectOption("off");
 	await page.getByRole("button", { name: "Save Changes" }).click();
 	await expect(page.getByTitle("Settings saved")).toBeVisible();
 	expect(savedConfig).toMatchObject({
@@ -902,7 +902,7 @@ test("Slack tool progress loads and saves independently of typing", async ({
 			},
 		],
 	});
-	await progress.check();
+	await progress.selectOption("name");
 	await maxCalls.fill("100");
 	await maxChars.fill("2800");
 	await page.getByRole("button", { name: "Save Changes" }).click();
@@ -912,7 +912,7 @@ test("Slack tool progress loads and saves independently of typing", async ({
 			{
 				channels: [
 					{
-						tool_progress: true,
+						tool_progress: "name",
 						tool_progress_max_calls: 100,
 						tool_progress_max_chars: 2800,
 						show_typing: false,
@@ -920,6 +920,12 @@ test("Slack tool progress loads and saves independently of typing", async ({
 				],
 			},
 		],
+	});
+	await progress.selectOption("sql");
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	expect(savedConfig).toMatchObject({
+		agents: [{ channels: [{ tool_progress: "sql" }] }],
 	});
 });
 

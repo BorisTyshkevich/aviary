@@ -1211,12 +1211,13 @@ func (r *AgentRunner) executeToolCall(
 			Name: streamRec.Name, InvocationID: invocationID, State: state,
 			Args: streamRec.Args, Result: result, Error: errorText,
 		}})
-		if !privateConnectionTurn(promptCtx) {
+		if !privateConnectionTurn(promptCtx) || connectedProgressTurn(promptCtx) {
 			duration := time.Duration(0)
 			if state != ToolStateStarted {
 				duration = time.Since(startedAt)
 			}
 			if public, ok := projectPublicToolEvent(registeredNames, name, invocationID, state, args, duration); ok {
+				public.PrivateSafe = connectedProgressTurn(promptCtx)
 				emit(StreamEvent{Type: StreamEventToolProgress, PublicTool: &public})
 			}
 		}
@@ -1264,8 +1265,23 @@ func projectPublicToolEvent(registeredNames map[string]string, proposedName, inv
 	if state == ToolStateStarted {
 		duration = 0
 	}
-	return PublicToolEvent{Name: name, InvocationID: invocationID, State: state,
+	return PublicToolEvent{Name: publicToolName(name), InvocationID: invocationID, State: state,
 		Detail: publicToolDetail(name, args), Duration: duration}, true
+}
+
+// Dynamic ClickHouse tool names carry a target generation. It is an internal
+// attachment identifier and must not be included in Slack progress.
+func publicToolName(name string) string {
+	if isPublicSQLTool(name) && name != "chlab_query" {
+		return "clickhouse_query"
+	}
+	if strings.HasPrefix(name, "clickhouse_") && strings.Contains(name, "__") {
+		if strings.HasSuffix(name, "__inspect") {
+			return "clickhouse_inspect"
+		}
+		return "clickhouse_tool"
+	}
+	return name
 }
 
 func normalizeSessionToolArguments(toolName, sessionID string, args map[string]any) map[string]any {

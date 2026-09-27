@@ -724,13 +724,14 @@
 										Show typing indicator
 									</label>
 									<div v-if="ch.type === 'slack'" class="max-w-sm">
-										<label class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
-											<input type="checkbox" v-model="ch.tool_progress"
-												class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
-											Show tool progress
-										</label>
+										<label class="field-label" :for="`tool-progress-${i}-${k}`">Tool progress</label>
+										<select :id="`tool-progress-${i}-${k}`" v-model="ch.tool_progress" class="field-input mt-1">
+											<option value="off">Off</option>
+											<option value="name">Names and status</option>
+											<option value="sql">Names and safe inputs (SQL)</option>
+										</select>
 										<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
-											Off by default. Shows temporary tool details, including safe inputs and redacted SQL, then deletes progress after the final answer. Raw results and errors stay private.
+											Off by default. Names and status shows tool name, state, and elapsed time. SQL also shows safe inputs with SQL literals and comments redacted. Progress is removed after the final answer when possible. Raw results and errors stay private.
 										</p>
 										<div class="mt-2 grid grid-cols-2 gap-2">
 											<label class="text-xs text-gray-600 dark:text-gray-400">
