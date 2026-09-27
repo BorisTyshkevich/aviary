@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"io"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -135,4 +136,31 @@ func TestStatusNodesSnapshotDuringTransitions(t *testing.T) {
 		}
 	}
 	wg.Wait()
+}
+
+func TestPlatformLockAndDiskSpace(t *testing.T) {
+	lockPath := t.TempDir() + "/service.lock"
+	first, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireServiceLock(first); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = closeServiceLock(first) })
+	second, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireServiceLock(second); err == nil {
+		_ = closeServiceLock(second)
+		t.Fatal("second service lock was acquired")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	free, err := freeDiskAt(t.TempDir())
+	if err != nil || free == 0 {
+		t.Fatalf("free disk=%d err=%v", free, err)
+	}
 }
