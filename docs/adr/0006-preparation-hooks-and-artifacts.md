@@ -11,8 +11,19 @@ trusted execution identity and the stable target generation are resolved, before
 the first model request. Provider fallback and model tool rounds do not rerun it.
 The target remains reserved throughout preparation and the turn. Hook arguments
 come from configuration and are executed directly, without shell interpolation.
-Connect/status/disconnect commands and private credential replies do not invoke
-preparation. Collector context excludes raw conversation text by default.
+Connect/status/disconnect commands do not invoke `before_turn` preparation.
+Collector context excludes raw conversation text by default.
+
+An agent may instead configure `post_connect` for a direct ClickHouse
+connection. After private credential validation, Aviary invokes that hook once,
+stores its bounded `evidence.json` with the personal credential, and posts a
+deterministic confirmation in the original thread. A validated optional public
+summary may state version and uptime; the confirmation makes no LLM call.
+Subsequent turns reuse the exact private snapshot for the credential and target
+generation, without implicit refresh. An immediate turn waits for an in-flight
+post-connect collection. Credential rotation, target replacement, and
+disconnect discard the snapshot. Collection failure does not undo login; the
+confirmation and later turns mark baseline evidence unavailable.
 
 A versioned, bounded process protocol carries non-secret context, an assigned
 output directory and a structured result. Explicitly authorized credentials use
@@ -36,7 +47,11 @@ Aviary assigns a private staging directory for each invocation, validates bounde
 structured output and manifest-listed relative files, and publishes accepted
 artifacts atomically. Reject path traversal, absolute paths, symlink escapes and
 non-regular files. Enforce file count, per-file/total size, retained storage and
-retention limits. The executable is trusted deployment code, not OS-sandboxed;
+retention limits. A `post_connect` snapshot is copied into the owner-only
+credential store with a 1 MiB bound and lasts until that credential or target
+is removed. Its temporary generic run is discarded after the copy. `before_turn`
+runs keep their seven-day/cap-based retention. The executable is trusted
+deployment code, not OS-sandboxed;
 directory assignment alone does not restrict its filesystem or network access.
 
 Artifact identity includes the agent, trusted principal, originating thread,

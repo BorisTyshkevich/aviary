@@ -82,6 +82,34 @@ type preparationProvider struct {
 	err      error
 }
 
+func TestPostConnectEvidenceIsReusedAcrossAgentTurnsWithoutHookRun(t *testing.T) {
+	service, err := connections.Open(t.TempDir())
+	require.NoError(t, err)
+	execution := testConnectionExecution()
+	target, _, err := service.Select(execution.Scope, "clickhouse", "https://db.example")
+	require.NoError(t, err)
+	require.NoError(t, service.PutPrompt(connections.Prompt{Principal: execution.Principal, DMChannelID: "dm", DMRootID: "prompt", Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Minute)}))
+	require.NoError(t, service.CompletePassword(context.Background(), execution.Principal, "dm", "prompt", "100.000001", "fake-agent-password", func(context.Context, connections.Target, connections.Credential) error { return nil }))
+	credential, ok := service.CredentialFor(execution, target)
+	require.True(t, ok)
+	require.NoError(t, service.SaveEvidence(execution, target, credential.Version, connections.EvidenceSnapshot{Status: "complete", RunID: "0123456789abcdef0123456789abcdef", Path: "evidence.json", Content: []byte(`{"version":"25.8"}`), ObservedAt: time.Now(), ProducerRevision: "fake-v1"}))
+	service.FinishEvidence(execution.Principal, target, credential.Version)
+	r := NewAgentRunner(&domain.Agent{ID: "private"}, &config.AgentConfig{Hooks: &config.HooksConfig{PostConnect: &config.BeforeTurnHookConfig{AllowCredential: true}}}, nil, nil)
+	r.connections = service
+	for range 2 {
+		lease, err := service.Begin(execution.Scope)
+		require.NoError(t, err)
+		ctx := connections.WithLease(connections.WithExecution(context.Background(), execution), lease)
+		prepared, index, err := r.prepareTurn(ctx)
+		require.NoError(t, err)
+		require.Contains(t, index, "evidence.json")
+		state, ok := PreparationFromContext(prepared)
+		require.True(t, ok)
+		require.JSONEq(t, `{"version":"25.8"}`, string(state.Snapshot))
+		lease.End()
+	}
+}
+
 func (p *preparationProvider) Stream(ctx context.Context, req llm.Request) (<-chan llm.Event, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

@@ -115,9 +115,18 @@ func registerConnectionTools(s *sdkmcp.Server) {
 			if args.MaxBytes == 0 {
 				args.MaxBytes = 64 << 10
 			}
-			data, err := state.Engine.Read(ctx, state.Input, args.RunID, args.Path, args.MaxBytes)
-			if err != nil {
-				return nil, struct{}{}, err
+			var data []byte
+			if state.Snapshot != nil {
+				if args.RunID != state.Result.RunID || len(state.Result.Artifacts) != 1 || args.Path != state.Result.Artifacts[0] || args.MaxBytes < 1 || int64(len(state.Snapshot)) > args.MaxBytes {
+					return nil, struct{}{}, fmt.Errorf("preparation artifact is unavailable")
+				}
+				data = state.Snapshot
+			} else {
+				var err error
+				data, err = state.Engine.Read(ctx, state.Input, args.RunID, args.Path, args.MaxBytes)
+				if err != nil {
+					return nil, struct{}{}, err
+				}
 			}
 			return jsonResult(map[string]any{"run_id": args.RunID, "path": args.Path, "provenance": state.Input, "content": string(data)})
 		})

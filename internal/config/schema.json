@@ -85,6 +85,7 @@
           "hooks": {
             "type": "object",
             "additionalProperties": false,
+            "not": { "required": ["before_turn", "post_connect"] },
             "properties": {
               "before_turn": {
                 "type": "object",
@@ -95,6 +96,18 @@
                   "timeout": { "type": "string", "default": "15s", "description": "Maximum preparation time, up to 2m." },
                   "on_error": { "type": "string", "enum": ["continue", "stop"], "default": "continue", "description": "Continue the turn with unavailable evidence or stop the turn." },
                   "allow_credential": { "type": "boolean", "default": false, "description": "Allow a matching interactive personal credential through the private stdin protocol." }
+                }
+              },
+              "post_connect": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["argv", "allow_credential"],
+                "description": "Runs once after a personal ClickHouse login; must publish exactly one evidence.json artifact. Cannot be combined with before_turn.",
+                "properties": {
+                  "argv": { "type": "array", "minItems": 1, "maxItems": 32, "items": { "type": "string", "maxLength": 4096 }, "description": "Administrator executable and literal arguments, without a shell." },
+                  "timeout": { "type": "string", "default": "15s", "description": "Maximum collection time, up to 2m." },
+                  "on_error": { "type": "string", "enum": ["continue"], "default": "continue", "description": "Collection failure does not reverse a saved login." },
+                  "allow_credential": { "const": true, "description": "Forward the matching interactive personal credential through the private stdin protocol." }
                 }
               }
             }

@@ -3,6 +3,7 @@ package channels
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -200,8 +201,20 @@ func TestSlackConnectionSetupUsesOneDMThreadAndRetriesWrongPassword(t *testing.T
 	ch.botUserID, ch.teamID = "BOT", "TEAM"
 	spec := channelSpec{agentName: "agent", channelConfig: config.ChannelConfig{Type: "slack", AllowFrom: []config.AllowFromEntry{{From: "U1", AllowedGroups: "C1", RespondToMentions: true}}}}
 	validationCalls := 0
+	collectionCalls := 0
+	collectionStarted := make(chan struct{})
+	releaseCollection := make(chan struct{})
 	intake := &slackConnectionIntake{channel: ch, service: service, specs: []channelSpec{spec},
 		validateEndpoint: func(context.Context, string, string) error { return nil },
+		postConnect: func(_ context.Context, target connections.Target, sender connections.Principal, queryAllowed bool) (string, error) {
+			collectionCalls++
+			if target.Scope.ChannelID != "C1" || sender.UserID != "U1" || !queryAllowed {
+				t.Fatal("post-connect hook received the wrong trusted identity")
+			}
+			close(collectionStarted)
+			<-releaseCollection
+			return "Version 25.8; uptime 3d 4h.", nil
+		},
 		validatePassword: func(_ context.Context, _ connections.Target, c connections.Credential) error {
 			validationCalls++
 			if c.Password != "fake-correct-password" {
@@ -241,9 +254,20 @@ func TestSlackConnectionSetupUsesOneDMThreadAndRetriesWrongPassword(t *testing.T
 	}
 
 	correct := &slackevents.MessageEvent{User: "U1", Channel: "D1", ThreadTimeStamp: "100.000001", TimeStamp: "100.000003", Text: "fake-correct-password"}
+	intake.postConnectSlots = make(chan struct{}, 4)
 	ch.handleMessageEvent(correct)
-	if validationCalls != 2 || len(posts) != 3 || posts[2].channel != "D1" || posts[2].thread != "100.000001" || !strings.Contains(posts[2].text, "Credentials saved") {
-		t.Fatalf("success was not the last DM thread message: %+v", posts)
+	select {
+	case <-collectionStarted:
+	case <-time.After(time.Second):
+		t.Fatal("post-connect collection did not start")
+	}
+	if len(posts) != 2 {
+		t.Fatal("confirmation posted before collection completed")
+	}
+	close(releaseCollection)
+	intake.postConnectWorkers.Wait()
+	if validationCalls != 2 || collectionCalls != 1 || len(posts) != 3 || posts[2].channel != "C1" || posts[2].thread != "50.000001" || !strings.Contains(posts[2].text, "Version 25.8; uptime 3d 4h.") {
+		t.Fatalf("success was not confirmed once in the original thread: %+v", posts)
 	}
 	if !service.HasCredential(principal, target) {
 		t.Fatal("corrected password was not saved")
@@ -252,6 +276,98 @@ func TestSlackConnectionSetupUsesOneDMThreadAndRetriesWrongPassword(t *testing.T
 		if strings.Contains(p.text, "fake-wrong-password") || strings.Contains(p.text, "fake-correct-password") {
 			t.Fatal("password was echoed to Slack")
 		}
+	}
+}
+
+func TestPostConnectCredentialForwardingRespectsSlackRouteTools(t *testing.T) {
+	ch := NewSlackChannel("xapp-fake", "xoxb-fake", nil, "", nil)
+	ch.botUserID, ch.teamID = "BOT", "TEAM"
+	target := connections.Target{Scope: connections.Scope{AgentID: "agent", InstallationID: "BOT", WorkspaceID: "TEAM", ChannelID: "C1", RootThreadID: "50.000001"}}
+	principal := connections.Principal{InstallationID: "BOT", WorkspaceID: "TEAM", UserID: "U1"}
+	spec := channelSpec{agentName: "agent", channelConfig: config.ChannelConfig{Type: "slack", AllowFrom: []config.AllowFromEntry{{From: "U1", AllowedGroups: "C1", RespondToMentions: true}}}}
+	intake := &slackConnectionIntake{channel: ch, specs: []channelSpec{spec}}
+	if !intake.postConnectQueryAllowed(target, principal) {
+		t.Fatal("authorized route denied collection")
+	}
+	intake.specs[0].channelConfig.DisabledTools = []string{"clickhouse_query"}
+	if intake.postConnectQueryAllowed(target, principal) {
+		t.Fatal("disabled query tool forwarded credential")
+	}
+	intake.specs[0].channelConfig.DisabledTools = nil
+	intake.specs[0].channelConfig.AllowFrom[0].RestrictTools = []string{"artifact_read"}
+	if intake.postConnectQueryAllowed(target, principal) {
+		t.Fatal("restricted query tool forwarded credential")
+	}
+}
+
+func TestPostConnectConfirmationHandlesFailureCapacityAndStaleTarget(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		collect, configured, stale bool
+		want                       string
+	}{
+		{name: "collector failure", collect: true, configured: true, want: "Baseline facts are unavailable."},
+		{name: "capacity reached", configured: true, want: "Baseline facts are unavailable."},
+		{name: "no hook configured", want: "ClickHouse connected. Ask a question in this thread."},
+		{name: "stale target", collect: true, configured: true, stale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			service, err := connections.Open(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			scope := connections.Scope{AgentID: "agent", InstallationID: "BOT", WorkspaceID: "TEAM", ChannelID: "C1", RootThreadID: "50.000001"}
+			target, _, err := service.Select(scope, "clickhouse", "https://db.example")
+			if err != nil {
+				t.Fatal(err)
+			}
+			principal := connections.Principal{InstallationID: "BOT", WorkspaceID: "TEAM", UserID: "U1"}
+			if err := service.PutPrompt(connections.Prompt{Principal: principal, DMChannelID: "D1", DMRootID: "prompt", Target: target, Stage: "password", Username: "reader", ExpiresAt: time.Now().Add(time.Minute)}); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.CompletePassword(context.Background(), principal, "D1", "prompt", "100.000001", "fake-password", func(context.Context, connections.Target, connections.Credential) error { return nil }); err != nil {
+				t.Fatal(err)
+			}
+			credential, ok := service.CredentialFor(connections.Execution{Kind: connections.Interactive, Scope: scope, Principal: principal}, target)
+			if !ok {
+				t.Fatal("credential missing")
+			}
+			var posts []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				if r.URL.Path != "/chat.postMessage" {
+					http.NotFound(w, r)
+					return
+				}
+				if r.FormValue("channel") != "C1" || r.FormValue("thread_ts") != "50.000001" {
+					t.Error("confirmation posted outside original thread")
+				}
+				posts = append(posts, r.FormValue("text"))
+				_, _ = w.Write([]byte(`{"ok":true,"channel":"C1","ts":"50.000002"}`))
+			}))
+			defer server.Close()
+			ch := NewSlackChannel("xapp-fake", "xoxb-fake", nil, "", nil)
+			ch.client = slack.New("xoxb-fake", slack.OptionAPIURL(server.URL+"/"))
+			ch.botUserID, ch.teamID = "BOT", "TEAM"
+			intake := &slackConnectionIntake{channel: ch, service: service, specs: []channelSpec{{agentName: "agent", postConnectConfigured: tc.configured, channelConfig: config.ChannelConfig{Type: "slack", AllowFrom: []config.AllowFromEntry{{From: "U1", AllowedGroups: "C1", RespondToMentions: true}}}}}, postConnect: func(context.Context, connections.Target, connections.Principal, bool) (string, error) {
+				return "", errors.New("fake collector failure")
+			}}
+			if tc.stale {
+				if _, _, err := service.Select(scope, "clickhouse", "https://new.example"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			intake.finishConnect(target, principal, credential.Version, tc.collect)
+			if tc.stale {
+				if len(posts) != 0 {
+					t.Fatalf("stale connection was confirmed: %v", posts)
+				}
+				return
+			}
+			if len(posts) != 1 || !strings.Contains(posts[0], tc.want) {
+				t.Fatalf("unexpected confirmation: %v", posts)
+			}
+		})
 	}
 }
 

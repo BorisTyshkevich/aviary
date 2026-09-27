@@ -1137,6 +1137,12 @@ func (r *AgentRunner) filterTools(tools []ToolInfo, restrictTools, disabledTools
 	return result
 }
 
+// AllowsTool reports the agent-level permission used for credential-bearing
+// lifecycle hooks, before any per-channel route restrictions are applied.
+func (r *AgentRunner) AllowsTool(name string) bool {
+	return len(r.filterTools([]ToolInfo{{Name: name}}, nil, nil)) != 0
+}
+
 // toolEventRecord is the JSON payload embedded in "[tool] ..." session messages
 // and stream events. Result/Error are only set in persisted history.
 type toolEventRecord struct {

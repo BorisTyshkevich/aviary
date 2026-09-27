@@ -68,6 +68,61 @@ func TestTargetLeaseIsolationAndRestart(t *testing.T) {
 	require.False(t, ok)
 }
 
+func TestConnectionEvidenceLastsUntilCredentialOrTargetChanges(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(dir)
+	require.NoError(t, err)
+	scope := testScope("evidence")
+	target, _, err := s.Select(scope, "clickhouse", "https://cluster.example")
+	require.NoError(t, err)
+	principal := testPrincipal("alice")
+	login := func(root, ts string) {
+		require.NoError(t, s.PutPrompt(Prompt{Principal: principal, DMChannelID: "dm", DMRootID: root, Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Minute)}))
+		require.NoError(t, s.CompletePassword(context.Background(), principal, "dm", root, ts, "fake-password", func(context.Context, Target, Credential) error { return nil }))
+	}
+	login("first", "100.000001")
+	execution := Execution{Kind: Interactive, Scope: scope, Principal: principal}
+	credential, ok := s.CredentialFor(execution, target)
+	require.True(t, ok)
+	waited := make(chan struct{})
+	go func() { s.WaitForEvidence(context.Background(), execution, target); close(waited) }()
+	select {
+	case <-waited:
+		t.Fatal("turn did not wait for post-connect evidence")
+	case <-time.After(10 * time.Millisecond):
+	}
+	evidence := EvidenceSnapshot{Status: "complete", RunID: "0123456789abcdef0123456789abcdef", Path: "evidence.json", Content: []byte(`{"version":"25.8"}`), ObservedAt: time.Now(), ProducerRevision: "fake-v1"}
+	leaking := evidence
+	leaking.Content = []byte(`{"password":"fake-password"}`)
+	require.Error(t, s.SaveEvidence(execution, target, credential.Version, leaking))
+	require.NoError(t, s.SaveEvidence(execution, target, credential.Version, evidence))
+	s.FinishEvidence(principal, target, credential.Version)
+	select {
+	case <-waited:
+	case <-time.After(time.Second):
+		t.Fatal("turn remained blocked after collection")
+	}
+	s, err = Open(dir)
+	require.NoError(t, err)
+	got, version, ok := s.EvidenceFor(execution, target)
+	require.True(t, ok)
+	require.Equal(t, credential.Version, version)
+	require.Equal(t, evidence.Content, got.Content)
+	got.Content[0] = 'x'
+	got, _, ok = s.EvidenceFor(execution, target)
+	require.True(t, ok)
+	require.Equal(t, evidence.Content, got.Content)
+	_, _, ok = s.EvidenceFor(Execution{Kind: Interactive, Scope: scope, Principal: testPrincipal("bob")}, target)
+	require.False(t, ok)
+	login("second", "100.000002")
+	_, _, ok = s.EvidenceFor(execution, target)
+	require.False(t, ok)
+	_, _, err = s.Select(scope, "clickhouse", "https://new.example")
+	require.NoError(t, err)
+	_, _, ok = s.EvidenceFor(execution, target)
+	require.False(t, ok)
+}
+
 func TestPrivatePromptsAndCredentialOwnership(t *testing.T) {
 	dir := t.TempDir()
 	s, err := Open(dir)

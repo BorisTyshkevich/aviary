@@ -82,6 +82,12 @@ export interface AgentHooks {
 		on_error?: "continue" | "stop";
 		allow_credential?: boolean;
 	};
+	post_connect?: {
+		argv: string[];
+		timeout?: string;
+		on_error?: "continue";
+		allow_credential: true;
+	};
 }
 
 export interface AgentTask {

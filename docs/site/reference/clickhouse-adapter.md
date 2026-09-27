@@ -61,9 +61,12 @@ username is not a secret and belongs in the command. Otherwise the login comes
 from the authenticated sender's Slack profile email. There is exactly one DM
 password prompt, never a separate username prompt. An unavailable email produces
 an actionable setup error instead of treating a password as a username.
-Successful setup sends no second channel-thread acknowledgment. A failed
+Successful setup posts one confirmation in the original channel thread after
+the optional post-connect collector finishes. Validated version and uptime may
+appear there without an LLM call. Its private evidence snapshot remains bound
+to the credential and target for later turns, without implicit refresh. A failed
 password check leaves the same private prompt available for a corrected password
-until it expires or the selected target changes; success is confirmed in the DM.
+until it expires or the selected target changes. The DM receives no success reply.
 
 Mode 2 permits setting changes, so operators can constrain resource settings
 with positive minima and maximums. For example, use

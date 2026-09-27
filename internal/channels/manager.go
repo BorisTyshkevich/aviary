@@ -44,6 +44,7 @@ type Manager struct {
 	connectionService   *connections.Service
 	connectionValidator func(context.Context, string, string) error
 	credentialValidator func(context.Context, connections.Target, connections.Credential) error
+	postConnect         func(context.Context, connections.Target, connections.Principal, bool) (string, error)
 }
 
 // SetConnectionService enables deterministic Slack connection setup. It must be
@@ -68,12 +69,20 @@ func (m *Manager) SetCredentialValidator(validate func(context.Context, connecti
 	m.credentialValidator = validate
 }
 
+// SetPostConnectHook collects one private connection snapshot after login.
+func (m *Manager) SetPostConnectHook(run func(context.Context, connections.Target, connections.Principal, bool) (string, error)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.postConnect = run
+}
+
 type channelSpec struct {
-	agentName      string
-	channelConfig  config.ChannelConfig
-	metadata       store.ChannelMetadata
-	agentModel     string
-	agentFallbacks []string
+	agentName             string
+	postConnectConfigured bool
+	channelConfig         config.ChannelConfig
+	metadata              store.ChannelMetadata
+	agentModel            string
+	agentFallbacks        []string
 }
 
 type sharedSlackChannel struct {
@@ -131,11 +140,12 @@ func (m *Manager) Reconcile(ctx context.Context, cfg *config.Config, msgFn func(
 			if config.BoolOr(cc.Enabled, true) {
 				desired[key] = struct{}{}
 				spec := channelSpec{
-					agentName:      ac.Name,
-					channelConfig:  cc,
-					metadata:       channelMetadata(state, key),
-					agentModel:     agentModel,
-					agentFallbacks: append([]string{}, agentFallbacks...),
+					agentName:             ac.Name,
+					postConnectConfigured: ac.Hooks != nil && ac.Hooks.PostConnect != nil,
+					channelConfig:         cc,
+					metadata:              channelMetadata(state, key),
+					agentModel:            agentModel,
+					agentFallbacks:        append([]string{}, agentFallbacks...),
 				}
 				existingSpec, exists := m.specs[key]
 				m.specs[key] = spec
@@ -384,7 +394,7 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	ch := NewSlackChannel(base.URL, base.Token, base.AllowFrom, "", nil)
 	ch.affinityPass = func(in slackIngress) bool { return in.RootTS != "" && in.RootTS != in.MessageTS }
 	ch.showStatus = anySlackStatusEnabled(resolvedSpecs)
-	intake := &slackConnectionIntake{channel: ch, service: m.connectionService, validateEndpoint: m.connectionValidator, validatePassword: m.credentialValidator, specs: resolvedSpecs}
+	intake := &slackConnectionIntake{channel: ch, service: m.connectionService, validateEndpoint: m.connectionValidator, validatePassword: m.credentialValidator, postConnect: m.postConnect, specs: resolvedSpecs}
 	intake.claimCommand = func(in slackIngress, selected channelSpec) bool { return m.claimSlackCommand(ch, in, selected) }
 	ch.intake = intake.handle
 	ch.intakeStart = intake.start
