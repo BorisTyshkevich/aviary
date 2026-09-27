@@ -253,8 +253,6 @@ func (i *slackConnectionIntake) executeCommand(in slackIngress, selected channel
 			i.promptMu.Unlock()
 			if cmd.username != "" && cmd.username != active.Username {
 				i.reply(in.ChannelID, in.RootTS, "An existing private setup is pending. To change the username, disconnect and reconnect in this thread.")
-			} else {
-				i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete the existing private setup prompt.")
 			}
 			return
 		}
@@ -279,8 +277,6 @@ func (i *slackConnectionIntake) executeCommand(in slackIngress, selected channel
 			} else {
 				i.reply(in.ChannelID, in.RootTS, "Connection attached, but private setup could not start. Retry connect in this thread.")
 			}
-		} else {
-			i.reply(in.ChannelID, in.RootTS, "Connection attached. Complete private setup in the bot DM.")
 		}
 	}
 }
@@ -363,11 +359,15 @@ func (i *slackConnectionIntake) handleSetupReply(in slackIngress) {
 		}
 		ctx, cancel := context.WithTimeout(i.baseContext(), 15*time.Second)
 		defer cancel()
-		err := i.service.CompletePassword(ctx, principal, in.ChannelID, in.RootTS, in.Text, i.validatePassword)
+		err := i.service.CompletePassword(ctx, principal, in.ChannelID, in.RootTS, in.MessageTS, in.Text, i.validatePassword)
 		if err == nil {
 			i.reply(in.ChannelID, in.RootTS, "Credentials saved. Return to the original thread to continue.")
+		} else if errors.Is(err, connections.ErrDuplicate) {
+			return
+		} else if errors.Is(err, connections.ErrValidation) {
+			i.reply(in.ChannelID, in.RootTS, "Credentials could not be verified. Check the password and reply in this DM thread to try again. If it still fails, check the database account and connection.")
 		} else {
-			i.reply(in.ChannelID, in.RootTS, "Credentials could not be saved. Check the connection and start setup again.")
+			i.reply(in.ChannelID, in.RootTS, "Credentials could not be saved. Start setup again from the original thread.")
 		}
 		return
 	}

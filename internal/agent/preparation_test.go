@@ -145,7 +145,7 @@ func attachPreparationPrincipal(t *testing.T, r *AgentRunner) context.Context {
 	require.NoError(t, err)
 	p := connections.Principal{InstallationID: "install", WorkspaceID: "workspace", UserID: "alice"}
 	require.NoError(t, s.PutPrompt(connections.Prompt{Principal: p, DMChannelID: "dm", DMRootID: "password-prompt", Target: target, Stage: "password", Username: "alice", ExpiresAt: time.Now().Add(time.Hour)}))
-	require.NoError(t, s.CompletePassword(context.Background(), p, "dm", "password-prompt", "fake-agent-password", func(context.Context, connections.Target, connections.Credential) error { return nil }))
+	require.NoError(t, s.CompletePassword(context.Background(), p, "dm", "password-prompt", "100.000001", "fake-agent-password", func(context.Context, connections.Target, connections.Credential) error { return nil }))
 	r.connections = s
 	return connections.WithExecution(WithSessionID(context.Background(), "shared"), connections.Execution{Kind: connections.Interactive, Scope: scope, Principal: p})
 }

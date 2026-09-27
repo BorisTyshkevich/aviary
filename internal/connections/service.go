@@ -10,6 +10,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +24,7 @@ var (
 	ErrBusy       = errors.New("thread has an active turn")
 	ErrStale      = errors.New("connection setup is stale")
 	ErrPrompt     = errors.New("private setup prompt is unavailable")
+	ErrDuplicate  = errors.New("private setup reply was already processed")
 	ErrValidation = errors.New("connection validation failed")
 )
 
@@ -86,6 +89,7 @@ type Prompt struct {
 	Target      Target    `json:"target"`
 	Stage       string    `json:"stage"`
 	Username    string    `json:"username"`
+	LastReplyTS string    `json:"last_reply_ts,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at"`
 	Completed   bool      `json:"completed"`
 }
@@ -435,6 +439,16 @@ func promptKey(installation, workspace, channel, root string) string {
 	return key(struct{ Installation, Workspace, Channel, Root string }{installation, workspace, channel, root})
 }
 
+func slackReplyTimestamp(ts string) (uint64, uint64, bool) {
+	seconds, fraction, ok := strings.Cut(ts, ".")
+	if !ok || seconds == "" || len(fraction) != 6 {
+		return 0, 0, false
+	}
+	sec, secErr := strconv.ParseUint(seconds, 10, 64)
+	micro, microErr := strconv.ParseUint(fraction, 10, 64)
+	return sec, micro, secErr == nil && microErr == nil
+}
+
 // PutPrompt durably records non-secret private prompt correlation metadata.
 func (s *Service) PutPrompt(p Prompt) error {
 	if !p.Principal.valid() || p.DMChannelID == "" || p.DMRootID == "" || p.Stage != "password" || p.ExpiresAt.IsZero() || p.Target.Scope.InstallationID != p.Principal.InstallationID || p.Target.Scope.WorkspaceID != p.Principal.WorkspaceID {
@@ -513,21 +527,43 @@ func (s *Service) FinishPrompt(p Principal, dmChannel, dmRoot string) error {
 	return nil
 }
 
-// CompletePassword durably consumes a prompt before validation, so a crash or
-// repeated reply cannot replay it. Validation runs outside the lifecycle lock.
-func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, dmRoot, password string, validate func(context.Context, Target, Credential) error) error {
+// CompletePassword durably marks a prompt busy before validation, so a crash or
+// concurrent reply cannot replay it. A failed authentication reopens the same
+// prompt while its target and expiry remain valid. Validation runs outside the
+// lifecycle lock.
+func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, dmRoot, replyTS, password string, validate func(context.Context, Target, Credential) error) error {
+	seconds, micros, valid := slackReplyTimestamp(replyTS)
+	if !valid {
+		return ErrInvalid
+	}
 	k := promptKey(p.InstallationID, p.WorkspaceID, dmChannel, dmRoot)
 	s.mu.Lock()
 	pr, ok := s.state.Prompts[k]
-	if !ok || pr.Principal != p || pr.Stage != "password" || pr.Completed || !time.Now().Before(pr.ExpiresAt) || !s.currentLocked(pr.Target) || s.completing[k] {
+	if !ok || pr.Principal != p || pr.Stage != "password" || !time.Now().Before(pr.ExpiresAt) || !s.currentLocked(pr.Target) {
 		s.mu.Unlock()
 		return ErrPrompt
 	}
+	if pr.LastReplyTS != "" {
+		previousSeconds, previousMicros, previousValid := slackReplyTimestamp(pr.LastReplyTS)
+		if !previousValid {
+			s.mu.Unlock()
+			return ErrPrompt
+		}
+		if seconds < previousSeconds || (seconds == previousSeconds && micros <= previousMicros) {
+			s.mu.Unlock()
+			return ErrDuplicate
+		}
+	}
+	if pr.Completed || s.completing[k] {
+		s.mu.Unlock()
+		return ErrPrompt
+	}
+	previous := pr
 	pr.Completed = true
+	pr.LastReplyTS = replyTS
 	s.state.Prompts[k] = pr
 	if err := s.saveState(); err != nil {
-		pr.Completed = false
-		s.state.Prompts[k] = pr
+		s.state.Prompts[k] = previous
 		s.mu.Unlock()
 		return err
 	}
@@ -543,6 +579,21 @@ func (s *Service) CompletePassword(ctx context.Context, p Principal, dmChannel, 
 		return ErrValidation
 	}
 	if err := validate(ctx, pr.Target, c); err != nil {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		latest := s.state.Prompts[k]
+		if latest != pr || !s.currentLocked(latest.Target) {
+			return ErrStale
+		}
+		if !time.Now().Before(latest.ExpiresAt) {
+			return ErrPrompt
+		}
+		latest.Completed = false
+		s.state.Prompts[k] = latest
+		if saveErr := s.saveState(); saveErr != nil {
+			s.state.Prompts[k] = pr
+			return saveErr
+		}
 		return ErrValidation
 	}
 	s.mu.Lock()

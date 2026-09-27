@@ -68,8 +68,13 @@ The user replies in the DM password prompt's thread with only the password.
 Treat the entire reply as the password, preserving spaces and punctuation.
 Bind each prompt to the sender, installation/workspace, DM channel, prompt root,
 destination thread and exact target identity. Independent prompts may coexist.
-Prompts expire; stale, duplicate or wrong-principal replies cannot authorize or
-mutate a connection. Do not interpret arbitrary unthreaded DMs as passwords.
+Successful setup sends no second acknowledgment to the destination thread; the
+DM prompt is the next action. If password validation fails, keep that same DM
+thread open for another password reply while the prompt and target remain valid.
+Only a successful validation ends the loop with a success reply in the DM.
+Prompts expire; stale, duplicate, concurrent or wrong-principal replies cannot
+authorize or mutate a connection. Do not interpret arbitrary unthreaded DMs as
+passwords.
 
 Consume credential replies before history enrichment, observers, persistence or
 LLM processing. Store credentials privately for that sender and exact connection

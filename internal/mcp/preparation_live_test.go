@@ -77,7 +77,7 @@ func TestLivePreparedConnectionThroughMCP(t *testing.T) {
 		t.Fatal("credential prompt setup failed")
 	}
 	adapter := clickhouseconn.Adapter{Policy: policy}
-	if err := connectionsStore.CompletePassword(context.Background(), principal, "dm", "live", account.Password, func(ctx context.Context, selected connections.Target, credential connections.Credential) error {
+	if err := connectionsStore.CompletePassword(context.Background(), principal, "dm", "live", "100.000001", account.Password, func(ctx context.Context, selected connections.Target, credential connections.Credential) error {
 		return adapter.ValidateReadOnly(ctx, clickhouseconn.Target{Endpoint: selected.Endpoint, Username: credential.Username}, clickhouseconn.NewCredentials(credential.Password))
 	}); err != nil {
 		t.Fatal("credential validation failed")
