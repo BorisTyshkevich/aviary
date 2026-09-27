@@ -39,6 +39,7 @@ export interface AgentChannel {
 	show_typing?: boolean;
 	separate_top_level_sessions?: boolean;
 	reply_to_replies?: boolean;
+	ignore_other_user_mentions?: boolean;
 	react_to_emoji?: boolean;
 	send_read_receipts?: boolean;
 	group_chat_history?: number;

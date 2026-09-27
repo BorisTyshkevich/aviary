@@ -222,6 +222,10 @@ type ChannelConfig struct {
 	// Sender, group, exclude and tool policy still apply on every reply.
 	// Defaults to true.
 	ReplyToReplies *bool `yaml:"reply_to_replies,omitempty" json:"reply_to_replies,omitempty"`
+	// IgnoreOtherUserMentions keeps a claimed Slack thread from routing a reply
+	// to its owner when the reply directly mentions another user. Explicit
+	// routing to another bot remains available. Defaults to false.
+	IgnoreOtherUserMentions bool `yaml:"ignore_other_user_mentions,omitempty" json:"ignore_other_user_mentions,omitempty"`
 	// SendReadReceipts controls whether the agent sends read receipts for
 	// messages it will respond to. Read receipts are only sent for messages
 	// that pass the allowFrom filter (i.e. messages the agent will act on).

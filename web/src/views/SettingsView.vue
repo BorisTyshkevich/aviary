@@ -1608,6 +1608,8 @@ function hydrateDraftConfig(config: AppConfig): AppConfig {
 			if (ch.enabled === undefined) ch.enabled = true;
 			if (ch.show_typing === undefined) ch.show_typing = true;
 			if (ch.reply_to_replies === undefined) ch.reply_to_replies = true;
+			if (ch.ignore_other_user_mentions === undefined)
+				ch.ignore_other_user_mentions = false;
 			if (ch.react_to_emoji === undefined) ch.react_to_emoji = true;
 			if (ch.send_read_receipts === undefined) ch.send_read_receipts = true;
 			(ch.allow_from ?? []).forEach((entry) => {
@@ -2279,6 +2281,7 @@ function addChannel(agentIndex: number) {
 		type: "signal",
 		show_typing: true,
 		reply_to_replies: true,
+		ignore_other_user_mentions: false,
 		react_to_emoji: true,
 		send_read_receipts: true,
 	};
@@ -2758,6 +2761,8 @@ function normalizedDraftConfig(): AppConfig {
 			separate_top_level_sessions:
 				ch.separate_top_level_sessions === true ? true : undefined,
 			reply_to_replies: ch.reply_to_replies === false ? false : undefined,
+			ignore_other_user_mentions:
+				ch.ignore_other_user_mentions === true ? true : undefined,
 			react_to_emoji: ch.react_to_emoji === false ? false : undefined,
 			send_read_receipts: ch.send_read_receipts === false ? false : undefined,
 			group_chat_history:

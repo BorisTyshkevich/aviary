@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,17 @@ import (
 // Slack thread claims expire with their root timestamp. Expired roots cannot
 // acquire a new claim, so pruning cannot transfer an old thread to a new bot.
 const slackAffinityRetention = 90 * 24 * time.Hour
+
+var slackUserMention = regexp.MustCompile(`<@!?([A-Za-z0-9]+)(?:\|[^>]*)?>`)
+
+func mentionsSlackUserOtherThan(text, botUserID string) bool {
+	for _, match := range slackUserMention.FindAllStringSubmatch(text, -1) {
+		if match[1] != botUserID {
+			return true
+		}
+	}
+	return false
+}
 
 type slackThreadOwner struct {
 	TeamID       string    `json:"team_id"`
@@ -229,6 +241,19 @@ func ownerMatchesSlackCandidate(owner *slackThreadOwner, candidate slackRouteCan
 		owner.EnabledAt.Equal(candidate.spec.metadata.EnabledAt)
 }
 
+func ignoreClaimedSlackReply(owner *slackThreadOwner, candidates []slackRouteCandidate, msg IncomingMessage) bool {
+	if owner == nil || !msg.IsThreadReply || !mentionsSlackUserOtherThan(msg.OriginalText, owner.BotUserID) {
+		return false
+	}
+	for _, candidate := range candidates {
+		if ownerMatchesSlackCandidate(owner, candidate) && candidate.spec.channelConfig.IgnoreOtherUserMentions &&
+			config.BoolOr(candidate.spec.channelConfig.ReplyToReplies, true) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intake *slackConnectionIntake,
 	msgFn func(agentName, channelType, configuredID string, ch Channel, msg IncomingMessage)) {
 	candidates := m.slackCandidates()
@@ -261,12 +286,15 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 		ch.logf("slack: thread affinity unavailable: %v", err)
 		return
 	}
+	ignoreOwnerBot := ignoreClaimedSlackReply(owner, candidates, msg)
 	var addressed []slackRouteCandidate
 	var selected slackRouteCandidate
 	var routed IncomingMessage
 	authorized := 0
 	for _, candidate := range candidates {
-		if !shouldProcessIncomingMessage(candidate.spec.metadata, msg) || !addressedSlackCandidate(candidate, msg) {
+		botID, _ := candidate.ch.affinityIdentity()
+		if !shouldProcessIncomingMessage(candidate.spec.metadata, msg) ||
+			(ignoreOwnerBot && botID == owner.BotUserID) || !addressedSlackCandidate(candidate, msg) {
 			continue
 		}
 		addressed = append(addressed, candidate)
@@ -302,7 +330,7 @@ func (m *Manager) routeSlackMessage(ch *SlackChannel, msg IncomingMessage, intak
 		return
 	}
 	if owner != nil {
-		if !msg.IsThreadReply {
+		if !msg.IsThreadReply || ignoreOwnerBot {
 			return
 		}
 		for _, candidate := range candidates {
