@@ -73,16 +73,6 @@
 								<input v-model="agent.working_dir" type="text" class="field-input"
 									placeholder="Default: process working directory (e.g. /home/user/projects/myrepo)" />
 							</div>
-							<div class="mt-2">
-								<label class="flex cursor-pointer items-center gap-3">
-									<input v-model="agent.verbose" type="checkbox"
-										class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
-									<span class="text-sm text-gray-700 dark:text-gray-300">
-										Verbose mode
-										<span class="ml-1 text-xs text-gray-400 dark:text-gray-500">(send live status updates before each tool call on channels that don't support streaming)</span>
-									</span>
-								</label>
-							</div>
 						</div>
 
 						<!-- Files content moved into General subtab -->

@@ -393,7 +393,6 @@ func (m *Manager) startSharedSlackLocked(ctx context.Context, connKey string, sp
 	base.AllowFrom = mergeAllowFrom(resolvedSpecs)
 	ch := NewSlackChannel(base.URL, base.Token, base.AllowFrom, "", nil)
 	ch.affinityPass = func(in slackIngress) bool { return in.RootTS != "" && in.RootTS != in.MessageTS }
-	ch.showStatus = anySlackStatusEnabled(resolvedSpecs)
 	intake := &slackConnectionIntake{channel: ch, service: m.connectionService, validateEndpoint: m.connectionValidator, validatePassword: m.credentialValidator, postConnect: m.postConnect, specs: resolvedSpecs}
 	intake.claimCommand = func(in slackIngress, selected channelSpec) bool { return m.claimSlackCommand(ch, in, selected) }
 	ch.intake = intake.handle
@@ -493,15 +492,6 @@ func matchesAnyAllowedGroup(entries []config.AllowFromEntry, channelID string) b
 			continue
 		}
 		if matchesAllowedGroup(entry.AllowedGroups, channelID) {
-			return true
-		}
-	}
-	return false
-}
-
-func anySlackStatusEnabled(specs []channelSpec) bool {
-	for _, spec := range specs {
-		if config.BoolOr(spec.channelConfig.ShowTyping, true) {
 			return true
 		}
 	}
@@ -731,7 +721,6 @@ func newChannel(cc config.ChannelConfig, agentModel string, agentFallbacks []str
 		// Token = bot token (xoxb-…), URL = app-level token (xapp-…) for Socket Mode.
 		ch := NewSlackChannel(cc.URL, cc.Token, cc.AllowFrom, model, fallbacks)
 		ch.disabledTools = cc.DisabledTools
-		ch.showStatus = config.BoolOr(cc.ShowTyping, true)
 		return ch
 	case "discord":
 		if cc.ShowTyping != nil {

@@ -659,6 +659,7 @@ func TestAgentRunner_WithProvider(t *testing.T) {
 func TestAgentRunner_ErrorCases(t *testing.T) {
 	t.Run("stream setup error", func(t *testing.T) {
 		runner := NewAgentRunner(&domain.Agent{ID: "a1", Model: "anthropic/test"}, &config.AgentConfig{Name: "bot"}, &mockProvider{err: errors.New("boom")}, nil)
+		t.Cleanup(runner.Wait)
 		errCh := make(chan error, 1)
 		runner.Prompt(context.Background(), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
@@ -675,24 +676,27 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 
 	t.Run("stream setup error delivers to session channel", func(t *testing.T) {
 		var delivered string
-		RegisterSessionDelivery("a1", "sess-stream-setup-error", "signal", "+1", func(text string) { delivered = text })
+		RegisterSessionDelivery("a1", "sess-stream-setup-error", "slack", "C1", func(text string) { delivered = text })
+		const sensitiveError = "provider failed for fake-secret and /private/path"
 
 		runner := NewAgentRunner(
 			&domain.Agent{ID: "a1", Model: "anthropic/test"},
 			&config.AgentConfig{Name: "bot"},
-			&mockProvider{err: errors.New("boom")},
+			&mockProvider{err: errors.New(sensitiveError)},
 			nil,
 		)
+		t.Cleanup(runner.Wait)
 
 		done := make(chan struct{}, 1)
 		runner.Prompt(WithSessionID(context.Background(), "sess-stream-setup-error"), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
+				assert.ErrorContains(t, e.Err, sensitiveError)
 				done <- struct{}{}
 			}
 		})
 		select {
 		case <-done:
-			assert.Equal(t, "Error: boom", delivered)
+			assert.Equal(t, "Unable to complete this request.", delivered)
 		case <-time.After(2 * time.Second):
 			assert.FailNow(t, "timeout")
 		}
@@ -700,6 +704,7 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 
 	t.Run("stream event error", func(t *testing.T) {
 		runner := NewAgentRunner(&domain.Agent{ID: "a1", Model: "anthropic/test"}, &config.AgentConfig{Name: "bot"}, &mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New("event boom")}}}, nil)
+		t.Cleanup(runner.Wait)
 		errCh := make(chan error, 1)
 		runner.Prompt(context.Background(), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
@@ -716,24 +721,27 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 
 	t.Run("stream event error delivers to session channel", func(t *testing.T) {
 		var delivered string
-		RegisterSessionDelivery("a1", "sess-stream-event-error", "signal", "+1", func(text string) { delivered = text })
+		RegisterSessionDelivery("a1", "sess-stream-event-error", "slack", "C1", func(text string) { delivered = text })
+		const sensitiveError = "event failed for fake-secret and /private/path"
 
 		runner := NewAgentRunner(
 			&domain.Agent{ID: "a1", Model: "anthropic/test"},
 			&config.AgentConfig{Name: "bot"},
-			&mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New("event boom")}}},
+			&mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New(sensitiveError)}}},
 			nil,
 		)
+		t.Cleanup(runner.Wait)
 
 		done := make(chan struct{}, 1)
 		runner.Prompt(WithSessionID(context.Background(), "sess-stream-event-error"), "hi", func(e StreamEvent) {
 			if e.Type == StreamEventError {
+				assert.ErrorContains(t, e.Err, sensitiveError)
 				done <- struct{}{}
 			}
 		})
 		select {
 		case <-done:
-			assert.Equal(t, "Error: event boom", delivered)
+			assert.Equal(t, "Unable to complete this request.", delivered)
 		case <-time.After(2 * time.Second):
 			assert.FailNow(t, "timeout")
 		}
@@ -751,6 +759,7 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 			&mockProvider{events: []llm.Event{{Type: llm.EventTypeError, Error: errors.New("429 rate limit")}}},
 			nil,
 		)
+		t.Cleanup(runner.Wait)
 
 		errCh := make(chan error, 1)
 		runner.Prompt(WithSessionID(context.Background(), sessionID), "hi", func(e StreamEvent) {
@@ -787,6 +796,28 @@ func TestAgentRunner_ErrorCases(t *testing.T) {
 			time.Sleep(10 * time.Millisecond)
 		}
 	})
+}
+
+func TestNoProviderDoesNotExposeModelToSlackDelivery(t *testing.T) {
+	const sessionID = "sess-no-provider-public-error"
+	var delivered string
+	RegisterSessionDelivery("a1", sessionID, "slack", "C1", func(text string) { delivered = text })
+	runner := NewAgentRunner(&domain.Agent{ID: "a1", Model: "fake-secret-model"}, &config.AgentConfig{Name: "bot"}, nil, nil)
+	t.Cleanup(runner.Wait)
+	done := make(chan StreamEvent, 1)
+	runner.Prompt(WithSessionID(context.Background(), sessionID), "hi", func(e StreamEvent) {
+		if e.Type == StreamEventDone {
+			done <- e
+		}
+	})
+	select {
+	case event := <-done:
+		assert.Equal(t, "Unable to complete this request.", delivered)
+		assert.Equal(t, delivered, event.Text)
+		assert.NotContains(t, event.Text, "fake-secret-model")
+	case <-time.After(2 * time.Second):
+		assert.FailNow(t, "timeout")
+	}
 }
 
 func TestAgentRunner_StopAndAccessors(t *testing.T) {

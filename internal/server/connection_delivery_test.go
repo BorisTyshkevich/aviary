@@ -31,9 +31,10 @@ type deliveryTestChannel struct {
 }
 
 type sensitiveDeliveryToolClient struct {
-	mu   sync.Mutex
-	name string
-	args map[string]any
+	mu    sync.Mutex
+	name  string
+	args  map[string]any
+	calls int
 }
 
 func (c *sensitiveDeliveryToolClient) ListTools(context.Context) ([]agent.ToolInfo, error) {
@@ -44,6 +45,10 @@ func (c *sensitiveDeliveryToolClient) CallToolText(_ context.Context, name strin
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.name, c.args = name, args
+	c.calls++
+	if c.calls == 1 {
+		return "", errors.New("fake-sensitive-tool-error")
+	}
 	return "fake-sensitive-result", nil
 }
 
@@ -149,69 +154,157 @@ func TestPrivateSlackAnswerEntersHistoryOnlyAfterDelivery(t *testing.T) {
 	}
 }
 
-func TestPrivateVerboseSlackToolDataIsNotPosted(t *testing.T) {
+func TestSlackToolDataIsNotPosted(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		name := "public"
+		if private {
+			name = "private"
+		}
+		t.Run(name, func(t *testing.T) {
+			setupServerDataDir(t)
+			resetSlogForTest()
+			var (
+				mu     sync.Mutex
+				rounds int
+				valid  bool
+			)
+			model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/v1/chat/completions" {
+					http.NotFound(w, r)
+					return
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				rounds++
+				switch rounds {
+				case 1, 2:
+					writeDeliveryToolCall(w, "sensitive_tool", map[string]any{"token": "fake-sensitive-argument", "path": "/fake-sensitive-path"})
+				case 3:
+					valid = true
+					writeDeliveryText(w, "safe final answer")
+				default:
+					http.Error(w, "unexpected model round", http.StatusBadRequest)
+				}
+			}))
+			t.Cleanup(model.Close)
+
+			cfg := &config.Config{
+				Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+				Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test"}},
+			}
+			srv := New(cfg, "fake-token")
+			if private {
+				selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
+			}
+			toolClient := &sensitiveDeliveryToolClient{}
+			agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return toolClient, nil })
+			t.Cleanup(func() { agent.SetToolClientFactory(nil) })
+
+			ch := &statusDeliveryChannel{}
+			srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "alerts", ch, channels.IncomingMessage{
+				Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
+			})
+			runner, ok := srv.agents.Get("bot")
+			require.True(t, ok)
+			runner.Wait()
+
+			mu.Lock()
+			gotRounds, modelValid := rounds, valid
+			mu.Unlock()
+			require.Equal(t, 3, gotRounds)
+			require.True(t, modelValid)
+			toolClient.mu.Lock()
+			toolName, token := toolClient.name, fmt.Sprint(toolClient.args["token"])
+			toolClient.mu.Unlock()
+			require.Equal(t, "sensitive_tool", toolName)
+			require.Equal(t, "fake-sensitive-argument", token)
+			require.Equal(t, "/fake-sensitive-path", toolClient.args["path"])
+			posted := ch.posted()
+			require.Equal(t, []string{"safe final answer"}, posted)
+			require.Equal(t, []string{"is thinking"}, ch.snapshotStatuses())
+			for _, text := range posted {
+				require.NotContains(t, text, "fake-sensitive-argument")
+				require.NotContains(t, text, "fake-sensitive-result")
+				require.NotContains(t, text, "fake-sensitive-tool-error")
+				require.NotContains(t, text, "/fake-sensitive-path")
+			}
+		})
+	}
+}
+
+func TestSlackTerminalErrorUsesFixedPublicText(t *testing.T) {
+	for _, private := range []bool{false, true} {
+		name := "public"
+		if private {
+			name = "private"
+		}
+		t.Run(name, func(t *testing.T) {
+			setupServerDataDir(t)
+			resetSlogForTest()
+			model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "fake-sensitive-provider-error", http.StatusInternalServerError)
+			}))
+			t.Cleanup(model.Close)
+			cfg := &config.Config{
+				Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+				Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test"}},
+			}
+			srv := New(cfg, "fake-token")
+			if private {
+				selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
+			}
+			ch := &deliveryTestChannel{}
+			srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "alerts", ch, channels.IncomingMessage{
+				Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
+			})
+			runner, ok := srv.agents.Get("bot")
+			require.True(t, ok)
+			runner.Wait()
+			require.Equal(t, []string{"Unable to complete this request."}, ch.posted())
+		})
+	}
+}
+
+func TestSlackNoReplyClearsStatusWithoutPosting(t *testing.T) {
 	setupServerDataDir(t)
 	resetSlogForTest()
-	var (
-		mu     sync.Mutex
-		rounds int
-		valid  bool
-	)
-	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/chat/completions" {
-			http.NotFound(w, r)
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		rounds++
-		switch rounds {
-		case 1:
-			writeDeliveryToolCall(w, "sensitive_tool", map[string]any{"token": "fake-sensitive-argument"})
-		case 2:
-			valid = true
-			writeDeliveryText(w, "safe final answer")
-		default:
-			http.Error(w, "unexpected model round", http.StatusBadRequest)
-		}
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeDeliveryText(w, "NO_REPLY")
 	}))
 	t.Cleanup(model.Close)
-
-	verbose := true
 	cfg := &config.Config{
 		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
-		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Verbose: &verbose}},
+		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test"}},
 	}
 	srv := New(cfg, "fake-token")
-	selectPrivateSlackDeliveryTarget(t, srv, privateSlackDeliveryScope())
-	toolClient := &sensitiveDeliveryToolClient{}
-	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return toolClient, nil })
-	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
-
-	ch := &deliveryTestChannel{}
+	ch := &statusDeliveryChannel{}
 	srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", "alerts", ch, channels.IncomingMessage{
-		Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
+		Type: "slack", Channel: "C123", ThreadTS: "1700000000.000001", From: "U123", Text: "question",
 	})
 	runner, ok := srv.agents.Get("bot")
 	require.True(t, ok)
 	runner.Wait()
+	require.Empty(t, ch.posted())
+	require.Equal(t, []string{"is thinking", ""}, ch.snapshotStatuses())
+}
 
-	mu.Lock()
-	gotRounds, modelValid := rounds, valid
-	mu.Unlock()
-	require.Equal(t, 2, gotRounds)
-	require.True(t, modelValid)
-	toolClient.mu.Lock()
-	toolName, token := toolClient.name, fmt.Sprint(toolClient.args["token"])
-	toolClient.mu.Unlock()
-	require.Equal(t, "sensitive_tool", toolName)
-	require.Equal(t, "fake-sensitive-argument", token)
-	posted := ch.posted()
-	require.Equal(t, []string{"safe final answer"}, posted)
-	for _, text := range posted {
-		require.NotContains(t, text, "fake-sensitive-argument")
-		require.NotContains(t, text, "fake-sensitive-result")
-	}
+type statusDeliveryChannel struct {
+	deliveryTestChannel
+	statusMu sync.Mutex
+	statuses []string
+}
+
+func (c *statusDeliveryChannel) SendAssistantStatusContext(_ context.Context, _, _, status string) error {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	c.statuses = append(c.statuses, status)
+	return nil
+}
+
+func (c *statusDeliveryChannel) snapshotStatuses() []string {
+	c.statusMu.Lock()
+	defer c.statusMu.Unlock()
+	return append([]string(nil), c.statuses...)
 }
 
 func writeDeliveryToolCall(w http.ResponseWriter, name string, arguments map[string]any) {

@@ -6,13 +6,12 @@ type StreamEventType string
 
 // StreamEventType values.
 const (
-	StreamEventText   StreamEventType = "text"   // partial text from the LLM
-	StreamEventTool   StreamEventType = "tool"   // tool execution metadata
-	StreamEventMedia  StreamEventType = "media"  // image data URL from the LLM
-	StreamEventDone   StreamEventType = "done"   // stream complete
-	StreamEventError  StreamEventType = "error"  // error occurred
-	StreamEventStop   StreamEventType = "stop"   // agent was stopped mid-stream
-	StreamEventStatus StreamEventType = "status" // verbose progress message before a tool call
+	StreamEventText  StreamEventType = "text"  // partial text from the LLM
+	StreamEventTool  StreamEventType = "tool"  // tool execution metadata
+	StreamEventMedia StreamEventType = "media" // image data URL from the LLM
+	StreamEventDone  StreamEventType = "done"  // stream complete
+	StreamEventError StreamEventType = "error" // error occurred
+	StreamEventStop  StreamEventType = "stop"  // agent was stopped mid-stream
 )
 
 // ToolEvent carries structured tool execution details for debug-oriented UIs.

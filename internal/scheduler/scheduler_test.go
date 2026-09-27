@@ -571,7 +571,7 @@ func TestWorkerPool_ExecuteJob_RepliesToSessionDelivery(t *testing.T) {
 	data, err := os.ReadFile(store.SessionPath(replyAgentID, replySessionID))
 	assert.NoError(t, err)
 	assert.Contains(t, string(data), "\"role\":\"assistant\"")
-	assert.Contains(t, string(data), "no LLM provider configured")
+	assert.Contains(t, string(data), "Unable to complete this request.")
 
 }
 
@@ -610,7 +610,7 @@ func TestWorkerPool_ExecuteJob_ReusesPersistedSession(t *testing.T) {
 	data, err := os.ReadFile(store.SessionPath("alpha", sess.ID))
 	assert.NoError(t, err)
 	assert.Contains(t, string(data), "Continue the unfinished scheduled task")
-	assert.Contains(t, string(data), "no LLM provider configured")
+	assert.Contains(t, string(data), "Unable to complete this request.")
 }
 
 func TestJobSessionName_UsesStableTaskName(t *testing.T) {

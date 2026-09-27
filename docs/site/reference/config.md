@@ -86,7 +86,6 @@ agents:
     working_dir: ~/workspace
     rules: |
       You are a helpful assistant.
-    verbose: true
     permissions: { ... }
     channels: [ ... ]
     tasks: [ ... ]
@@ -102,7 +101,6 @@ agents:
 | `compact_keep` | int | | Number of recent messages to retain during context compaction |
 | `working_dir` | string | | Default working directory for file-path resolution. Supports `~` and environment variables. Defaults to the agent's data directory. |
 | `rules` | string | | Inline markdown rules or a path to a file (e.g. `"./RULES.md"`) injected at the top of every system prompt. Paths are resolved relative to `working_dir`. |
-| `verbose` | bool | `false` | Emit a brief status message before each tool call when responding via a channel |
 
 ### agents[].permissions
 
@@ -187,7 +185,7 @@ channels:
 | `url` | string | | Channel transport address. For Slack this is the App-Level token (`xapp-...`) used by Socket Mode. For Signal this is the `signal-cli` daemon address. Discord does not use `url`. |
 | `model` | string | | Override model for all messages on this channel |
 | `fallbacks` | []string | | Override fallbacks for all messages on this channel |
-| `show_typing` | bool | `true` | Show a typing or progress indicator while processing on supported channels (Signal typing notifications and Slack assistant status indicators) |
+| `show_typing` | bool | `true` | Show Signal typing or fixed generic Slack assistant status for the selected channel route |
 | `separate_top_level_sessions` | bool | `false` | For Slack, start a distinct session for each top-level message thread instead of sharing one channel session |
 | `react_to_emoji` | bool | `true` | Treat emoji reactions on the agent's own messages as prompts |
 | `reply_to_replies` | bool | `true` | On Signal, respond to replies to the agent's messages. On Slack, let authorized participants continue a thread claimed by an explicit bot mention without another mention. |
@@ -202,7 +200,7 @@ channels:
 - `id` is not a Slack workspace ID or channel ID. It is your Aviary integration name for that Slack connection.
 - `url` must contain the Slack App-Level token (`xapp-...`) when `type: slack`.
 - `token` must contain the Slack Bot token (`xoxb-...`) when `type: slack`.
-- Slack apps using Events API and Socket Mode cannot send classic typing indicators, but `show_typing` enables Slack assistant thread status updates while Aviary is working.
+- Slack apps using Events API and Socket Mode cannot send classic typing indicators, but `show_typing` enables fixed generic Slack assistant status on supported surfaces while Aviary is working. The selected agent/channel route controls this setting; status text never includes tool calls or their inputs or results.
 - The first authorized explicit bot mention or literal configured mention prefix claims a Slack thread for one agent when `reply_to_replies` is true. A bot mention can claim a channel-scoped catch-all rule or a rule configured to respond to mentions; a prefix-gated rule also requires its prefix. Wildcard mention prefixes remain ordinary message filters and do not claim or transfer threads. Authorized participants can continue a claimed thread without another mention. Sender, channel, exclude, and tool rules apply to each reply. Set `ignore_other_user_mentions: true` to keep a claimed thread's owner from responding when a reply directly tags another user, even if it also tags the owner. A mention of another bot routes that message when the other bot has an enabled channel rule that accepts its mention; it does not change the thread owner. Ambiguous explicit targets are ignored. Unclaimed threads still follow ordinary `allow_from` rules; mention-gated agents ignore their untagged replies. Set `reply_to_replies: false` to require a fresh bot mention or literal prefix for every reply.
 - `ignore_other_user_mentions` controls reply routing and setup prompts. It does not change `group_chat_history`, which records channel messages for later context.
 - Thread claims survive restarts and expire 90 days after the Slack thread root. Removing, disabling, or re-enabling the owning channel spec leaves its old claim without an active owner; start a fresh thread to establish new affinity.

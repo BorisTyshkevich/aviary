@@ -242,7 +242,6 @@ agents:
   - name: lobby
     model: anthropic/claude-haiku-4-5-20251001
     memory: shared
-    verbose: true
     channels:
       - type: slack
         id: workspace-bot

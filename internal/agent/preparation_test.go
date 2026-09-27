@@ -221,6 +221,21 @@ func TestPreparationFailurePolicy(t *testing.T) {
 	}
 }
 
+func TestPreparationErrorDoesNotReachRegisteredSlackDelivery(t *testing.T) {
+	r, _ := preparationRunner(t, "fail", "stop")
+	t.Cleanup(r.Wait)
+	r.provider = &preparationProvider{}
+	r.cfg.Hooks.BeforeTurn.Argv = []string{"/fake/private/fake-secret/collector"}
+	const sessionID = "prep-failure-slack-delivery"
+	var delivered string
+	RegisterSessionDelivery(r.agent.ID, sessionID, "slack", "C1", func(text string) { delivered = text })
+
+	event := runPreparationPrompt(WithSessionID(context.Background(), sessionID), t, r, RunOverrides{Bare: true})
+	require.Equal(t, StreamEventError, event.Type)
+	require.ErrorContains(t, event.Err, "preparation unavailable")
+	require.Equal(t, "Unable to complete this request.", delivered)
+}
+
 func TestPreparationStructuredStatusRespectsFailurePolicy(t *testing.T) {
 	for _, status := range []string{"unavailable", "denied", "timed_out", "partial"} {
 		for _, policy := range []string{"continue", "stop"} {
