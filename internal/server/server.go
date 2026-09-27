@@ -524,7 +524,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	configureRun := func(candidate channels.Channel, cc config.ChannelConfig, incoming channels.IncomingMessage) {
 		progressMode = config.ToolProgressOff
 		if cc.ToolProgress != nil {
-			progressMode = *cc.ToolProgress
+			switch *cc.ToolProgress {
+			case config.ToolProgressName, config.ToolProgressSQL:
+				progressMode = *cc.ToolProgress
+			}
 		}
 		startTyping = nil
 		stopTyping = nil

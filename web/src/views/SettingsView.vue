@@ -1607,7 +1607,11 @@ function hydrateDraftConfig(config: AppConfig): AppConfig {
 		(agent.channels ?? []).forEach((ch) => {
 			if (ch.enabled === undefined) ch.enabled = true;
 			if (ch.show_typing === undefined) ch.show_typing = true;
-			if (ch.type === "slack" && ch.tool_progress === undefined)
+			if (
+				ch.type === "slack" &&
+				ch.tool_progress !== "name" &&
+				ch.tool_progress !== "sql"
+			)
 				ch.tool_progress = "off";
 			if (ch.type === "slack") {
 				if (ch.tool_progress_max_calls === undefined)
@@ -2771,7 +2775,8 @@ function normalizedDraftConfig(): AppConfig {
 				.filter(Boolean),
 			show_typing: ch.show_typing === false ? false : undefined,
 			tool_progress:
-				ch.type === "slack" && ch.tool_progress !== "off"
+				ch.type === "slack" &&
+				(ch.tool_progress === "name" || ch.tool_progress === "sql")
 					? ch.tool_progress
 					: undefined,
 			tool_progress_max_calls:

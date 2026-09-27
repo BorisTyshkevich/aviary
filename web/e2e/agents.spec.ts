@@ -929,6 +929,41 @@ test("Slack tool progress loads and saves independently of typing", async ({
 	});
 });
 
+test("invalid Slack tool progress loads safely as off", async ({ page }) => {
+	let savedConfig: unknown = null;
+	await mockMCP(page, {
+		config_get: {
+			...CONFIG,
+			agents: [
+				{
+					...CONFIG.agents[0],
+					channels: [
+						{ type: "slack", id: "workspace-bot", tool_progress: "true" },
+					],
+				},
+			],
+		},
+		config_save: (args) => {
+			savedConfig = JSON.parse(String(args?.config ?? "{}"));
+			return "ok";
+		},
+	});
+	await page.goto("/settings");
+	await page.getByRole("link", { name: "Agents & Tasks", exact: true }).click();
+	await page
+		.getByRole("button", { name: "Channels", exact: true })
+		.first()
+		.click();
+	await expect(page.getByLabel("Tool progress")).toHaveValue("off");
+	await page.getByLabel("Max tool calls").fill("101");
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	const saved = savedConfig as {
+		agents: { channels: { tool_progress?: string }[] }[];
+	};
+	expect(saved.agents[0].channels[0].tool_progress).toBeUndefined();
+});
+
 test("saving settings preserves task prompt newlines", async ({ page }) => {
 	let savedConfig: unknown = null;
 

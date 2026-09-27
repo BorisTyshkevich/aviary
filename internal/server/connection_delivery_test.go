@@ -404,7 +404,7 @@ func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
 }
 
 func TestSlackPrivateTurnToolProgressModes(t *testing.T) {
-	for _, mode := range []string{config.ToolProgressOff, config.ToolProgressName, config.ToolProgressSQL} {
+	for _, mode := range []string{config.ToolProgressOff, config.ToolProgressName, config.ToolProgressSQL, "false", "invalid"} {
 		t.Run(mode, func(t *testing.T) {
 			setupServerDataDir(t)
 			resetSlogForTest()
@@ -442,7 +442,7 @@ func TestSlackPrivateTurnToolProgressModes(t *testing.T) {
 			require.True(t, ok)
 			runner.Wait()
 			posted := ch.posted()
-			if mode == config.ToolProgressOff {
+			if mode != config.ToolProgressName && mode != config.ToolProgressSQL {
 				require.Equal(t, []string{"synthetic private answer"}, posted)
 				require.Empty(t, ch.deletedMessages())
 				return
