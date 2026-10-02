@@ -169,6 +169,17 @@ func TestChannelAdmissionRepeatedRejectionRepliesInOriginalThread(t *testing.T) 
 	require.Zero(t, checkpointCountForServerTest("bot"))
 }
 
+func TestChannelAdmissionResendNoticeUsesRouteReplyPrefix(t *testing.T) {
+	setupServerDataDir(t)
+	resetSlogForTest()
+	srv := New(signalAdmissionConfig("stub"), "tok")
+	ch := &admissionChannel{}
+	srv.sendAdmissionResendNotice(ch, channels.IncomingMessage{Type: "slack", Channel: "C1", ThreadTS: "original"}, "🔒")
+	posts, threads := ch.snapshot()
+	require.Empty(t, posts)
+	require.Equal(t, []string{"original:🔒 Restarting; please resend your request."}, threads)
+}
+
 func TestNonSlackIngressStopsBeforeRunnerAdmission(t *testing.T) {
 	setupServerDataDir(t)
 	resetSlogForTest()

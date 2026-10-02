@@ -75,6 +75,8 @@ type SlackCheckpoint struct {
 	Disposition     SlackDisposition `json:"disposition"`
 	CleanupPending  bool             `json:"cleanup_pending,omitempty"`
 	NoticeAttempted bool             `json:"notice_attempted,omitempty"`
+	// ReplyPrefix is the prefix selected for this run's Slack messages.
+	ReplyPrefix string `json:"reply_prefix,omitempty"`
 }
 
 // ProgressTimestamps returns accepted progress pages in their creation order.

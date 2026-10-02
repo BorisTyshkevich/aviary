@@ -929,6 +929,72 @@ test("Slack tool progress loads and saves independently of typing", async ({
 	});
 });
 
+test("Slack reply prefix and markers load, trim, and clear", async ({
+	page,
+}) => {
+	let savedConfig: unknown = null;
+	await mockMCP(page, {
+		config_get: {
+			...CONFIG,
+			agents: [
+				{
+					...CONFIG.agents[0],
+					channels: [
+						{
+							type: "slack",
+							id: "workspace-bot",
+							reply_prefix: "🔒",
+							reply_prefix_markers: [":lock:"],
+							allow_from: [{ from: "*" }],
+						},
+					],
+				},
+			],
+		},
+		config_save: (args) => {
+			savedConfig = JSON.parse(String(args?.config ?? "{}"));
+			return "ok";
+		},
+	});
+	await page.goto("/settings");
+	await page.getByRole("link", { name: "Agents & Tasks", exact: true }).click();
+	await page
+		.getByRole("button", { name: "Channels", exact: true })
+		.first()
+		.click();
+	const prefix = page.getByLabel("Reply prefix", { exact: true });
+	const markers = page.getByLabel("Reply prefix markers (comma-separated)");
+	await expect(prefix).toHaveValue("🔒");
+	await expect(markers).toHaveValue(":lock:");
+	await prefix.fill(" 🔐 ");
+	await markers.fill(" :lock: , 🔒 ,, ");
+	await markers.blur();
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	expect(savedConfig).toMatchObject({
+		agents: [
+			{
+				channels: [
+					{ reply_prefix: "🔐", reply_prefix_markers: [":lock:", "🔒"] },
+				],
+			},
+		],
+	});
+	await prefix.fill("   ");
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	const saved = savedConfig as {
+		agents: {
+			channels: { reply_prefix?: string; reply_prefix_markers?: string[] }[];
+		}[];
+	};
+	expect(saved.agents[0].channels[0].reply_prefix).toBeUndefined();
+	expect(
+		saved.agents[0].channels[0].reply_prefix_markers,
+		"markers without a prefix are not saved",
+	).toBeUndefined();
+});
+
 test("invalid Slack tool progress loads safely as off", async ({ page }) => {
 	let savedConfig: unknown = null;
 	await mockMCP(page, {

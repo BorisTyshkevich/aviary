@@ -41,6 +41,7 @@ Shared channel behavior:
 - Channel-level `model` and `fallbacks` override the agent defaults for messages arriving through that channel.
 - `show_typing` applies to Signal typing notifications and fixed generic Slack assistant status on supported surfaces. The selected agent/channel route controls it, including when agents share one Slack connection. Discord does not support it.
 - `tool_progress` is an optional Slack-only setting with values `off` (default), `name`, and `sql`. The selected route controls it independently of `show_typing`. `tool_progress_max_calls` defaults to 100 (range 1–1000) and `tool_progress_max_chars` defaults to 2800 (range 500–3900).
+- `reply_prefix` is an optional Slack-only string, such as `"🔒"`, placed before every message an agent run posts on the selected route. Add `reply_prefix_markers`, such as `[":lock:", "🔒"]`, to apply it only when the question itself contains a marker.
 
 ## Slack
 
@@ -127,6 +128,32 @@ Slack-specific notes:
 - `allow_from[].allowed_groups` accepts raw Slack channel IDs or human-friendly names such as `alerts` or `#alerts`.
 - Slack apps connected through Events API and Socket Mode cannot emit classic typing notifications, but Aviary uses fixed generic Slack assistant status on supported surfaces when the selected route has `show_typing` enabled. Status never includes tool names, arguments, results, errors, paths, or commands.
 - With `tool_progress: name`, Aviary shows registered tool names, state, and elapsed time in temporary messages in the original thread. `tool_progress: sql` also shows safe input details, with SQL literals and comments redacted. Raw results and errors stay private. Each message stays within the UTF-8 byte cap. Calls through the call cap are paginated while the run is active, with up to ten seconds to flush queued pages before the final answer; additional calls are counted on the last page. Progress is cleaned up after the final answer when Slack permits it.
+- With `reply_prefix: "🔒"`, every answer, notice, attached-answer introduction, and temporary progress message on that route starts with `🔒 `. To give one channel its own prefix or progress mode, add another channel entry for the same agent that reuses the Slack tokens with a distinct `id` and an `allowed_groups` list containing only that channel:
+
+```yaml
+channels:
+  - type: slack
+    id: workspace-bot
+    url: auth:slack_app_token
+    token: auth:slack_bot_token
+    tool_progress: sql
+    reply_prefix: "🔒"
+    reply_prefix_markers: [":lock:", "🔒"]  # only questions marked with 🔒
+    allow_from:
+      - from: "*"
+        allowed_groups: "#alerts"
+        respond_to_mentions: true
+  - type: slack
+    id: workspace-bot-triage
+    url: auth:slack_app_token
+    token: auth:slack_bot_token
+    tool_progress: "off"
+    reply_prefix: "🔒"  # every reply in #triage
+    allow_from:
+      - from: "*"
+        allowed_groups: "#triage"
+        respond_to_mentions: true
+```
 - `users:read` is required if you want Aviary to resolve Slack user names and support name-based routing instead of raw user IDs only.
 - In the control panel, **Settings > Agents > Channels > Slack** includes a **Browse Channels** action that validates the bot token and lists channels visible to the app.
 

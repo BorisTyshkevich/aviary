@@ -317,6 +317,11 @@ func (v *validator) checkAuthCredentialEither(field, oauthKey, apiKey, hint stri
 }
 
 // checkChannel validates a ChannelConfig.
+// validReplyPrefixText accepts one line of bounded text without surrounding whitespace.
+func validReplyPrefixText(value string) bool {
+	return strings.TrimSpace(value) == value && !strings.ContainsAny(value, "\r\n") && len(value) <= MaxReplyPrefixBytes
+}
+
 func (v *validator) checkChannel(field string, ch ChannelConfig) {
 	switch ch.Type {
 	case "slack", "discord", "signal":
@@ -345,6 +350,28 @@ func (v *validator) checkChannel(field string, ch ChannelConfig) {
 			v.errorf(field+".tool_progress_max_chars", "tool_progress_max_chars is only supported for Slack channels")
 		} else if *ch.ToolProgressMaxChars < MinToolProgressMaxChars || *ch.ToolProgressMaxChars > MaxToolProgressMaxChars {
 			v.errorf(field+".tool_progress_max_chars", "tool_progress_max_chars must be between %d and %d", MinToolProgressMaxChars, MaxToolProgressMaxChars)
+		}
+	}
+	if ch.ReplyPrefix != "" {
+		if ch.Type != "slack" {
+			v.errorf(field+".reply_prefix", "reply_prefix is only supported for Slack channels")
+		} else if !validReplyPrefixText(ch.ReplyPrefix) {
+			v.errorf(field+".reply_prefix", "reply_prefix must be a single line of at most %d UTF-8 bytes without surrounding whitespace", MaxReplyPrefixBytes)
+		}
+	}
+	if len(ch.ReplyPrefixMarkers) > 0 {
+		switch {
+		case ch.Type != "slack":
+			v.errorf(field+".reply_prefix_markers", "reply_prefix_markers is only supported for Slack channels")
+		case ch.ReplyPrefix == "":
+			v.errorf(field+".reply_prefix_markers", "reply_prefix_markers requires reply_prefix")
+		case len(ch.ReplyPrefixMarkers) > MaxReplyPrefixMarkers:
+			v.errorf(field+".reply_prefix_markers", "reply_prefix_markers accepts at most %d markers", MaxReplyPrefixMarkers)
+		}
+		for i, marker := range ch.ReplyPrefixMarkers {
+			if marker == "" || !validReplyPrefixText(marker) {
+				v.errorf(fmt.Sprintf("%s.reply_prefix_markers[%d]", field, i), "reply_prefix_markers entries must be non-empty single lines of at most %d UTF-8 bytes without surrounding whitespace", MaxReplyPrefixBytes)
+			}
 		}
 	}
 

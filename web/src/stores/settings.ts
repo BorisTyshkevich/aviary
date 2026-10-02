@@ -40,6 +40,8 @@ export interface AgentChannel {
 	tool_progress?: "off" | "name" | "sql";
 	tool_progress_max_calls?: number;
 	tool_progress_max_chars?: number;
+	reply_prefix?: string;
+	reply_prefix_markers?: string[];
 	separate_top_level_sessions?: boolean;
 	reply_to_replies?: boolean;
 	ignore_other_user_mentions?: boolean;
@@ -217,6 +219,8 @@ function channelForType(channel: AgentChannel): AgentChannel {
 		delete safe.tool_progress;
 		delete safe.tool_progress_max_calls;
 		delete safe.tool_progress_max_chars;
+		delete safe.reply_prefix;
+		delete safe.reply_prefix_markers;
 	}
 	return safe;
 }

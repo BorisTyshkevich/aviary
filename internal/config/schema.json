@@ -175,6 +175,8 @@
                 "tool_progress": { "type": "string", "enum": ["off", "name", "sql"], "default": "off" },
                 "tool_progress_max_calls": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 },
                 "tool_progress_max_chars": { "type": "integer", "minimum": 500, "maximum": 3900, "default": 2800 },
+                "reply_prefix": { "type": "string", "maxLength": 64, "pattern": "^[^\\s](?:[^\\r\\n]*[^\\s])?$" },
+                "reply_prefix_markers": { "type": "array", "maxItems": 16, "items": { "type": "string", "maxLength": 64, "pattern": "^[^\\s](?:[^\\r\\n]*[^\\s])?$" } },
                 "separate_top_level_sessions": { "type": "boolean" },
                 "reply_to_replies": { "type": "boolean" },
                 "ignore_other_user_mentions": { "type": "boolean" },
@@ -225,7 +227,7 @@
                   }
                 }
               },
-              "allOf": [{ "if": { "anyOf": [{ "required": ["tool_progress"] }, { "required": ["tool_progress_max_calls"] }, { "required": ["tool_progress_max_chars"] }] }, "then": { "properties": { "type": { "const": "slack" } } } }]
+              "allOf": [{ "if": { "anyOf": [{ "required": ["tool_progress"] }, { "required": ["tool_progress_max_calls"] }, { "required": ["tool_progress_max_chars"] }, { "required": ["reply_prefix"] }, { "required": ["reply_prefix_markers"] }] }, "then": { "properties": { "type": { "const": "slack" } } } }, { "if": { "required": ["reply_prefix_markers"] }, "then": { "required": ["reply_prefix"] } }]
             }
           },
           "tasks": {

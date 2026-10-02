@@ -745,6 +745,19 @@
 										</div>
 										<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">Defaults: 100 calls across progress messages, 2,800 UTF-8 bytes per message. More messages appear while the run is active; terminal delivery has a bounded ten-second flush. Calls over the cap are counted.</p>
 									</div>
+									<div v-if="ch.type === 'slack'" class="max-w-sm">
+										<label class="field-label" :for="`reply-prefix-${i}-${k}`">Reply prefix</label>
+										<input :id="`reply-prefix-${i}-${k}`" v-model="ch.reply_prefix" type="text" maxlength="64" class="field-input mt-1" placeholder="🔒" />
+										<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+											Optional. Leads every message this route posts for an agent run, including notices and temporary progress, followed by one space.
+										</p>
+										<label class="field-label mt-2" :for="`reply-prefix-markers-${i}-${k}`">Reply prefix markers (comma-separated)</label>
+										<input :id="`reply-prefix-markers-${i}-${k}`" :value="(ch.reply_prefix_markers ?? []).join(', ')" type="text" class="field-input mt-1" placeholder=":lock:, 🔒"
+											@change="ch.reply_prefix_markers = ($event.target as HTMLInputElement).value.split(',').map((v) => v.trim()).filter(Boolean)" />
+										<p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+											Optional. When set, the prefix is used only for questions whose own text contains a marker. Slack sends a typed 🔒 as <code>:lock:</code>.
+										</p>
+									</div>
 									<label class="flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-400">
 										<input type="checkbox" v-model="ch.reply_to_replies"
 											class="h-3.5 w-3.5 rounded border-gray-300 text-blue-600 focus:ring-blue-500 dark:border-gray-600 dark:bg-gray-800" />
