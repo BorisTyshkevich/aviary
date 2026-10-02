@@ -223,7 +223,7 @@ func (s *Server) recoverClaimedSlackCheckpoint(ctx context.Context, route channe
 	if timestamps := meta.ProgressTimestamps(); len(timestamps) != 0 {
 		last := timestamps[len(timestamps)-1]
 		callCtx, cancel := slackRecoveryContext(ctx, route, slackAnswerCallTimeout)
-		err := route.Channel.EditThreadTextContext(callCtx, meta.ChannelID, last, slackRecoveryNotice(meta))
+		err := route.Channel.EditThreadTextContext(callCtx, meta.ChannelID, last, channels.SlackReplyText(meta.ReplyPrefix, slackRecoveryNotice(meta)))
 		cancel()
 		if err == nil {
 			// The edited final page is now the notice. Earlier pages still need
@@ -255,7 +255,7 @@ func (s *Server) recoverClaimedSlackCheckpoint(ctx context.Context, route channe
 	}
 	// Persist uncertainty before the first byte of a standalone notice can go
 	// out. A crash or unknown transport result must never trigger a fresh post.
-	body := slackRecoveryNotice(meta)
+	body := channels.SlackReplyText(meta.ReplyPrefix, slackRecoveryNotice(meta))
 	priorDisposition := meta.Disposition
 	meta.Disposition, meta.NoticeAttempted = agent.SlackDispositionUnconfirmed, true
 	if !persistSlackRecovery(path, &cp) {

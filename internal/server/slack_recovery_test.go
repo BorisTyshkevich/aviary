@@ -118,6 +118,18 @@ func TestSlackRecoveryUsesOriginalTargetAndRetiresAcceptedNotice(t *testing.T) {
 	require.True(t, os.IsNotExist(err))
 }
 
+func TestSlackRecoveryNoticeUsesRunReplyPrefix(t *testing.T) {
+	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{Disposition: agent.SlackDispositionPending, ReplyPrefix: "🔒"})
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	posts, _, _ := sender.snapshot()
+	require.Equal(t, []string{"C-original/1700000000.000001:🔒 Interrupted; please resend your request."}, posts)
+
+	path, route, sender = recoveryFixture(t, agent.SlackCheckpoint{ProgressTS: "progress", CleanupPending: true, ReplyPrefix: "🔒"})
+	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)
+	_, edits, _ := sender.snapshot()
+	require.Equal(t, []string{"C-original/progress:🔒 Interrupted; please resend your request."}, edits)
+}
+
 func TestSlackRecoveryKnownProgressEditsWithoutFreshPost(t *testing.T) {
 	path, route, sender := recoveryFixture(t, agent.SlackCheckpoint{ProgressTS: "progress", CleanupPending: true})
 	(&Server{}).recoverSlackCheckpoint(context.Background(), route, path)

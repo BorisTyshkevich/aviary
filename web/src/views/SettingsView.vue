@@ -1622,6 +1622,8 @@ function hydrateDraftConfig(config: AppConfig): AppConfig {
 				delete ch.tool_progress;
 				delete ch.tool_progress_max_calls;
 				delete ch.tool_progress_max_chars;
+				delete ch.reply_prefix;
+				delete ch.reply_prefix_markers;
 			}
 			if (ch.reply_to_replies === undefined) ch.reply_to_replies = true;
 			if (ch.ignore_other_user_mentions === undefined)
@@ -2783,6 +2785,14 @@ function normalizedDraftConfig(): AppConfig {
 				ch.type === "slack" ? ch.tool_progress_max_calls : undefined,
 			tool_progress_max_chars:
 				ch.type === "slack" ? ch.tool_progress_max_chars : undefined,
+			reply_prefix:
+				ch.type === "slack"
+					? (ch.reply_prefix ?? "").trim() || undefined
+					: undefined,
+			reply_prefix_markers:
+				ch.type === "slack" && (ch.reply_prefix ?? "").trim()
+					? (ch.reply_prefix_markers ?? []).map((v) => v.trim()).filter(Boolean)
+					: undefined,
 			separate_top_level_sessions:
 				ch.separate_top_level_sessions === true ? true : undefined,
 			reply_to_replies: ch.reply_to_replies === false ? false : undefined,

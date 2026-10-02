@@ -403,6 +403,63 @@ func TestSlackToolProgressUsesSelectedRouteOnSharedChannel(t *testing.T) {
 	require.Equal(t, []string{"posted"}, shared.deletedMessages())
 }
 
+func TestSlackReplyPrefixUsesSelectedRouteOnSharedChannel(t *testing.T) {
+	setupServerDataDir(t)
+	resetSlogForTest()
+	var rounds int
+	var roundsMu sync.Mutex
+	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		roundsMu.Lock()
+		defer roundsMu.Unlock()
+		rounds++
+		if rounds%2 == 1 {
+			writeDeliveryToolCall(w, "synthetic_tool", map[string]any{"path": "/fake-private-path"})
+		} else {
+			writeDeliveryText(w, "synthetic final")
+		}
+	}))
+	t.Cleanup(model.Close)
+	name, off := config.ToolProgressName, config.ToolProgressOff
+	cfg := &config.Config{
+		Models: config.ModelsConfig{Providers: map[string]config.ProviderConfig{"vllm": {BaseURI: model.URL}}},
+		Agents: []config.AgentConfig{{Name: "bot", Model: "vllm/test", Channels: []config.ChannelConfig{
+			{Type: "slack", ID: "plain", ToolProgress: &off},
+			{Type: "slack", ID: "locked", ToolProgress: &off, ReplyPrefix: "🔒"},
+			{Type: "slack", ID: "locked-progress", ToolProgress: &name, ReplyPrefix: "🔒"},
+			{Type: "slack", ID: "marked", ToolProgress: &off, ReplyPrefix: "🔒", ReplyPrefixMarkers: []string{":lock:", "🔒"}},
+		}}},
+	}
+	srv := New(cfg, "fake-token")
+	tool := &slowDeliveryToolClient{delay: 2 * time.Second}
+	agent.SetToolClientFactory(func(context.Context) (agent.ToolClient, error) { return tool, nil })
+	t.Cleanup(func() { agent.SetToolClientFactory(nil) })
+	runner, ok := srv.agents.Get("bot")
+	require.True(t, ok)
+	run := func(route, channel string, question ...string) []string {
+		text := route
+		if len(question) > 0 {
+			text = question[0]
+		}
+		ch := &deliveryTestChannel{}
+		srv.handleIncomingChannelMessage(context.Background(), "bot", "slack", route, ch, channels.IncomingMessage{
+			Type: "slack", InstallationID: "install", WorkspaceID: "workspace", Channel: channel, ThreadTS: "1700000000.000001", From: "U1",
+			Text: text, OriginalText: text,
+		})
+		runner.Wait()
+		return ch.posted()
+	}
+	require.Equal(t, []string{"synthetic final"}, run("plain", "C1"))
+	require.Equal(t, []string{"🔒 synthetic final"}, run("locked", "C2"), "prefixed route without progress posts only the prefixed answer")
+	posted := run("locked-progress", "C3")
+	require.Len(t, posted, 2)
+	require.True(t, strings.HasPrefix(posted[0], "🔒 "), "temporary progress also carries the prefix: %q", posted[0])
+	require.Contains(t, posted[0], "Tool progress")
+	require.Equal(t, "🔒 synthetic final", posted[1])
+	require.Equal(t, []string{"synthetic final"}, run("marked", "C4", "<@BOT> unmarked question"))
+	require.Equal(t, []string{"🔒 synthetic final"}, run("marked", "C5", "<@BOT> :lock: marked question"),
+		"a marker in the question's own text selects the prefix")
+}
+
 func TestSlackPrivateTurnToolProgressModes(t *testing.T) {
 	for _, mode := range []string{config.ToolProgressOff, config.ToolProgressName, config.ToolProgressSQL, "false", "invalid"} {
 		t.Run(mode, func(t *testing.T) {

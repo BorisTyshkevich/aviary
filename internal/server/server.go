@@ -457,14 +457,15 @@ func (s *Server) terminalContext(runCtx context.Context, budget time.Duration) (
 
 func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, channelType, configuredID string, ch channels.Channel, msg channels.IncomingMessage) {
 	if channelType != "slack" && s.nonSlackIngressClosed.Load() {
-		s.sendAdmissionResendNotice(ch, msg)
+		s.sendAdmissionResendNotice(ch, msg, "")
 		return
 	}
 	originalChannel, originalMessage := ch, msg
 	runner, ok := s.agents.Get(agentName)
 	if !ok {
 		if _, _, valid := s.channels.RevalidateRoutedMessage(agentName, channelType, configuredID, msg); valid {
-			s.sendAdmissionResendNotice(originalChannel, originalMessage)
+			cc, _ := s.findChannelConfig(agentName, channelType, configuredID)
+			s.sendAdmissionResendNotice(originalChannel, originalMessage, channels.SlackReplyPrefix(cc, originalMessage.OriginalText))
 		}
 		return
 	}
@@ -572,7 +573,8 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 		}
 		if channelType == "slack" && strings.TrimSpace(incoming.ThreadTS) != "" {
 			if sender, ok := candidate.(slackPresenterSender); ok {
-				presenter = newSlackPresenter(sender, incoming.Channel, incoming.ThreadTS, progressMode != config.ToolProgressOff)
+				replyPrefix := channels.SlackReplyPrefix(cc, incoming.OriginalText)
+				presenter = newSlackPresenter(channels.PrefixSlackReplies(sender, replyPrefix), incoming.Channel, incoming.ThreadTS, progressMode != config.ToolProgressOff)
 				if cc.ToolProgressMaxCalls != nil && *cc.ToolProgressMaxCalls >= config.MinToolProgressMaxCalls && *cc.ToolProgressMaxCalls <= config.MaxToolProgressMaxCalls {
 					presenter.maxCalls = *cc.ToolProgressMaxCalls
 				}
@@ -585,6 +587,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 				checkpoint = agent.NewSlackCheckpointHandle(agent.SlackCheckpoint{
 					InstallationID: incoming.InstallationID, WorkspaceID: incoming.WorkspaceID,
 					ConfiguredID: configuredID, ChannelID: incoming.Channel, RootThreadTS: incoming.ThreadTS,
+					ReplyPrefix: replyPrefix,
 				})
 				handle := checkpoint
 				presenter.hooks.ProgressCreated = handle.RecordProgressTimestamp
@@ -706,7 +709,7 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 			}
 		}
 		if admission.Status == agent.AdmissionRejectedStopping {
-			s.sendAdmissionResendNotice(originalChannel, originalMessage)
+			s.sendAdmissionResendNotice(originalChannel, originalMessage, channels.SlackReplyPrefix(channelCfg, originalMessage.OriginalText))
 			return
 		}
 	}
@@ -725,10 +728,10 @@ func (s *Server) handleIncomingChannelMessage(ctx context.Context, agentName, ch
 	stateMu.Unlock()
 }
 
-func (s *Server) sendAdmissionResendNotice(ch channels.Channel, msg channels.IncomingMessage) {
+func (s *Server) sendAdmissionResendNotice(ch channels.Channel, msg channels.IncomingMessage, replyPrefix string) {
 	ctx, cancel := s.terminalContext(context.Background(), 5*time.Second)
 	defer cancel()
-	const notice = "Restarting; please resend your request."
+	notice := channels.SlackReplyText(replyPrefix, "Restarting; please resend your request.")
 	if sender, ok := ch.(channels.ContextThreadMessageSender); ok {
 		if err := sender.SendThreadPlainTextContext(ctx, msg.Channel, msg.ThreadTS, notice); err != nil {
 			slog.Warn("server: could not send rejected-admission notice", "err", err)

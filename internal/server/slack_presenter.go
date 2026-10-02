@@ -24,12 +24,7 @@ const (
 	slackProgressMaxText     = 2800
 )
 
-type slackPresenterSender interface {
-	PostThreadTextContext(context.Context, string, string, string) (string, error)
-	EditThreadTextContext(context.Context, string, string, string) error
-	DeleteThreadMessageContext(context.Context, string, string) error
-	ShareThreadMarkdownFileContext(context.Context, string, string, string, string) error
-}
+type slackPresenterSender = channels.SlackReplySender
 
 type slackPublicCall struct {
 	name, id, state, detail string

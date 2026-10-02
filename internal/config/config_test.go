@@ -984,6 +984,71 @@ func TestToolProgressCapsValidationAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReplyPrefixSlackOnlyValidationAndRoundTrip(t *testing.T) {
+	channel := ChannelConfig{Type: "slack", ReplyPrefix: "🔒"}
+	cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{channel}}}}
+	assert.False(t, hasIssue(Validate(&cfg, nil), "reply_prefix"))
+
+	var fromYAML ChannelConfig
+	assert.NoError(t, yaml.Unmarshal([]byte("type: slack\nreply_prefix: \"🔒\"\n"), &fromYAML))
+	assert.Equal(t, "🔒", fromYAML.ReplyPrefix)
+	jsonData, err := json.Marshal(channel)
+	assert.NoError(t, err)
+	var fromJSON ChannelConfig
+	assert.NoError(t, json.Unmarshal(jsonData, &fromJSON))
+	assert.Equal(t, channel.ReplyPrefix, fromJSON.ReplyPrefix)
+	assert.NotContains(t, string(mustJSON(t, ChannelConfig{Type: "slack"})), "reply_prefix")
+
+	for _, invalid := range []string{" 🔒", "🔒 ", "🔒\nlocked", strings.Repeat("a", MaxReplyPrefixBytes+1)} {
+		t.Run(strconv.Quote(invalid), func(t *testing.T) {
+			cfg.Agents[0].Channels[0] = ChannelConfig{Type: "slack", ReplyPrefix: invalid}
+			assert.True(t, hasIssue(Validate(&cfg, nil), "reply_prefix must be a single line"))
+		})
+	}
+	for _, typ := range []string{"signal", "discord"} {
+		cfg.Agents[0].Channels[0] = ChannelConfig{Type: typ, ReplyPrefix: "🔒"}
+		assert.True(t, hasIssue(Validate(&cfg, nil), "reply_prefix is only supported for Slack channels"))
+	}
+}
+
+func TestReplyPrefixMarkersValidationAndRoundTrip(t *testing.T) {
+	channel := ChannelConfig{Type: "slack", ReplyPrefix: "🔒", ReplyPrefixMarkers: []string{":lock:", "🔒"}}
+	cfg := Config{Agents: []AgentConfig{{Name: "bot", Channels: []ChannelConfig{channel}}}}
+	assert.False(t, hasIssue(Validate(&cfg, nil), "reply_prefix_markers"))
+	var fromYAML ChannelConfig
+	assert.NoError(t, yaml.Unmarshal([]byte("type: slack\nreply_prefix: \"🔒\"\nreply_prefix_markers: [\":lock:\", \"🔒\"]\n"), &fromYAML))
+	assert.Equal(t, channel.ReplyPrefixMarkers, fromYAML.ReplyPrefixMarkers)
+	var fromJSON ChannelConfig
+	assert.NoError(t, json.Unmarshal(mustJSON(t, channel), &fromJSON))
+	assert.Equal(t, channel.ReplyPrefixMarkers, fromJSON.ReplyPrefixMarkers)
+
+	cfg.Agents[0].Channels[0] = ChannelConfig{Type: "slack", ReplyPrefixMarkers: []string{":lock:"}}
+	assert.True(t, hasIssue(Validate(&cfg, nil), "reply_prefix_markers requires reply_prefix"))
+	tooMany := make([]string, MaxReplyPrefixMarkers+1)
+	for i := range tooMany {
+		tooMany[i] = ":lock:"
+	}
+	cfg.Agents[0].Channels[0] = ChannelConfig{Type: "slack", ReplyPrefix: "🔒", ReplyPrefixMarkers: tooMany}
+	assert.True(t, hasIssue(Validate(&cfg, nil), "reply_prefix_markers accepts at most"))
+	for _, invalid := range []string{"", " :lock:", ":lock:\n", strings.Repeat("a", MaxReplyPrefixBytes+1)} {
+		t.Run(strconv.Quote(invalid), func(t *testing.T) {
+			cfg.Agents[0].Channels[0] = ChannelConfig{Type: "slack", ReplyPrefix: "🔒", ReplyPrefixMarkers: []string{invalid}}
+			assert.True(t, hasIssue(Validate(&cfg, nil), "reply_prefix_markers entries must be"))
+		})
+	}
+	for _, typ := range []string{"signal", "discord"} {
+		cfg.Agents[0].Channels[0] = ChannelConfig{Type: typ, ReplyPrefixMarkers: []string{":lock:"}}
+		assert.True(t, hasIssue(Validate(&cfg, nil), "reply_prefix_markers is only supported for Slack channels"))
+	}
+}
+
+func mustJSON(t *testing.T, value any) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	assert.NoError(t, err)
+	return data
+}
+
 func TestValidate_StdioModelMissingCommand(t *testing.T) {
 	cfg := &Config{
 		Agents: []AgentConfig{{

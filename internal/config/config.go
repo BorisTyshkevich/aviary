@@ -195,6 +195,8 @@ const (
 	MaxToolProgressMaxCalls     = 1000
 	MinToolProgressMaxChars     = 500
 	MaxToolProgressMaxChars     = 3900
+	MaxReplyPrefixBytes         = 64
+	MaxReplyPrefixMarkers       = 16
 )
 
 // ChannelConfig describes a communication channel for an agent.
@@ -222,6 +224,12 @@ type ChannelConfig struct {
 	ToolProgressMaxCalls *int `yaml:"tool_progress_max_calls,omitempty" json:"tool_progress_max_calls,omitempty"`
 	// ToolProgressMaxChars limits the size of a progress message.
 	ToolProgressMaxChars *int `yaml:"tool_progress_max_chars,omitempty" json:"tool_progress_max_chars,omitempty"`
+	// ReplyPrefix is prepended, followed by a space, to every Slack message an
+	// agent run posts or edits on this route. Valid only for Slack channels.
+	ReplyPrefix string `yaml:"reply_prefix,omitempty" json:"reply_prefix,omitempty"`
+	// ReplyPrefixMarkers limits ReplyPrefix to runs whose Slack question text
+	// contains one of these markers. When empty, ReplyPrefix applies to every run.
+	ReplyPrefixMarkers []string `yaml:"reply_prefix_markers,omitempty" json:"reply_prefix_markers,omitempty"`
 	// SeparateTopLevelSessions controls Slack channel session naming. When true,
 	// every top-level Slack message gets its own session keyed by the Slack
 	// thread/root timestamp, so all replies in that Slack thread share a session.
@@ -487,6 +495,9 @@ func normalize(cfg *Config) {
 			ch.DisabledTools = ClampToolNamesForPreset(preset, ch.DisabledTools)
 			if len(ch.DisabledTools) == 0 {
 				ch.DisabledTools = nil
+			}
+			if len(ch.ReplyPrefixMarkers) == 0 {
+				ch.ReplyPrefixMarkers = nil
 			}
 			if len(ch.AllowFrom) == 0 {
 				ch.AllowFrom = nil
