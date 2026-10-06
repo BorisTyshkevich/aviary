@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# Bounded, read-only access to two local source checkouts.
+# materialize and refresh only add or remove detached worktrees under the trees root.
+set -euo pipefail
+export GIT_OPTIONAL_LOCKS=0
+
+root=${CHSOURCE_UPSTREAM_ROOT:-$HOME/work/ClickHouse}
+source_name=upstream
+rg_bin=${CHSOURCE_RG_BIN:-$HOME/.local/bin/rg}
+[[ -x "$rg_bin" ]] || rg_bin=$(command -v rg || true)
+trees_root=${CHSOURCE_TREES_ROOT:-$HOME/work/chsource-trees}
+series_aliases='26.8 26.3 25.8 25.3 24.8'
+max_lines=160
+max_bytes=24000
+grep_threads=$(nproc 2>/dev/null || echo 4)
+(( grep_threads <= 16 )) || grep_threads=16
+lock_held=
+
+fail() {
+    printf 'chsource: %s\n' "$1" >&2
+    exit 2
+}
+
+usage() {
+    printf 'Usage: chsource [upstream|antalya] search QUERY [PATH] | read RELATIVE_PATH [START [COUNT]] | search-at REF QUERY [PATH] | read-at REF PATH [START [COUNT]] | materialize REF | revision | log [COUNT [REF [PATH]]] | commits QUERY [REF [COUNT [PATH]]] | commit REF | diff REF [PATH]\n' >&2
+    exit 2
+}
+
+positive_count() {
+    [[ "$1" =~ ^[0-9]{1,2}$ ]] || fail 'count must be an integer from 1 to 20'
+    parsed_count=$((10#$1))
+    (( parsed_count >= 1 && parsed_count <= 20 )) || fail 'count must be an integer from 1 to 20'
+}
+
+series_tag() {
+    git -C "$root" tag -l "v${1}.*" | sort -V | tail -1
+}
+
+commit_ref() {
+    local raw=$1
+    [[ ${#raw} -le 128 && "$raw" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] || fail 'invalid Git ref'
+    [[ "$raw" != *..* && "$raw" != *//* ]] || fail 'invalid Git ref'
+    case " $series_aliases " in
+        *" $raw "*)
+            raw=$(series_tag "$raw")
+            [[ -n "$raw" ]] || fail 'release series has no local tag'
+            ;;
+    esac
+    ref_name=$raw
+    resolved_ref=$(git -C "$root" rev-parse --verify --end-of-options "${raw}^{commit}" 2>/dev/null) || fail 'Git ref does not resolve to a commit'
+}
+
+history_path() {
+    local raw=$1 component
+    [[ -n "$raw" && "$raw" != /* && ${#raw} -le 300 && "$raw" != *$'\n'* && "$raw" != *$'\r'* ]] || fail 'invalid history path'
+    [[ "$raw" != */ && "$raw" != *//* ]] || fail 'invalid history path'
+    IFS=/ read -ra components <<< "$raw"
+    for component in "${components[@]}"; do
+        [[ "$component" != . && "$component" != .. && "$component" != .git ]] || fail 'invalid history path'
+    done
+    history_pathspec=":(literal)$raw"
+}
+
+# bounded_git PREFIX GIT_ARGS... strips PREFIX from the start of each output line.
+bounded_git() {
+    local prefix=$1 statuses
+    shift
+    set +e
+    timeout 20s git -C "$root" "$@" | awk -v limit="$max_bytes" -v prefix="$prefix" '
+        {
+            seen = 1
+            if (NR > 160 || used >= limit) { print "[output limit reached; narrow the query]"; exit }
+            line = $0
+            if (prefix != "" && index(line, prefix) == 1) line = substr(line, length(prefix) + 1)
+            line = substr(line, 1, 500)
+            if (used + length(line) + 1 > limit) { print "[output limit reached; narrow the query]"; exit }
+            print line
+            used += length(line) + 1
+        }
+        END { if (!seen) print "No results." }
+    '
+    statuses=("${PIPESTATUS[@]}")
+    set -e
+    # 141 is SIGPIPE: awk stopped reading at the output limit.
+    if (( statuses[1] != 0 )) || { (( statuses[0] != 0 && statuses[0] != 141 )) && ! { [[ "$1" == grep ]] && (( statuses[0] == 1 )); }; }; then
+        fail 'Git history command failed or timed out'
+    fi
+}
+
+# rg_tracked DIR QUERY [PATHSPEC] searches the files tracked by the checkout or worktree at DIR.
+rg_tracked() {
+    local dir=$1 query=$2
+    shift 2
+    [[ -x "$rg_bin" ]] || fail "rg is not installed at $rg_bin"
+    # git supplies tracked paths; rg reads their contents.
+    # xargs batches large checkouts without building a huge argument list.
+    (
+        cd "$dir"
+        git ls-files -z -- "$@" | xargs -0 -r -n 1000 -P 8 "$rg_bin" --no-config --no-messages --color never \
+            --with-filename --no-heading --line-number --fixed-strings \
+            --max-columns 300 --max-columns-preview -e "$query" --
+    ) | awk -v limit="$max_bytes" '
+        NR > 80 { print "[match limit reached; narrow the query]"; exit }
+        {
+            line = substr($0, 1, 500)
+            if (used + length(line) + 1 > limit) { print "[output limit reached; narrow the query]"; exit }
+            print line
+            used += length(line) + 1
+            found = 1
+        }
+        END { if (!found) print "No matches in tracked files." }
+    ' || :
+}
+
+tracked_path() {
+    local raw=$1 resolved
+    [[ -n "$raw" && "$raw" != /* ]] || fail 'path must be relative to the selected checkout'
+    resolved=$(realpath -- "$root/$raw") || fail 'path does not exist'
+    [[ "$resolved" == "$root/"* && -f "$resolved" ]] || fail 'path is outside the selected checkout or is not a file'
+    relative_path=${resolved#"$root/"}
+    git -C "$root" ls-files --error-unmatch -- ":(literal)$relative_path" >/dev/null 2>&1 || fail 'path is not tracked by the selected checkout'
+    resolved_path=$resolved
+}
+
+# Worktrees live at $trees_dir/<commit hash>, so a tree is found by the resolved commit
+# and a moving ref or alias never needs a link swap.
+tree_for() {
+    local dir=$trees_dir/$1 head
+    [[ -f "$dir/.git" ]] || return 1
+    head=$(git -C "$dir" rev-parse --verify -q HEAD 2>/dev/null) || return 1
+    [[ "$head" == "$1" ]] || return 1
+    tree_dir=$dir
+}
+
+take_lock() {
+    [[ -z "$lock_held" ]] || return 0
+    mkdir -p "$trees_dir/.on-demand"
+    exec 9>"$trees_dir/.lock"
+    flock -w 600 9 || fail 'another worktree update is still running'
+    lock_held=1
+}
+
+remove_tree() {
+    local dir=$1
+    [[ "$dir" == "$trees_dir/"* ]] || fail 'refusing to remove a path outside the trees root'
+    git -C "$root" worktree remove --force "$dir" >/dev/null 2>&1 || rm -rf -- "$dir"
+}
+
+# ensure_tree HASH creates the worktree for HASH unless a verified one exists. Callers hold the lock.
+ensure_tree() {
+    local hash=$1 tmp
+    tree_for "$hash" && return 0
+    [[ ! -e "$trees_dir/$hash" ]] || remove_tree "$trees_dir/$hash"
+    git -C "$root" worktree prune
+    tmp=$trees_dir/.tmp-$hash-$$
+    if ! git -C "$root" worktree add --quiet --detach "$tmp" "$hash" >/dev/null 2>&1; then
+        remove_tree "$tmp"
+        git -C "$root" worktree prune
+        fail "could not create a worktree for $hash"
+    fi
+    git -C "$root" worktree move "$tmp" "$trees_dir/$hash" || { remove_tree "$tmp"; fail "could not finish the worktree for $hash"; }
+    tree_for "$hash" || fail "worktree for $hash failed verification"
+}
+
+[[ $# -ge 1 ]] || usage
+case "$1" in
+    upstream) shift ;;
+    antalya) source_name=antalya; root=${CHSOURCE_ANTALYA_ROOT:-$HOME/work/Antalya}; shift ;;
+esac
+[[ $# -ge 1 ]] || usage
+git -C "$root" rev-parse --is-inside-work-tree >/dev/null 2>&1 || fail "$source_name checkout is unavailable at $root"
+root=$(realpath -- "$root")
+trees_dir=$trees_root/$source_name
+command=$1
+shift
+printf 'Source: %s (%s)\n' "$source_name" "$root"
+
+case "$command" in
+    search)
+        [[ $# -ge 1 && $# -le 2 && -n "$1" && ${#1} -le 200 ]] || fail 'search needs one query of 1 to 200 characters and an optional path'
+        [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || fail 'query cannot contain newlines'
+        scope=.
+        if [[ $# -eq 2 ]]; then
+            [[ -n "$2" && "$2" != /* ]] || fail 'search path must be relative to the selected checkout'
+            resolved_scope=$(realpath -- "$root/$2") || fail 'search path does not exist'
+            [[ "$resolved_scope" == "$root" || "$resolved_scope" == "$root/"* ]] || fail 'search path is outside the selected checkout'
+            [[ -d "$resolved_scope" || -f "$resolved_scope" ]] || fail 'search path must be a file or directory'
+            scope=${resolved_scope#"$root/"}
+            [[ "$resolved_scope" == "$root" ]] && scope=.
+        fi
+        rg_tracked "$root" "$1" ":(literal)$scope"
+        ;;
+    read)
+        [[ $# -ge 1 && $# -le 3 ]] || usage
+        raw=$1
+        start=${2:-1}
+        count=${3:-80}
+        [[ "$start" =~ ^[0-9]{1,9}$ && "$count" =~ ^[0-9]{1,9}$ ]] || fail 'start and count must be positive integers'
+        start=$((10#$start))
+        count=$((10#$count))
+        (( start >= 1 && count >= 1 && count <= max_lines )) || fail "start must be positive and count must be 1 to $max_lines"
+        tracked_path "$raw"
+        printf '%s (lines %s-%s, working tree)\n' "$relative_path" "$start" "$((start + count - 1))"
+        awk -v start="$start" -v count="$count" -v limit="$max_bytes" '
+            NR < start { next }
+            NR >= start + count { exit }
+            {
+                line = NR ": " substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { print "[output limit reached]"; exit }
+                print line
+                used += length(line) + 1
+            }
+        ' "$resolved_path"
+        ;;
+    search-at)
+        [[ $# -ge 2 && $# -le 3 && -n "$2" && ${#2} -le 200 ]] || usage
+        [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || fail 'query cannot contain newlines'
+        commit_ref "$1"
+        pathspec=()
+        if [[ $# -eq 3 ]]; then
+            history_path "$3"
+            pathspec=("$history_pathspec")
+        fi
+        if tree_for "$resolved_ref"; then
+            printf 'Source matches at %s (%s) via worktree:\n' "$ref_name" "$resolved_ref"
+            rg_tracked "$tree_dir" "$2" "${pathspec[@]}"
+        else
+            printf 'Source matches at %s (%s) via git grep:\n' "$ref_name" "$resolved_ref"
+            bounded_git "$resolved_ref:" grep --threads "$grep_threads" --line-number --full-name --fixed-strings -I \
+                -e "$2" "$resolved_ref" -- "${pathspec[@]}"
+        fi
+        ;;
+    read-at)
+        [[ $# -ge 2 && $# -le 4 ]] || usage
+        commit_ref "$1"
+        history_path "$2"
+        start=${3:-1}
+        count=${4:-80}
+        [[ "$start" =~ ^[0-9]{1,9}$ && "$count" =~ ^[0-9]{1,9}$ ]] || fail 'start and count must be positive integers'
+        start=$((10#$start))
+        count=$((10#$count))
+        (( start >= 1 && count >= 1 && count <= max_lines )) || fail "start must be positive and count must be 1 to $max_lines"
+        object="$resolved_ref:$2"
+        [[ $(git -C "$root" cat-file -t "$object" 2>/dev/null) == blob ]] || fail 'path is not a file at that revision'
+        printf '%s at %s (%s), lines %s-%s:\n' "$2" "$ref_name" "$resolved_ref" "$start" "$((start + count - 1))"
+        if ! git -C "$root" cat-file -p "$object" | awk -v start="$start" -v count="$count" -v limit="$max_bytes" '
+            NR < start { next }
+            NR >= start + count { next }
+            {
+                line = NR ": " substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { if (!truncated++) print "[output limit reached]"; next }
+                print line
+                used += length(line) + 1
+            }
+        '; then
+            fail 'could not read file at that revision'
+        fi
+        ;;
+    materialize)
+        [[ $# -eq 1 ]] || usage
+        commit_ref "$1"
+        if ! tree_for "$resolved_ref"; then
+            take_lock
+            ensure_tree "$resolved_ref"
+        fi
+        mkdir -p "$trees_dir/.on-demand"
+        : > "$trees_dir/.on-demand/$resolved_ref"
+        printf 'Worktree ready for %s (%s); search-at uses it for this commit.\n' "$ref_name" "$resolved_ref"
+        ;;
+    refresh)
+        # Operator command run by chsource-daily-pull; not in the agent allowlist.
+        [[ $# -eq 0 ]] || usage
+        take_lock
+        for stale in "$trees_dir"/.tmp-*; do
+            [[ -e "$stale" ]] && remove_tree "$stale"
+        done
+        git -C "$root" worktree prune
+        : > "$trees_dir/.aliases.new"
+        for alias in $series_aliases; do
+            tag=$(series_tag "$alias")
+            [[ -n "$tag" ]] || continue
+            hash=$(git -C "$root" rev-parse --verify "${tag}^{commit}")
+            if tree_for "$hash" && [[ -n $(git -C "$tree_dir" status --porcelain --untracked-files=no) ]]; then
+                printf 'Recreating modified worktree for %s (%s)\n' "$tag" "$hash"
+                remove_tree "$tree_dir"
+            fi
+            ensure_tree "$hash"
+            printf '%s %s %s\n' "$alias" "$tag" "$hash" >> "$trees_dir/.aliases.new"
+            printf '%s -> %s (%s)\n' "$alias" "$tag" "$hash"
+        done
+        # Trees an alias left in the previous run were kept for one run so in-flight
+        # searches finish; remove them now unless an alias or materialize still uses them.
+        if [[ -f "$trees_dir/.retired" ]]; then
+            while read -r hash; do
+                [[ "$hash" =~ ^[0-9a-f]{40,64}$ ]] || continue
+                awk -v h="$hash" '$3 == h { found = 1 } END { exit !found }' "$trees_dir/.aliases.new" && continue
+                [[ -e "$trees_dir/.on-demand/$hash" ]] && continue
+                [[ -e "$trees_dir/$hash" ]] || continue
+                printf 'Removing retired worktree %s\n' "$hash"
+                remove_tree "$trees_dir/$hash"
+            done < "$trees_dir/.retired"
+        fi
+        : > "$trees_dir/.retired.new"
+        if [[ -f "$trees_dir/.aliases" ]]; then
+            awk 'NR == FNR { keep[$3] = 1; next } !($3 in keep) { print $3 }' \
+                "$trees_dir/.aliases.new" "$trees_dir/.aliases" | sort -u >> "$trees_dir/.retired.new"
+        fi
+        mv -f "$trees_dir/.retired.new" "$trees_dir/.retired"
+        mv -f "$trees_dir/.aliases.new" "$trees_dir/.aliases"
+        git -C "$root" worktree prune
+        ;;
+    revision)
+        [[ $# -eq 0 ]] || usage
+        printf 'HEAD: '
+        git -C "$root" rev-parse HEAD
+        git -C "$root" status --short --untracked-files=no | awk -v limit="$max_bytes" '
+            NR > 50 { print "[change list limit reached]"; exit }
+            {
+                line = substr($0, 1, 500)
+                if (used + length(line) + 1 > limit) { print "[output limit reached]"; exit }
+                print line
+                used += length(line) + 1
+            }
+        ' || :
+        ;;
+    log)
+        [[ $# -le 3 ]] || usage
+        positive_count "${1:-5}"
+        count=$parsed_count
+        commit_ref "${2:-HEAD}"
+        printf 'Recent commits at %s (%s):\n' "$ref_name" "$resolved_ref"
+        if [[ $# -eq 3 ]]; then
+            history_path "$3"
+            bounded_git '' log --no-patch -n "$count" --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git '' log --no-patch -n "$count" --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref"
+        fi
+        ;;
+    commits)
+        [[ $# -ge 1 && $# -le 4 && -n "$1" && ${#1} -le 200 ]] || usage
+        [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] || fail 'query cannot contain newlines'
+        query=$1
+        commit_ref "${2:-HEAD}"
+        positive_count "${3:-10}"
+        printf 'Commit messages containing %q at %s (%s):\n' "$query" "$ref_name" "$resolved_ref"
+        if [[ $# -eq 4 ]]; then
+            history_path "$4"
+            bounded_git '' log --no-patch -n "$parsed_count" --fixed-strings --regexp-ignore-case --grep="$query" \
+                --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git '' log --no-patch -n "$parsed_count" --fixed-strings --regexp-ignore-case --grep="$query" \
+                --format='%H %cI %an%n  %s' --end-of-options "$resolved_ref"
+        fi
+        ;;
+    commit)
+        [[ $# -eq 1 ]] || usage
+        commit_ref "$1"
+        bounded_git '' show --stat --no-ext-diff --no-textconv --no-renames \
+            --format='%H%nAuthor: %an <%ae>%nAuthor date: %aI%nCommit date: %cI%nParents: %P%n%n%B' \
+            --end-of-options "$resolved_ref"
+        ;;
+    diff)
+        [[ $# -ge 1 && $# -le 2 ]] || usage
+        commit_ref "$1"
+        printf 'Patch for %s (against first parent):\n' "$resolved_ref"
+        if [[ $# -eq 2 ]]; then
+            history_path "$2"
+            bounded_git '' show --first-parent --patch --no-ext-diff --no-textconv --no-renames \
+                --unified=3 --format= --end-of-options "$resolved_ref" -- "$history_pathspec"
+        else
+            bounded_git '' show --first-parent --patch --no-ext-diff --no-textconv --no-renames \
+                --unified=3 --format= --end-of-options "$resolved_ref"
+        fi
+        ;;
+    *) usage ;;
+esac
