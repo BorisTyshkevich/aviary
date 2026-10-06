@@ -37,10 +37,11 @@ type SkillConfig struct {
 
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
-	Port           int        `yaml:"port,omitempty"            json:"port,omitempty"`
-	TLS            *TLSConfig `yaml:"tls,omitempty"             json:"tls,omitempty"`
-	ExternalAccess bool       `yaml:"external_access,omitempty" json:"external_access,omitempty"` // bind to 0.0.0.0 instead of 127.0.0.1
-	NoTLS          bool       `yaml:"no_tls,omitempty"          json:"no_tls,omitempty"`          // disable TLS (plain HTTP)
+	Clients        []ClientConfig `yaml:"clients,omitempty" json:"clients,omitempty"`
+	Port           int            `yaml:"port,omitempty"            json:"port,omitempty"`
+	TLS            *TLSConfig     `yaml:"tls,omitempty"             json:"tls,omitempty"`
+	ExternalAccess bool           `yaml:"external_access,omitempty" json:"external_access,omitempty"` // bind to 0.0.0.0 instead of 127.0.0.1
+	NoTLS          bool           `yaml:"no_tls,omitempty"          json:"no_tls,omitempty"`          // disable TLS (plain HTTP)
 	// FailedTaskTimeout is the maximum age of a pending run checkpoint before
 	// the agent gives up and notifies the session instead of resuming.
 	// Accepts Go duration strings like "6h", "30m". Defaults to 6h if unset.
@@ -598,6 +599,9 @@ func BaseDir() string {
 // Save writes cfg to path as YAML (creating parent directories as needed).
 // If path is empty, DefaultPath() is used.
 func Save(path string, cfg *Config) error {
+	if err := ValidateClients(cfg); err != nil {
+		return err
+	}
 	if path == "" {
 		path = DefaultPath()
 	}
@@ -741,6 +745,9 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parsing config %s: %w", path, err)
 	}
 
+	if err := ValidateClients(&cfg); err != nil {
+		return nil, err
+	}
 	for i := range cfg.Agents {
 		fileTasks, ftErr := LoadAgentTaskFiles(cfg.Agents[i])
 		if ftErr != nil {

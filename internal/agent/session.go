@@ -19,23 +19,23 @@ var idCounter atomic.Uint64
 // file. It intentionally omits AgentID because the agent is already encoded in
 // the file path (agents/<agentID>/sessions/<sessionID>.jsonl).
 type sessionRecord struct {
-	ID        string             `json:"id,omitempty"`
-	Name      string             `json:"name,omitempty"`
-	TaskID    string             `json:"task_id,omitempty"`
-	Type      domain.SessionType `json:"type,omitempty"`
-	CreatedAt time.Time          `json:"created_at"`
-	UpdatedAt time.Time          `json:"updated_at"`
+	OwnerAgentID string             `json:"owner_agent_id,omitempty"`
+	ClientID     string             `json:"client_id,omitempty"`
+	Protocol     string             `json:"protocol,omitempty"`
+	ID           string             `json:"id,omitempty"`
+	Name         string             `json:"name,omitempty"`
+	TaskID       string             `json:"task_id,omitempty"`
+	Type         domain.SessionType `json:"type,omitempty"`
+	CreatedAt    time.Time          `json:"created_at"`
+	UpdatedAt    time.Time          `json:"updated_at"`
 }
 
 func toSessionRecord(s *domain.Session) sessionRecord {
-	return sessionRecord{
-		ID:        s.ID,
-		Name:      s.Name,
-		TaskID:    s.TaskID,
-		Type:      s.Type,
-		CreatedAt: s.CreatedAt,
-		UpdatedAt: s.UpdatedAt,
+	ownerAgentID := ""
+	if s.ClientID != "" {
+		ownerAgentID = s.AgentID
 	}
+	return sessionRecord{OwnerAgentID: ownerAgentID, ClientID: s.ClientID, Protocol: s.Protocol, ID: s.ID, Name: s.Name, TaskID: s.TaskID, Type: s.Type, CreatedAt: s.CreatedAt, UpdatedAt: s.UpdatedAt}
 }
 
 // SessionManager creates and persists agent sessions.

@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lsegal/aviary/internal/clientauth"
+
 	"github.com/gorilla/websocket"
 
 	"github.com/lsegal/aviary/internal/buildinfo"
@@ -112,11 +114,11 @@ func wsHandler(token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Auth: session cookie (preferred) or explicit query param.
 		authed := false
-		if c, err := r.Cookie("aviary_session"); err == nil && c.Value == token {
+		if c, err := r.Cookie("aviary_session"); err == nil && clientauth.EqualToken(c.Value, token) {
 			authed = true
 		}
 		if !authed {
-			if q := r.URL.Query().Get("token"); q == token && token != "" {
+			if q := r.URL.Query().Get("token"); clientauth.EqualToken(q, token) && token != "" {
 				authed = true
 			}
 		}

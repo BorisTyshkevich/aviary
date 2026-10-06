@@ -67,6 +67,8 @@ func NewAgentRunner(a *domain.Agent, cfg *config.AgentConfig, provider llm.Provi
 
 // RunOverrides defines per-run overrides for model, fallbacks, and tools.
 type RunOverrides struct {
+	// DisableRecovery makes synchronous external runs non-replayable on restart.
+	DisableRecovery  bool
 	Model            string
 	Fallbacks        []string
 	RestrictTools    []string
@@ -268,7 +270,7 @@ func (r *AgentRunner) promptCore(
 		// The checkpoint is deleted at goroutine exit unless the server was stopped.
 		checkpointOwned := !persistUserMessage
 		var checkpointErr error
-		if overrides.Checkpoint != nil || (persistUserMessage && persistedPromptID != "" && !isScheduledTaskRun) {
+		if !overrides.DisableRecovery && (overrides.Checkpoint != nil || (persistUserMessage && persistedPromptID != "" && !isScheduledTaskRun)) {
 			cp := &RunCheckpoint{
 				AgentName:       r.agent.Name,
 				SessionID:       sessionID,

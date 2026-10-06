@@ -8,7 +8,17 @@ export interface TLSConfig {
 	key: string;
 }
 
+export interface InboundClientConfig {
+	id: string;
+	name: string;
+	token_hash: string;
+	protocols: "mcp"[];
+	tools: ("agent_run" | "ping")[];
+	agents?: string[];
+}
+
 export interface ServerConfig {
+	clients?: InboundClientConfig[];
 	port: number;
 	tls: TLSConfig;
 	external_access: boolean;
