@@ -58,3 +58,10 @@ other client commands. If a process crashes leaving that file behind, verify
 that no client command is still running before removing it. Full-config editor
 concurrency is tracked separately by #34. A custom `--config` path must match
 the running server's configuration path for an installation acknowledgment.
+
+Client-policy acknowledgement loads TLS trust from the exact selected `--config`,
+including when `--server` overrides the endpoint. Relative `server.tls.cert` paths
+resolve beside that config file. HTTPS regression tests use a non-default config,
+no default certificate, and both relative and absolute certificate paths; they
+check the exact acknowledged revision for add, rotate, and remove. The forged
+agent-header tests cover the authenticated HTTP boundary and an actual MCP run.

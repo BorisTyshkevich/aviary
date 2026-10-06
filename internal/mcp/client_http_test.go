@@ -114,6 +114,31 @@ func TestClientHTTPToolCatalogAndTransportOwnership(t *testing.T) {
 	}
 }
 
+// Verify the HTTP boundary itself as well as agent execution below: removing
+// the header guard must fail even if a runner happens to overwrite its context.
+func TestClientHTTPForgedAgentHeaderIsStripped(t *testing.T) {
+	registry := clientauth.New()
+	require.NoError(t, registry.Install(inboundFixture()))
+	observed := false
+	handler := withHTTPRequestContext(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed = true
+		require.Empty(t, r.Header.Get("X-Aviary-Agent-ID"))
+		_, ok := agent.SessionAgentIDFromContext(r.Context())
+		require.False(t, ok)
+		p, _, ok := clientauth.FromContext(r.Context())
+		require.True(t, ok)
+		require.Equal(t, inboundFixture().Server.Clients[0].ID, p.ID)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	request := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+	request.Header.Set("Authorization", "Bearer fake-alice")
+	request.Header.Set("X-Aviary-Agent-ID", "other")
+	response := httptest.NewRecorder()
+	PrincipalMiddleware(registry, handler).ServeHTTP(response, request)
+	require.Equal(t, http.StatusNoContent, response.Code)
+	require.True(t, observed)
+}
+
 func TestClientHTTPAgentExecutionUsesAgentToolsAndOwnedSessions(t *testing.T) {
 	store.SetDataDir(t.TempDir())
 	t.Cleanup(func() { store.SetDataDir("") })
@@ -169,10 +194,21 @@ func TestClientHTTPAgentExecutionUsesAgentToolsAndOwnedSessions(t *testing.T) {
 	}
 	entries, err := os.ReadDir(filepath.Join(store.AgentDir("expert"), "sessions"))
 	require.True(t, os.IsNotExist(err) || len(entries) == 0)
-	res, err := alice.CallTool(context.Background(), "agent_run", map[string]any{"name": "expert", "message": "answer"})
+	// Send the impersonation header through the real MCP HTTP transport.
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":123,"method":"tools/call","params":{"name":"agent_run","arguments":{"name":"expert","message":"answer"}}}`))
 	require.NoError(t, err)
-	require.False(t, res.IsError)
-	require.Equal(t, "owned conversation answered", extractText(res))
+	request.Header.Set("Authorization", "Bearer fake-alice")
+	request.Header.Set("Mcp-Session-Id", alice.session.ID())
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("X-Aviary-Agent-ID", "other")
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	body, err := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Contains(t, string(body), "owned conversation answered")
 	mu.Lock()
 	require.True(t, catalogSeen)
 	require.True(t, resultSeen)

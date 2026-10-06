@@ -123,7 +123,7 @@ func finishClientChange(cmd *cobra.Command, clients []config.ClientConfig, raw s
 }
 
 func acknowledgeClientPolicy(ctx context.Context, baseURL, adminToken, revision, path string) error {
-	transport, err := mcp.RemoteHTTPTransport(baseURL)
+	transport, err := mcp.RemoteHTTPTransport(baseURL, path)
 	if err != nil {
 		return err
 	}

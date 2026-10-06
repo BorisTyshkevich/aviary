@@ -52,6 +52,10 @@ When offline, the command reports persistence for next startup. Use the same
 `--config` and `--data-dir` as the server and an administrator `--token` when
 its stored token is unavailable.
 
+Client-policy acknowledgement uses TLS trust from the selected `--config`, even
+with an explicit `--server`. Relative `server.tls.cert` paths resolve beside that
+configuration file.
+
 ---
 
 ## aviary stop

@@ -3,11 +3,16 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
+	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +20,7 @@ import (
 
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/server"
+	"github.com/lsegal/aviary/internal/store"
 )
 
 func TestClientCLIAddRotateRemoveAndOfflineStatus(t *testing.T) {
@@ -136,4 +142,89 @@ func TestClientCLIRejectsMismatchedAcknowledgment(t *testing.T) {
 	}))
 	defer backend.Close()
 	require.ErrorContains(t, acknowledgeClientPolicy(context.Background(), backend.URL, "fake-admin", "expected", "unused.yaml"), "did not match")
+}
+
+func TestClientCLICustomConfigTLSAcknowledgment(t *testing.T) {
+	for _, relative := range []bool{false, true} {
+		t.Run(fmt.Sprintf("relative=%t", relative), func(t *testing.T) {
+			oldCfg, oldURL, oldToken := cfgFile, serverURL, token
+			t.Cleanup(func() { cfgFile, serverURL, token = oldCfg, oldURL, oldToken })
+			t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+			t.Setenv("AVIARY_CONFIG_BASE_DIR", t.TempDir())
+			_, err := os.Stat(config.DefaultPath())
+			require.True(t, os.IsNotExist(err))
+			selectedPath := filepath.Join(t.TempDir(), "custom.yaml")
+			t.Setenv("AVIARY_PID_FILE", filepath.Join(t.TempDir(), "running.pid"))
+			require.NoError(t, server.WritePID())
+			acknowledgments := 0
+			backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.Equal(t, "Bearer fake-admin", r.Header.Get("Authorization"))
+				require.Equal(t, "/api/clients/reload", r.URL.Path)
+				var payload map[string]string
+				require.NoError(t, json.NewDecoder(r.Body).Decode(&payload))
+				require.Equal(t, selectedPath, payload["path"])
+				cfg, err := config.Load(selectedPath)
+				require.NoError(t, err)
+				require.Equal(t, config.ClientPolicyRevision(cfg.Server.Clients), payload["revision"])
+				acknowledgments++
+				_ = json.NewEncoder(w).Encode(map[string]string{"revision": payload["revision"]})
+			}))
+			store.SetDataDir(t.TempDir())
+			t.Cleanup(func() { store.SetDataDir("") })
+			cert, err := server.LoadOrGenerateTLS("", "")
+			require.NoError(t, err)
+			backend.TLS = &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
+			backend.StartTLS()
+			backend.URL = strings.Replace(backend.URL, "127.0.0.1", "localhost", 1)
+			// No generated/default certificate is available to the operator transport.
+			store.SetDataDir(t.TempDir())
+			defer backend.Close()
+			certPath := filepath.Join(filepath.Dir(selectedPath), "custom-cert.pem")
+			require.NoError(t, os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: backend.Certificate().Raw}), 0o600))
+			if relative {
+				certPath = filepath.Base(certPath)
+			}
+			endpoint, err := url.Parse(backend.URL)
+			require.NoError(t, err)
+			port, err := strconv.Atoi(endpoint.Port())
+			require.NoError(t, err)
+			require.NoError(t, os.WriteFile(selectedPath, []byte(fmt.Sprintf("server:\n  port: %d\n  tls:\n    cert: %q\n    key: custom-key.pem\n", port, certPath)), 0o600))
+			serverURL, token = backend.URL, "fake-admin"
+			run := func(args ...string) (string, string, error) {
+				command := newClientCommand()
+				command.PersistentFlags().StringVar(&cfgFile, "config", "", "selected config")
+				command.PersistentFlags().String("server", backend.URL, "test endpoint")
+				var stdout, stderr bytes.Buffer
+				command.SetOut(&stdout)
+				command.SetErr(&stderr)
+				args = append(args, "--config", selectedPath)
+				if relative {
+					args = append(args, "--server", backend.URL)
+				}
+				command.SetArgs(args)
+				err := command.Execute()
+				return stdout.String(), stderr.String(), err
+			}
+			_, status, err := run("add", "peer", "--protocols", "mcp", "--tools", "ping")
+			require.NoError(t, err)
+			require.Contains(t, status, "installed and acknowledged")
+			before, err := config.Load(selectedPath)
+			require.NoError(t, err)
+			raw, status, err := run("rotate", "peer")
+			require.NoError(t, err)
+			require.Contains(t, status, "installed and acknowledged")
+			after, err := config.Load(selectedPath)
+			require.NoError(t, err)
+			require.Equal(t, before.Server.Clients[0].ID, after.Server.Clients[0].ID)
+			require.Equal(t, config.ClientTokenHash(strings.TrimSpace(raw)), after.Server.Clients[0].TokenHash)
+			raw, status, err = run("remove", "peer")
+			require.NoError(t, err)
+			require.Empty(t, raw)
+			require.Contains(t, status, "installed and acknowledged")
+			after, err = config.Load(selectedPath)
+			require.NoError(t, err)
+			require.Empty(t, after.Server.Clients)
+			require.Equal(t, 3, acknowledgments)
+		})
+	}
 }
