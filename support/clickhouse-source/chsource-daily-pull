@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Fast-forward one chsource checkout and refresh its release-series worktrees.
+# Usage: chsource-daily-pull upstream|antalya
+set -o pipefail
+
+case "${1:-}" in
+    upstream) repo=${CHSOURCE_UPSTREAM_ROOT:-$HOME/work/ClickHouse}; refresh=1 ;;
+    antalya) repo=${CHSOURCE_ANTALYA_ROOT:-$HOME/work/Antalya}; refresh= ;;
+    *) printf 'Usage: chsource-daily-pull upstream|antalya\n' >&2; exit 2 ;;
+esac
+chsource=$(dirname -- "$(realpath -- "$0")")/chsource
+mkdir -p "$repo/tmp"
+log="$repo/tmp/git-pull-$(date +%F).log"
+
+{
+    printf 'Git pull started: %s\n' "$(date --iso-8601=seconds)"
+    git -C "$repo" pull --ff-only
+    status=$?
+    printf 'Git pull exit status: %s\n' "$status"
+    if [[ -n "$refresh" ]]; then
+        "$chsource" "$1" refresh
+        refresh_status=$?
+        printf 'Worktree refresh exit status: %s\n' "$refresh_status"
+        (( status != 0 )) || status=$refresh_status
+    fi
+    exit "$status"
+} 2>&1 | tee -a "$log"

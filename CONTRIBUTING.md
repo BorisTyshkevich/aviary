@@ -100,6 +100,9 @@ internal/
   scheduler/         Cron runner, file watcher, job queue
   server/            HTTPS server, TLS, auth, web embed
   store/             Atomic JSON and append-only JSONL storage
+support/
+  clickhouse-source/ chsource helper, daily checkout pull, and its skill
+  templates/         Agent workspace templates
 docs/
   site/              VitePress documentation site
 web/
