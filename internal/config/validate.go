@@ -36,6 +36,9 @@ func Validate(cfg *Config, authGet func(key string) (string, error)) []Issue {
 		models:      cfg.Models,
 	}
 	v.checkServer(cfg.Server)
+	if err := ValidateClients(cfg); err != nil {
+		v.errorf("server.clients", "%v", err)
+	}
 	v.checkAgents(cfg.Agents, cfg.Models)
 	v.checkModels(cfg.Models)
 	v.checkBrowser(cfg.Browser)

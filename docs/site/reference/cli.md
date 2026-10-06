@@ -25,6 +25,35 @@ No flags.
 
 ---
 
+## aviary client
+
+Manage local inbound MCP callers:
+
+```sh
+aviary client add peer --protocols mcp --tools agent_run,ping --agents expert
+aviary client rotate peer
+aviary client remove peer
+```
+
+`add` requires explicit protocol/tool grants; only `mcp`, `agent_run`, and
+`ping` are supported. `--agents` names configured agents and is required for
+`agent_run`. `rotate` preserves the immutable client ID and conversations.
+Recreating a removed name generates a new identity.
+
+Add/rotate print the raw token once to stdout after successful persistence.
+Installation status goes to stderr. Store that output securely. Commands update
+only the client configuration and atomically preserve other YAML fields.
+The configured port/TLS mode is used unless `--server` is supplied explicitly.
+
+A running server must acknowledge the exact policy and matching config path
+before the command reports success. If installation fails, the command returns
+an error explaining that persistence succeeded but revocation is unconfirmed.
+When offline, the command reports persistence for next startup. Use the same
+`--config` and `--data-dir` as the server and an administrator `--token` when
+its stored token is unavailable.
+
+---
+
 ## aviary stop
 
 Stop the running Aviary server.

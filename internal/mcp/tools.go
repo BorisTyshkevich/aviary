@@ -23,6 +23,7 @@ import (
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/auth"
 	"github.com/lsegal/aviary/internal/channels"
+	"github.com/lsegal/aviary/internal/clientauth"
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/cronutil"
 	"github.com/lsegal/aviary/internal/domain"
@@ -281,139 +282,7 @@ func registerAgentTools(s *sdkmcp.Server) {
 		return jsonResult(d.Agents.List())
 	})
 
-	addTool(s, &sdkmcp.Tool{
-		Name:        "agent_run",
-		Description: "Send a message to an agent and stream the response",
-	}, func(ctx context.Context, req *sdkmcp.CallToolRequest, args agentRunArgs) (*sdkmcp.CallToolResult, struct{}, error) {
-		slog.Info("mcp: tool call", "component", "chat", "tool", "agent_run", "agent", args.Name, "session", args.Session)
-		d := GetDeps()
-		if d.Agents == nil {
-			return nil, struct{}{}, fmt.Errorf("agent manager not initialized; is the server running?")
-		}
-
-		agentName := strings.TrimSpace(args.Name)
-		agentID := ""
-		var sess *domain.Session
-		if strings.TrimSpace(args.SessionID) != "" {
-			if agentName == "" {
-				return nil, struct{}{}, fmt.Errorf("name is required when session_id is provided")
-			}
-			loaded, err := loadSessionByID(agentName, args.SessionID)
-			if err != nil {
-				return nil, struct{}{}, err
-			}
-			sess = loaded
-			agentID = strings.TrimSpace(sess.AgentID)
-			if agentID == "" {
-				return nil, struct{}{}, fmt.Errorf("session %q is missing agent metadata", args.SessionID)
-			}
-			agentName = agentID
-		} else {
-			if agentName == "" {
-				return nil, struct{}{}, fmt.Errorf("name is required when session_id is not provided")
-			}
-			agentID = agentName
-			// Ensure the session exists (defaults to "main").
-			var err error
-			sess, err = agent.NewSessionManager().GetOrCreateNamed(agentID, args.Session)
-			if err != nil {
-				return nil, struct{}{}, fmt.Errorf("initializing session: %w", err)
-			}
-		}
-
-		runner, ok := d.Agents.Get(agentName)
-		if !ok {
-			return nil, struct{}{}, fmt.Errorf("agent %q not found", agentName)
-		}
-		if isStopCommand(args.Message) {
-			stopped := agent.StopSession(sess.AgentID, sess.ID)
-			if stopped == 0 {
-				return text(fmt.Sprintf("session %q has no active work", sess.ID))
-			}
-			return text(fmt.Sprintf("stopped session %q", sess.ID))
-		}
-		ctx = agent.WithSessionID(ctx, sess.ID)
-
-		var buf strings.Builder
-		progressToken := req.Params.GetProgressToken()
-		progressCount := 0.0
-		done := make(chan error, 1)
-		history := resolveAgentRunHistory(args)
-
-		admission := runner.PromptMediaWithOverrides(ctx, args.Message, args.MediaURL, agent.RunOverrides{
-			Bare:    args.Bare,
-			History: &history,
-		}, func(e agent.StreamEvent) {
-			switch e.Type {
-			case agent.StreamEventText:
-				buf.WriteString(e.Text)
-				if progressToken != nil {
-					progressCount++
-					_ = req.Session.NotifyProgress(ctx, &sdkmcp.ProgressNotificationParams{
-						ProgressToken: progressToken,
-						Progress:      progressCount,
-						Message:       e.Text,
-					})
-				}
-			case agent.StreamEventTool:
-				if progressToken != nil && args.IncludeToolProgress && e.Tool != nil {
-					payload, err := json.Marshal(map[string]any{
-						"name":          e.Tool.Name,
-						"invocation_id": e.Tool.InvocationID,
-						"state":         e.Tool.State,
-						"args":          e.Tool.Args,
-					})
-					if err == nil {
-						progressCount++
-						_ = req.Session.NotifyProgress(ctx, &sdkmcp.ProgressNotificationParams{
-							ProgressToken: progressToken,
-							Progress:      progressCount,
-							Message:       "[tool]" + string(payload),
-						})
-					}
-				}
-			case agent.StreamEventMedia:
-				if e.MediaURL != "" && progressToken != nil {
-					progressCount++
-					_ = req.Session.NotifyProgress(ctx, &sdkmcp.ProgressNotificationParams{
-						ProgressToken: progressToken,
-						Progress:      progressCount,
-						// Prefix lets the client detect media progress vs text.
-						Message: "[media]" + e.MediaURL,
-					})
-				}
-			case agent.StreamEventDone:
-				done <- nil
-			case agent.StreamEventStop:
-				if e.StopCause == agent.StopCauseRunner {
-					done <- fmt.Errorf("agent %q run was interrupted by restart; recovery will resume the accepted request", agentName)
-				} else {
-					done <- context.Canceled
-				}
-			case agent.StreamEventError:
-				if errors.Is(e.Err, context.Canceled) {
-					done <- context.Canceled
-					return
-				}
-				done <- e.Err
-			}
-		})
-		if admission.Status == agent.AdmissionRejectedStopping {
-			return nil, struct{}{}, fmt.Errorf("agent %q is restarting; retry the request", agentName)
-		}
-		if err := <-done; err != nil {
-			if errors.Is(err, context.Canceled) {
-				return text(buf.String())
-			}
-			slog.Error("mcp: tool failed", "component", "chat", "tool", "agent_run", "agent", args.Name, "err", err)
-			return &sdkmcp.CallToolResult{
-				IsError: true,
-				Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: err.Error()}},
-			}, struct{}{}, nil
-		}
-		slog.Info("mcp: tool done", "component", "chat", "tool", "agent_run", "agent", args.Name)
-		return text(buf.String())
-	})
+	registerAgentRunTool(s)
 
 	addTool(s, &sdkmcp.Tool{
 		Name:        "agent_stop",
@@ -2730,12 +2599,7 @@ func registerServerTools(s *sdkmcp.Server) {
 		return jsonResult(map[string]any{"started": true})
 	})
 
-	addTool(s, &sdkmcp.Tool{
-		Name:        "ping",
-		Description: "Check server connectivity",
-	}, func(_ context.Context, _ *sdkmcp.CallToolRequest, _ struct{}) (*sdkmcp.CallToolResult, struct{}, error) {
-		return text("pong")
-	})
+	registerPingTool(s)
 
 	addTool(s, &sdkmcp.Tool{
 		Name:        "config_get",
@@ -3523,4 +3387,154 @@ func registerSkillTools(s *sdkmcp.Server) {
 		}
 		return jsonResult(list)
 	})
+}
+
+func registerAgentRunTool(s *sdkmcp.Server) {
+	addTool(s, &sdkmcp.Tool{
+		Name:        "agent_run",
+		Description: "Send a message to an agent and stream the response",
+	}, func(ctx context.Context, req *sdkmcp.CallToolRequest, args agentRunArgs) (*sdkmcp.CallToolResult, struct{}, error) {
+		if p, registry, ok := clientauth.FromContext(ctx); ok {
+			return runClientAgent(ctx, req, args, p, registry)
+		}
+		slog.Info("mcp: tool call", "component", "chat", "tool", "agent_run", "agent", args.Name, "session", args.Session)
+		d := GetDeps()
+		if d.Agents == nil {
+			return nil, struct{}{}, fmt.Errorf("agent manager not initialized; is the server running?")
+		}
+
+		agentName := strings.TrimSpace(args.Name)
+		agentID := ""
+		var sess *domain.Session
+		if strings.TrimSpace(args.SessionID) != "" {
+			if agentName == "" {
+				return nil, struct{}{}, fmt.Errorf("name is required when session_id is provided")
+			}
+			loaded, err := loadSessionByID(agentName, args.SessionID)
+			if err != nil {
+				return nil, struct{}{}, err
+			}
+			sess = loaded
+			agentID = strings.TrimSpace(sess.AgentID)
+			if agentID == "" {
+				return nil, struct{}{}, fmt.Errorf("session %q is missing agent metadata", args.SessionID)
+			}
+			agentName = agentID
+		} else {
+			if agentName == "" {
+				return nil, struct{}{}, fmt.Errorf("name is required when session_id is not provided")
+			}
+			agentID = agentName
+			// Ensure the session exists (defaults to "main").
+			var err error
+			sess, err = agent.NewSessionManager().GetOrCreateNamed(agentID, args.Session)
+			if err != nil {
+				return nil, struct{}{}, fmt.Errorf("initializing session: %w", err)
+			}
+		}
+
+		runner, ok := d.Agents.Get(agentName)
+		if !ok {
+			return nil, struct{}{}, fmt.Errorf("agent %q not found", agentName)
+		}
+		if isStopCommand(args.Message) {
+			stopped := agent.StopSession(sess.AgentID, sess.ID)
+			if stopped == 0 {
+				return text(fmt.Sprintf("session %q has no active work", sess.ID))
+			}
+			return text(fmt.Sprintf("stopped session %q", sess.ID))
+		}
+		ctx = agent.WithSessionID(ctx, sess.ID)
+
+		var buf strings.Builder
+		progressToken := req.Params.GetProgressToken()
+		progressCount := 0.0
+		done := make(chan error, 1)
+		history := resolveAgentRunHistory(args)
+
+		admission := runner.PromptMediaWithOverrides(ctx, args.Message, args.MediaURL, agent.RunOverrides{
+			Bare:    args.Bare,
+			History: &history,
+		}, func(e agent.StreamEvent) {
+			switch e.Type {
+			case agent.StreamEventText:
+				buf.WriteString(e.Text)
+				if progressToken != nil {
+					progressCount++
+					_ = req.Session.NotifyProgress(ctx, &sdkmcp.ProgressNotificationParams{
+						ProgressToken: progressToken,
+						Progress:      progressCount,
+						Message:       e.Text,
+					})
+				}
+			case agent.StreamEventTool:
+				if progressToken != nil && args.IncludeToolProgress && e.Tool != nil {
+					payload, err := json.Marshal(map[string]any{
+						"name":          e.Tool.Name,
+						"invocation_id": e.Tool.InvocationID,
+						"state":         e.Tool.State,
+						"args":          e.Tool.Args,
+					})
+					if err == nil {
+						progressCount++
+						_ = req.Session.NotifyProgress(ctx, &sdkmcp.ProgressNotificationParams{
+							ProgressToken: progressToken,
+							Progress:      progressCount,
+							Message:       "[tool]" + string(payload),
+						})
+					}
+				}
+			case agent.StreamEventMedia:
+				if e.MediaURL != "" && progressToken != nil {
+					progressCount++
+					_ = req.Session.NotifyProgress(ctx, &sdkmcp.ProgressNotificationParams{
+						ProgressToken: progressToken,
+						Progress:      progressCount,
+						// Prefix lets the client detect media progress vs text.
+						Message: "[media]" + e.MediaURL,
+					})
+				}
+			case agent.StreamEventDone:
+				done <- nil
+			case agent.StreamEventStop:
+				if e.StopCause == agent.StopCauseRunner {
+					done <- fmt.Errorf("agent %q run was interrupted by restart; recovery will resume the accepted request", agentName)
+				} else {
+					done <- context.Canceled
+				}
+			case agent.StreamEventError:
+				if errors.Is(e.Err, context.Canceled) {
+					done <- context.Canceled
+					return
+				}
+				done <- e.Err
+			}
+		})
+		if admission.Status == agent.AdmissionRejectedStopping {
+			return nil, struct{}{}, fmt.Errorf("agent %q is restarting; retry the request", agentName)
+		}
+		if err := <-done; err != nil {
+			if errors.Is(err, context.Canceled) {
+				return text(buf.String())
+			}
+			slog.Error("mcp: tool failed", "component", "chat", "tool", "agent_run", "agent", args.Name, "err", err)
+			return &sdkmcp.CallToolResult{
+				IsError: true,
+				Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: err.Error()}},
+			}, struct{}{}, nil
+		}
+		slog.Info("mcp: tool done", "component", "chat", "tool", "agent_run", "agent", args.Name)
+		return text(buf.String())
+	})
+
+}
+
+func registerPingTool(s *sdkmcp.Server) {
+	addTool(s, &sdkmcp.Tool{
+		Name:        "ping",
+		Description: "Check server connectivity",
+	}, func(_ context.Context, _ *sdkmcp.CallToolRequest, _ struct{}) (*sdkmcp.CallToolResult, struct{}, error) {
+		return text("pong")
+	})
+
 }

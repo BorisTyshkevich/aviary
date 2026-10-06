@@ -100,11 +100,15 @@ retrieval or promise recovery of a closed synchronous response.
 
 Removal immediately denies new requests, closes client streams and cancels its
 accepted runs. A2A tasks become canceled once execution stops. Recreating the
-same name generates a fresh ID and inherits no conversations. Removing protocol
-or agent grants cancels affected runs and closes affected streams; credential
+same name generates a fresh ID and inherits no conversations. Removing protocol,
+MCP `agent_run`, or agent grants cancels affected runs and closes affected streams; credential
 rotation alone does not. Validated config reloads publish a coherent policy
 snapshot. CLI commands report success only after the running server acknowledges
-the change; when offline, they explicitly report persistence for next startup.
+the change; when offline, they explicitly report persistence for next startup. The
+administrator-only `/api/clients/reload` endpoint acknowledges the exact client
+policy revision loaded from the running server's configuration path. Synchronous
+client MCP runs never enter generic checkpoint replay after process/runner
+restart; #54 adds no durable task result recovery.
 
 ### 3. A2A protocol, dependency and routes
 

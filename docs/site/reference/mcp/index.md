@@ -2,7 +2,46 @@
 
 Aviary exposes all of its capabilities as MCP tools. Any MCP-compatible client — Claude Code, another LLM, or a custom integration — can connect to the running server and invoke these tools directly.
 
-Connect at `https://localhost:16677/mcp` using the bearer token from `~/.config/aviary/token`.
+Connect at `https://localhost:16677/mcp`. The token from
+`~/.config/aviary/token` is an administrator credential and exposes the full
+control plane. Integrations should use a scoped credential created with
+`aviary client add` instead.
+
+## Scoped inbound clients
+
+```sh
+aviary client add investigation-peer --protocols mcp --tools agent_run,ping --agents expert
+aviary client rotate investigation-peer
+aviary client remove investigation-peer
+```
+
+Add and rotate print the raw token once to local stdout after persistence.
+Store it privately and send it only as `Authorization: Bearer <client-token>`.
+Client cookies, query tokens, login and administrator APIs are denied. A client
+lists and calls only its exact grants: `ping` and/or `agent_run`. Tool groups,
+wildcards and all other tools are rejected as client grants.
+
+`agent_run.name` must identify a granted configured agent. Omitted `session`
+uses that client's own default conversation. A `session` is an exact logical
+name within its client/agent namespace; `session_id` must resolve to an
+existing persisted owned conversation. A stop message can stop only that
+owned conversation. `X-Aviary-Agent-ID` does not affect client requests.
+MCP transport sessions also bind to the authenticated principal across POST,
+GET and DELETE, independently of conversation ownership.
+
+Rotation invalidates old credentials and closes their transports while admitted
+runs continue. The new token retains conversation ownership. Removal, or
+removing the `agent_run` or relevant agent grant, cancels affected runs.
+Client runs are synchronous and are not replayed after server/runner restart;
+rotation or disconnection does not provide a recoverable task result.
+Progress notifications remain supported, with tool progress limited to safe
+registered names and states.
+
+The external client grants do not restrict the agent's internal tool catalog:
+the agent executes under its configured permissions. Conversation ownership
+does not isolate agent-global memory or workspace. Use separate agents when
+those resources must be private. See [security and permissions](../../guide/security-permissions)
+and the [client configuration reference](../config#server-clients).
 
 ## Tool Categories
 

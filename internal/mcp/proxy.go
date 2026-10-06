@@ -173,3 +173,8 @@ func (t *bearerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	r.Header.Set("Authorization", "Bearer "+t.token)
 	return t.base.RoundTrip(r)
 }
+
+// RemoteHTTPTransport uses the configured local server trust roots for operator API calls.
+func RemoteHTTPTransport(serverURL string) (*http.Transport, error) {
+	return newRemoteHTTPTransport(serverURL)
+}

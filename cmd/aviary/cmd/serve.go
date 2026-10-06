@@ -236,7 +236,7 @@ func runStart(_ *cobra.Command, _ []string) error {
 
 	// Start server; restart when config changes require it.
 	for {
-		srv := server.New(cfg, tok)
+		srv := server.New(cfg, tok, resolvedCfgPath)
 		err := srv.ListenAndServe(ctx)
 		if err == nil || ctx.Err() != nil {
 			return err

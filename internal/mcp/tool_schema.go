@@ -10,6 +10,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/lsegal/aviary/internal/agent"
+	"github.com/lsegal/aviary/internal/clientauth"
 )
 
 func addTool[Args any](
@@ -21,6 +22,9 @@ func addTool[Args any](
 		tool.InputSchema = inferredInputSchema[Args]()
 	}
 	sdkmcp.AddTool(s, tool, func(ctx context.Context, req *sdkmcp.CallToolRequest, args Args) (*sdkmcp.CallToolResult, struct{}, error) {
+		if p, registry, ok := clientauth.FromContext(ctx); ok && !registry.Allowed(p, tool.Name) {
+			return nil, struct{}{}, clientauth.ErrDenied
+		}
 		if _, scoped := agent.ToolPolicyAllows(ctx, tool.Name); scoped || agent.PrivateDataContext(ctx) {
 			if err := agentToolPermitted(ctx, tool.Name); err != nil {
 				return nil, struct{}{}, err
