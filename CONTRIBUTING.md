@@ -127,6 +127,9 @@ For Slack status checks and runner teardown test ordering, see
 For prompt admission, shutdown ordering, and recovery limits, see
 [Runner lifecycle and shutdown](docs/testing/runner-lifecycle.md).
 
+For the accepted inbound client credential and A2A design tracked by #54 and
+#55, see [ADR 0007](docs/adr/0007-inbound-client-credentials-and-a2a.md).
+
 ## Linting
 
 ```shell
