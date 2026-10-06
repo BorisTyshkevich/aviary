@@ -13,6 +13,7 @@ Use the absolute `chsource` path configured in Aviary's exec allowlist for read-
 - Check `revision` for each destination used. Resolve refs within the selected checkout; a hash or branch from one checkout does not imply the same code in the other.
 - For source claims, read the relevant lines and cite `upstream:PATH:LINE` or `antalya:PATH:LINE`, with the ref when using `read-at`. Keep differences between the checkouts explicit.
 - Searches match literal text. Keep queries narrow; the command bounds output and history calls.
+- Submodule content (for example upstream `contrib/*` libraries) is out of scope. Searches skip it, and paths inside a submodule are refused. Say so when a question depends on third-party library code.
 
 For upstream ClickHouse GitHub issues, PRs, bug reports, and feature discussions, use the public Wizard corpus through the allowed absolute command:
 

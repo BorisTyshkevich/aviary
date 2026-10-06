@@ -87,16 +87,35 @@ bounded_git() {
     fi
 }
 
+# Submodule content is out of scope: no command searches or reads files inside a gitlink.
+# reject_submodule_path REV PATH fails when PATH is a gitlink or lies inside one at REV
+# (empty REV means the checkout index).
+reject_submodule_path() {
+    local rev=$1 path=$2 submodule
+    submodule=$(
+        if [[ -n "$rev" ]]; then
+            git -C "$root" ls-tree -r -z --format='%(objectmode) %(path)' "$rev"
+        else
+            git -C "$root" ls-files -z --format='%(objectmode) %(path)'
+        fi | { grep -z '^160000 ' || :; } | tr '\0' '\n' | awk -v p="$path" '
+            { sub(/^160000 /, "") }
+            p == $0 || index(p, $0 "/") == 1 { print; exit }
+        '
+    ) || :
+    [[ -z "$submodule" ]] || fail "path is inside submodule $submodule; submodule content is out of scope"
+}
+
 # rg_tracked DIR QUERY [PATHSPEC] searches the files tracked by the checkout or worktree at DIR.
 rg_tracked() {
     local dir=$1 query=$2
     shift 2
     [[ -x "$rg_bin" ]] || fail "rg is not installed at $rg_bin"
-    # git supplies tracked paths; rg reads their contents.
+    # git supplies tracked paths without gitlinks, so rg never descends into submodules.
     # xargs batches large checkouts without building a huge argument list.
     (
         cd "$dir"
-        git ls-files -z -- "$@" | xargs -0 -r -n 1000 -P 8 "$rg_bin" --no-config --no-messages --color never \
+        git ls-files -z --format='%(objectmode) %(path)' -- "$@" | { grep -z -v '^160000 ' || :; } | sed -z 's/^[0-7]* //' \
+            | xargs -0 -r -n 1000 -P 8 "$rg_bin" --no-config --no-messages --color never \
             --with-filename --no-heading --line-number --fixed-strings \
             --max-columns 300 --max-columns-preview -e "$query" --
     ) | awk -v limit="$max_bytes" '
@@ -118,7 +137,10 @@ tracked_path() {
     resolved=$(realpath -- "$root/$raw") || fail 'path does not exist'
     [[ "$resolved" == "$root/"* && -f "$resolved" ]] || fail 'path is outside the selected checkout or is not a file'
     relative_path=${resolved#"$root/"}
-    git -C "$root" ls-files --error-unmatch -- ":(literal)$relative_path" >/dev/null 2>&1 || fail 'path is not tracked by the selected checkout'
+    if ! git -C "$root" ls-files --error-unmatch -- ":(literal)$relative_path" >/dev/null 2>&1; then
+        reject_submodule_path '' "$relative_path"
+        fail 'path is not tracked by the selected checkout'
+    fi
     resolved_path=$resolved
 }
 
@@ -187,6 +209,7 @@ case "$command" in
             [[ -d "$resolved_scope" || -f "$resolved_scope" ]] || fail 'search path must be a file or directory'
             scope=${resolved_scope#"$root/"}
             [[ "$resolved_scope" == "$root" ]] && scope=.
+            [[ "$scope" == . ]] || reject_submodule_path '' "$scope"
         fi
         rg_tracked "$root" "$1" ":(literal)$scope"
         ;;
@@ -219,6 +242,7 @@ case "$command" in
         pathspec=()
         if [[ $# -eq 3 ]]; then
             history_path "$3"
+            reject_submodule_path "$resolved_ref" "$3"
             pathspec=("$history_pathspec")
         fi
         if tree_for "$resolved_ref"; then
@@ -241,7 +265,10 @@ case "$command" in
         count=$((10#$count))
         (( start >= 1 && count >= 1 && count <= max_lines )) || fail "start must be positive and count must be 1 to $max_lines"
         object="$resolved_ref:$2"
-        [[ $(git -C "$root" cat-file -t "$object" 2>/dev/null) == blob ]] || fail 'path is not a file at that revision'
+        if [[ $(git -C "$root" cat-file -t "$object" 2>/dev/null) != blob ]]; then
+            reject_submodule_path "$resolved_ref" "$2"
+            fail 'path is not a file at that revision'
+        fi
         printf '%s at %s (%s), lines %s-%s:\n' "$2" "$ref_name" "$resolved_ref" "$start" "$((start + count - 1))"
         if ! git -C "$root" cat-file -p "$object" | awk -v start="$start" -v count="$count" -v limit="$max_bytes" '
             NR < start { next }

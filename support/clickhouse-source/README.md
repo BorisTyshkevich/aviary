@@ -30,6 +30,10 @@ Each run appends to `<checkout>/tmp/git-pull-YYYY-MM-DD.log`. `MAILTO` is empty,
 
 Allow these agent exec patterns next to the existing read-only operations: `chsource materialize *`, `chsource upstream materialize *`, and `chsource antalya materialize *`. Never allow `refresh`; only the daily job runs it.
 
+## Requirements
+
+Git 2.38 or later (for `ls-files --format`), ripgrep, `flock`, and GNU `grep`/`sed` (both use `-z`).
+
 ## Environment
 
 | Variable | Default |
@@ -51,7 +55,8 @@ Design decisions:
 - **A tree is published only once it is complete.** `materialize` and `refresh` create the worktree under `.tmp-<hash>-<pid>` and `git worktree move` it into place while holding `.lock`. A reader never sees a partial checkout.
 - **Superseded trees get a grace run.** `refresh` records the commits that aliases left in `.retired` and removes them on the next run, unless an alias or `materialize` (`.on-demand/<hash>`) still uses them. A search in flight during an update therefore keeps its files.
 - **Modified trees are rebuilt.** `refresh` rebuilds any alias tree whose `git status` shows tracked changes. Searches check only `HEAD`, which keeps each call fast.
-- **No submodule content.** Worktrees have no submodule content, matching `git grep` on a commit tree. On-demand trees have no size cap or expiry yet; see [#56](https://github.com/BorisTyshkevich/aviary/issues/56).
+- **Submodule content is out of scope.** No command searches or reads files inside a submodule (for example `contrib/*` upstream), even when it is initialized in the checkout. `search` passes only non-gitlink tracked files to ripgrep, which already matches `git grep` on a commit tree and the worktrees, where submodules are empty. A path that is a submodule or lies inside one fails with `path is inside submodule …; submodule content is out of scope`. A match the agent cannot open, and cannot cite at a known commit, wastes calls and the match budget.
+- **On-demand trees are uncapped.** They have no size cap or expiry yet; see [#56](https://github.com/BorisTyshkevich/aviary/issues/56).
 - **`read-at` always reads the blob with `git cat-file`.** That is fast and cannot drift from the commit.
 
 Worktrees share the checkout's object store; each tree costs only its checked-out files. Upstream release trees range from about 0.3 GB (24.8) to 1.1 GB (26.8), and the five series trees total about 2.5 GB.

@@ -108,6 +108,27 @@ func (f *fixture) commit(path, content, tag string) string {
 	return f.git(f.origin, "rev-parse", "HEAD")
 }
 
+// addSubmodule commits vendor/lib as a submodule of origin, initializes it in the
+// checkout, and puts sub_token both inside the submodule and in a superproject file.
+func (f *fixture) addSubmodule() {
+	f.t.Helper()
+	lib := filepath.Join(filepath.Dir(f.origin), "lib")
+	f.git(filepath.Dir(f.origin), "init", "-q", "-b", "main", lib)
+	if err := os.WriteFile(filepath.Join(lib, "x.c"), []byte("int sub_token = 1;\n"), 0o644); err != nil {
+		f.t.Fatal(err)
+	}
+	f.git(lib, "add", "x.c")
+	f.git(lib, "commit", "-q", "-m", "lib")
+	f.git(f.origin, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "vendor/lib")
+	f.git(f.origin, "commit", "-q", "-m", "add submodule")
+	f.commit("src/uses_sub.cpp", "// sub_token from vendor/lib\n", "")
+	f.git(f.checkout, "pull", "-q", "--ff-only")
+	f.git(f.checkout, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+	if _, err := os.Stat(filepath.Join(f.checkout, "vendor", "lib", "x.c")); err != nil {
+		f.t.Fatalf("submodule was not initialized: %v", err)
+	}
+}
+
 func (f *fixture) hash(ref string) string {
 	f.t.Helper()
 	return f.git(f.checkout, "rev-parse", ref+"^{commit}")
@@ -392,5 +413,53 @@ func TestDailyPullFailsWithoutSource(t *testing.T) {
 
 	if code != 2 || !strings.Contains(out, "Usage: chsource-daily-pull upstream|antalya") {
 		t.Fatalf("unexpected result %d:\n%s", code, out)
+	}
+}
+
+func TestSearchSkipsSubmoduleContent(t *testing.T) {
+	f := newFixture(t)
+	f.requireRG()
+	f.addSubmodule()
+
+	out := f.chsource("search", "sub_token")
+	if !strings.Contains(out, "src/uses_sub.cpp:1:") || strings.Contains(out, "vendor/lib/") {
+		t.Fatalf("search should match only the superproject:\n%s", out)
+	}
+	// A directory that contains a submodule is searched without descending into it.
+	out = f.chsource("search", "sub_token", "vendor")
+	if !strings.Contains(out, "No matches in tracked files.") {
+		t.Fatalf("search under vendor returned submodule content:\n%s", out)
+	}
+
+	f.chsource("materialize", "HEAD")
+	out = f.chsource("search-at", "HEAD", "sub_token")
+	if !strings.Contains(out, "via worktree:\nsrc/uses_sub.cpp:1:") || strings.Contains(out, "vendor/lib/") {
+		t.Fatalf("worktree search should match only the superproject:\n%s", out)
+	}
+}
+
+func TestSubmodulePathsAreRejected(t *testing.T) {
+	f := newFixture(t)
+	f.addSubmodule()
+	const want = "chsource: path is inside submodule vendor/lib; submodule content is out of scope"
+
+	for _, args := range [][]string{
+		{"search", "sub_token", "vendor/lib"},
+		{"search", "sub_token", "vendor/lib/x.c"},
+		{"read", "vendor/lib/x.c"},
+		{"search-at", "HEAD", "sub_token", "vendor/lib"},
+		{"search-at", "HEAD", "sub_token", "vendor/lib/x.c"},
+		{"read-at", "HEAD", "vendor/lib/x.c"},
+		{"read-at", "HEAD", "vendor/lib"},
+	} {
+		out, code := f.run("chsource", args...)
+		if code != 2 || !strings.Contains(out, want) {
+			t.Fatalf("%v exited %d, want the submodule refusal:\n%s", args, code, out)
+		}
+	}
+
+	// Ordinary missing paths keep their own errors.
+	if out, code := f.run("chsource", "read-at", "HEAD", "src/missing.cpp"); code != 2 || !strings.Contains(out, "path is not a file at that revision") {
+		t.Fatalf("missing path exited %d:\n%s", code, out)
 	}
 }
