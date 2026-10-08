@@ -4,6 +4,11 @@
 - Date: 2026-10-06
 - Related: [#54](https://github.com/BorisTyshkevich/aviary/issues/54), [#55](https://github.com/BorisTyshkevich/aviary/issues/55)
 
+> Execution-authority follow-up: accepted [ADR 0008](0008-execution-authority.md)
+> defines ownership through internal tools and delegation. PR #62 does not yet
+> satisfy that boundary. #54 and #55 require the authority/resource enforcement
+> release gate before their isolation claims are considered implemented.
+
 ## Context
 
 Aviary's inbound MCP endpoint accepts the administrator bearer token. External
@@ -86,8 +91,12 @@ reading or stopping anything, including an `agent_run` stop command. MCP and
 A2A conversations have separate namespaces even for the same client.
 
 The MCP tool grant authorizes the external operation. It is not the tool policy
-for the resulting model run. The agent uses its configured execution permissions;
-clients cannot supply tool/model overrides or trusted channel identity. This
+for the resulting model run. The agent uses its configured execution permissions,
+narrowed by inherited tool policy and resource authority from ADR 0008; clients
+cannot supply tool/model overrides or trusted channel identity. Internal calls
+retain caller ownership, and model runs cannot administer Aviary. Generic exec
+is unavailable to scoped model execution pending a separate containment decision;
+scoped scheduling/replay is deferred to durable authority issue #66. This
 boundary does not make agent-global memory or workspace state private to each
 peer. Operators must use separate agents where that isolation is required.
 

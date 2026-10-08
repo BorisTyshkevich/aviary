@@ -130,6 +130,9 @@ For prompt admission, shutdown ordering, and recovery limits, see
 For the accepted inbound client credential and A2A design tracked by #54 and
 #55, see [ADR 0007](docs/adr/0007-inbound-client-credentials-and-a2a.md).
 
+For common execution authority and its phased implementation contract, see
+[ADR 0008](docs/adr/0008-execution-authority.md).
+
 ## Linting
 
 ```shell
