@@ -274,11 +274,19 @@ func (m *Manager) routeSlackMessageFor(ch *SlackChannel, msg IncomingMessage, in
 	}
 	candidates := m.slackCandidates()
 	if strings.HasPrefix(msg.Channel, "D") {
+		// A DM carries no channel, so every configured entry of one agent on this
+		// connection can authorize it. Route it once per agent, to the first
+		// entry that allows it, or the agent would answer the same DM once per entry.
+		routedAgents := map[string]struct{}{}
 		for _, candidate := range candidates {
 			if candidate.ch != ch || !shouldProcessIncomingMessage(candidate.spec.metadata, msg) {
 				continue
 			}
+			if _, done := routedAgents[candidate.spec.agentName]; done {
+				continue
+			}
 			if routed, ok := routedSlackMessageOriginal(ch, candidate.spec, msg, false); ok {
+				routedAgents[candidate.spec.agentName] = struct{}{}
 				emit(candidate, routed)
 			}
 		}
