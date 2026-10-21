@@ -195,6 +195,7 @@ channels:
 | `react_to_emoji` | bool | `true` | Treat emoji reactions on the agent's own messages as prompts |
 | `reply_to_replies` | bool | `true` | On Signal, respond to replies to the agent's messages. On Slack, let authorized participants continue a thread claimed by an explicit bot mention without another mention. |
 | `ignore_other_user_mentions` | bool | `false` | On Slack, ignore claimed-thread replies that directly mention a user other than the owning bot. Requires `reply_to_replies: true`. Explicit mentions of another configured bot can still route to that bot. |
+| `claimed_reply_scope` | string | `all` | On Slack, who may continue a claimed thread without mentioning the bot: `all` authorized participants, only the `claimer` (the user whose mention claimed the thread), or `mentions` (nobody; every reply needs a mention). A direct mention always reaches the bot. |
 | `send_read_receipts` | bool | `true` | Send read receipts for messages the agent will act on |
 | `group_chat_history` | int | `50` | Number of recent group chat messages retained as context. Set to `-1` to disable. |
 | `disabled_tools` | []string | | Tools disabled for messages arriving on this channel |

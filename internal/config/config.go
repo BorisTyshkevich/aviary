@@ -247,6 +247,11 @@ type ChannelConfig struct {
 	// to its owner when the reply directly mentions another user. Explicit
 	// routing to another bot remains available. Defaults to false.
 	IgnoreOtherUserMentions bool `yaml:"ignore_other_user_mentions,omitempty" json:"ignore_other_user_mentions,omitempty"`
+	// ClaimedReplyScope limits who can continue a claimed Slack thread without
+	// mentioning the bot: "all" (default) lets every authorized participant,
+	// "claimer" only the user whose mention claimed the thread, and "mentions"
+	// nobody. A direct mention of the bot always addresses it.
+	ClaimedReplyScope string `yaml:"claimed_reply_scope,omitempty" json:"claimed_reply_scope,omitempty"`
 	// SendReadReceipts controls whether the agent sends read receipts for
 	// messages it will respond to. Read receipts are only sent for messages
 	// that pass the allowFrom filter (i.e. messages the agent will act on).

@@ -136,6 +136,13 @@ func (c *SlackChannel) Send(channel, text string) error {
 	return err
 }
 
+// addReaction adds an emoji reaction to a message. It needs reactions:write.
+func (c *SlackChannel) addReaction(channel, timestamp, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.client.AddReactionContext(ctx, name, slack.NewRefToMessage(channel, timestamp))
+}
+
 // SendAndGetID posts a message and returns the Slack message timestamp, which
 // serves as the message ID for EditMessage.
 func (c *SlackChannel) SendAndGetID(channel, text string) (string, error) {
@@ -586,6 +593,7 @@ func (c *SlackChannel) handleMessageEvent(event *slackevents.MessageEvent) {
 			SenderName:     c.displayNameForUser(from),
 			Channel:        channelID,
 			ThreadTS:       threadTS,
+			MessageTS:      rawTimestamp,
 			IsThreadReply:  isThreadReply,
 			Text:           enrichedText,
 			OriginalText:   text,

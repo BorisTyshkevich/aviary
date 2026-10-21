@@ -40,6 +40,8 @@ type slackThreadOwner struct {
 	AgentName    string    `json:"agent_name"`
 	ConfiguredID string    `json:"configured_id"`
 	EnabledAt    time.Time `json:"enabled_at,omitempty"`
+	ClaimedBy    string    `json:"claimed_by,omitempty"`
+	MutedAt      time.Time `json:"muted_at,omitempty"`
 }
 
 type slackThreadAffinity struct {
@@ -131,6 +133,44 @@ func (a *slackThreadAffinity) claim(want slackThreadOwner) (*slackThreadOwner, e
 		_ = dir.Close()
 	}
 	return &want, nil
+}
+
+// setMuted records or clears the thread mute on an existing claim. Replacing
+// the record in place keeps the claim itself, so the owner never changes.
+func (a *slackThreadAffinity) setMuted(team, channel, root string, muted bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	owner, err := a.lookupLocked(team, channel, root)
+	if err != nil || owner == nil || owner.MutedAt.IsZero() != muted {
+		return err
+	}
+	if muted {
+		owner.MutedAt = time.Now().UTC()
+	} else {
+		owner.MutedAt = time.Time{}
+	}
+	data, err := json.Marshal(owner)
+	if err != nil {
+		return err
+	}
+	path := a.path(team, channel, root)
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".mute-*")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }
 
 func (a *slackThreadAffinity) prune() error {
@@ -338,10 +378,23 @@ func (m *Manager) routeSlackMessageFor(ch *SlackChannel, msg IncomingMessage, in
 		if expectedKey != "" && channelKey(selected.spec.agentName, "slack", selected.spec.channelConfig.ID) != expectedKey {
 			return
 		}
+		if owner != nil && msg.IsThreadReply && !msg.IsEdited && ownerMatchesSlackCandidate(owner, selected) {
+			botID, _ := selected.ch.affinityIdentity()
+			if isSlackStopRequest(msg.OriginalText, botID) {
+				m.muteSlackThread(ch, msg)
+				return
+			}
+			if !owner.MutedAt.IsZero() {
+				if err := m.affinity.setMuted(ch.teamID, msg.Channel, msg.ThreadTS, false); err != nil {
+					ch.logf("slack: could not unmute thread: %v", err)
+					return
+				}
+			}
+		}
 		if !msg.IsEdited && owner == nil && config.BoolOr(selected.spec.channelConfig.ReplyToReplies, true) {
 			_, err = m.affinity.claim(slackThreadOwner{TeamID: ch.teamID, ChannelID: msg.Channel,
 				RootTS: msg.ThreadTS, BotUserID: ch.botUserID, AgentName: selected.spec.agentName,
-				ConfiguredID: selected.spec.channelConfig.ID, EnabledAt: selected.spec.metadata.EnabledAt})
+				ConfiguredID: selected.spec.channelConfig.ID, EnabledAt: selected.spec.metadata.EnabledAt, ClaimedBy: msg.From})
 			if err != nil {
 				ch.logf("slack: could not claim thread: %v", err)
 				return
@@ -355,12 +408,13 @@ func (m *Manager) routeSlackMessageFor(ch *SlackChannel, msg IncomingMessage, in
 		return
 	}
 	if owner != nil {
-		if !msg.IsThreadReply || ignoreOwnerBot {
+		if !msg.IsThreadReply || ignoreOwnerBot || !owner.MutedAt.IsZero() {
 			return
 		}
 		for _, candidate := range candidates {
 			if candidate.ch != ch || !ownerMatchesSlackCandidate(owner, candidate) ||
 				!config.BoolOr(candidate.spec.channelConfig.ReplyToReplies, true) ||
+				!slackClaimedReplyAllowed(candidate.spec.channelConfig.ClaimedReplyScope, owner, msg) ||
 				!shouldProcessIncomingMessage(candidate.spec.metadata, msg) {
 				continue
 			}
@@ -448,7 +502,7 @@ func (m *Manager) claimSlackCommand(ch *SlackChannel, in slackIngress, selected 
 	}
 	_, err := m.affinity.claim(slackThreadOwner{TeamID: ch.teamID, ChannelID: in.ChannelID, RootTS: in.RootTS,
 		BotUserID: ch.botUserID, AgentName: selected.agentName, ConfiguredID: selected.channelConfig.ID,
-		EnabledAt: selected.metadata.EnabledAt})
+		EnabledAt: selected.metadata.EnabledAt, ClaimedBy: in.UserID})
 	if err != nil {
 		ch.logf("slack: could not claim command thread: %v", err)
 	}
