@@ -167,6 +167,8 @@ Use `@Aviary status` to see the thread target and whether your own credentials a
 
 An authorized `@Aviary` message or connection command claims its Slack thread when `reply_to_replies` is enabled. Other authorized participants may then reply in that thread without repeating the mention. Set `ignore_other_user_mentions: true` on the Slack channel to ignore claimed-thread replies that tag someone other than the owning bot; a reply tagging only the owner still reaches it. A mention of another bot addresses that message to the other bot when it has an enabled channel rule that accepts its mention; it does not transfer the thread. Literal mention prefixes work when the corresponding bot is installed and invited to the channel. Ambiguous bot addresses are ignored. Sender and channel permissions still apply to every reply. Thread affinity lasts 90 days from the root message; start a new thread after that or after the owning channel is removed and re-enabled. Set `reply_to_replies: false` to require a fresh bot mention or literal prefix on each reply.
 
+Mention the bot with a bare "stop" (also "be quiet", "mute", "enough", "shut up", "go away") from any authorized participant to mute it in that thread: it reacts with :mute: (needs the `reactions:write` bot scope) and ignores unmentioned replies until someone mentions it again. The whole message must be the request; "@Aviary stop the merge" is an ordinary question. Set `claimed_reply_scope: claimer` to let only the user who claimed the thread continue it without a mention, or `mentions` to require a mention on every reply while keeping thread ownership.
+
 ### Common Confusions
 
 - If you only have an `xapp-...` token, you are missing the bot token. Aviary needs both.

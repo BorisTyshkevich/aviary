@@ -15,6 +15,7 @@ type IncomingMessage struct {
 	SenderName     string // optional human-readable sender name
 	Channel        string // channel ID or name
 	ThreadTS       string // optional platform thread timestamp/root ID
+	MessageTS      string // Slack timestamp of this message
 	IsThreadReply  bool   // true when the message is a reply inside a platform thread
 	IsGroup        bool   // trusted platform group/channel classification
 	WasMentioned   bool   // trusted platform mention signal
