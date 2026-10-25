@@ -1321,3 +1321,31 @@ test("agent files editor auto-syncs templates when an older agent has no root fi
 		page.getByText("No root markdown files yet. Refresh or add one."),
 	).toHaveCount(0);
 });
+
+test("saving unrelated settings preserves inbound client grants", async ({
+	page,
+}) => {
+	const clients = [
+		{
+			id: "client_00000000000000000000000000000001",
+			name: "fake-peer",
+			token_hash: `sha256:${"0".repeat(64)}`,
+			protocols: ["mcp"],
+			tools: ["agent_run", "ping"],
+			agents: ["assistant"],
+		},
+	];
+	let savedConfig: unknown = null;
+	await mockMCP(page, {
+		config_get: { ...CONFIG, server: { ...CONFIG.server, clients } },
+		config_save: (args) => {
+			savedConfig = JSON.parse(String(args?.config ?? "{}"));
+			return "ok";
+		},
+	});
+	await page.goto("/settings");
+	await page.locator('input[inputmode="numeric"]').first().fill("17777");
+	await page.getByRole("button", { name: "Save Changes" }).click();
+	await expect(page.getByTitle("Settings saved")).toBeVisible();
+	expect(savedConfig).toMatchObject({ server: { port: 17777, clients } });
+});

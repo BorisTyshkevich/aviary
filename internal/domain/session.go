@@ -18,6 +18,8 @@ const (
 
 // Session represents a conversation with an agent.
 type Session struct {
+	ClientID  string      `json:"client_id,omitempty"`
+	Protocol  string      `json:"protocol,omitempty"`
 	ID        string      `json:"id,omitempty"`
 	AgentID   string      `json:"agent_id,omitempty"`
 	Name      string      `json:"name,omitempty"`    // human-readable name; "main" for the default session

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/lsegal/aviary/internal/auth"
+	"github.com/lsegal/aviary/internal/clientauth"
 	"github.com/lsegal/aviary/internal/store"
 )
 
@@ -24,7 +25,7 @@ func tokenPath() string {
 
 // GenerateToken creates a new random token and saves it.
 func GenerateToken() (string, error) {
-	b := make([]byte, 16)
+	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("generating token: %w", err)
 	}
@@ -76,7 +77,7 @@ func BearerMiddleware(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Check Authorization header.
 		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			if strings.TrimPrefix(auth, "Bearer ") == token {
+			if clientauth.EqualToken(strings.TrimPrefix(auth, "Bearer "), token) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -84,7 +85,7 @@ func BearerMiddleware(token string, next http.Handler) http.Handler {
 
 		// Check session cookie.
 		if cookie, err := r.Cookie("aviary_session"); err == nil {
-			if cookie.Value == token {
+			if clientauth.EqualToken(cookie.Value, token) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -92,7 +93,7 @@ func BearerMiddleware(token string, next http.Handler) http.Handler {
 
 		// Check query token (used by EventSource/SSE where custom headers are
 		// not available).
-		if q := r.URL.Query().Get("token"); q != "" && q == token {
+		if q := r.URL.Query().Get("token"); q != "" && clientauth.EqualToken(q, token) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -124,7 +125,7 @@ func LoginHandler(token string) http.HandlerFunc {
 		if submitted == "" {
 			submitted = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		}
-		if submitted != token {
+		if !clientauth.EqualToken(submitted, token) {
 			http.Error(w, "Invalid token", http.StatusUnauthorized)
 			return
 		}

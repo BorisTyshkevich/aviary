@@ -68,6 +68,27 @@ server:
 | `tls.cert` | string | | Path to TLS certificate file |
 | `tls.key` | string | | Path to TLS private key file |
 
+### server.clients
+
+Scoped inbound MCP callers are managed locally with `aviary client`. Each
+entry contains a generated immutable `id`, unique operator-facing `name`,
+versioned `token_hash` (`sha256:` followed by 64 lowercase hexadecimal
+characters), `protocols: [mcp]`, exact `tools`, and allowed configured `agents`.
+Only `ping` and `agent_run` are valid tools. `agent_run` requires a nonempty
+agent grant; a ping-only client can omit agents. IDs, names and token hashes
+must be unique. Names match `[a-zA-Z0-9][a-zA-Z0-9_.-]{0,63}`; IDs match
+`client_[0-9a-f]{32}`. Raw client tokens never persist in this configuration.
+
+Clients authenticate only by bearer header on `/mcp`. The administrator token
+continues to authorize the full control plane. See the [MCP reference](./mcp/)
+for conversation ownership and execution policy boundaries.
+
+Validated reloads install a coherent client policy. Rotation preserves identity
+and admitted runs while closing old streams. Removing a client or its execution
+scope cancels affected runs. Client CLI success includes acknowledgment from the
+running server; offline commands explicitly report persistence for next startup.
+An acknowledgment failure reports an error even if the disk update succeeded.
+
 ---
 
 ## agents

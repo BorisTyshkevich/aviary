@@ -60,6 +60,26 @@ The safest default is still `https://localhost:16677` with the bearer token stor
 - Limit who can log into the control panel or connect to the MCP endpoint.
 - Avoid pasting the bearer token into shared terminals, screen recordings, or chat logs.
 
+### Scoped Integration Credentials
+
+Give integrations a client token with explicit `mcp`, `ping`/`agent_run`, and
+agent grants through `aviary client add`. Client credentials contain 256 bits
+of randomness; only versioned SHA-256 digests persist. Authentication compares
+fixed-length digests in constant time, including administrator login.
+
+Clients cannot log into the control panel, use administrator APIs, supply
+trusted routing headers, or read/stop other clients' conversations. Transport
+sessions bind to principal identity as well. Rotation preserves the immutable
+client ID and owned conversations while invalidating old streams. Removal or
+execution-scope removal cancels admitted client runs. Confirm the CLI reports
+runtime acknowledgment before treating a credential as revoked.
+
+The agent still uses its configured execution permissions. Shared agent memory
+and workspace are not private per client. Provision separate agents and working
+directories when those resources require isolation. See the
+[MCP client reference](../reference/mcp/) for synchronous result and restart
+limitations.
+
 ## Agent Access Permissions
 
 Aviary's strongest built-in security controls are the per-agent permission settings.

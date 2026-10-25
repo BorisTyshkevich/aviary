@@ -10,6 +10,7 @@ import (
 
 	"github.com/lsegal/aviary/internal/agent"
 	"github.com/lsegal/aviary/internal/buildinfo"
+	"github.com/lsegal/aviary/internal/clientauth"
 )
 
 // NewServer creates and configures an MCP server with all Aviary tools registered.
@@ -35,11 +36,22 @@ func HTTPHandler(s *mcp.Server) http.Handler {
 		DisableLocalhostProtection: true,
 	})
 
+	return withHTTPRequestContext(base)
+}
+
+// withHTTPRequestContext preserves administrator routing/logging and strips
+// client impersonation headers without logging client arguments.
+func withHTTPRequestContext(base http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if agentID := r.Header.Get("X-Aviary-Agent-ID"); agentID != "" {
+		_, _, client := clientauth.FromContext(r.Context())
+		if client {
+			r = r.Clone(r.Context())
+			r.Header.Del("X-Aviary-Agent-ID")
+		}
+		if agentID := r.Header.Get("X-Aviary-Agent-ID"); !client && agentID != "" {
 			r = r.WithContext(agent.WithSessionAgentID(r.Context(), agentID))
 		}
-		if r.Method == http.MethodPost && r.Body != nil {
+		if !client && r.Method == http.MethodPost && r.Body != nil {
 			body, err := io.ReadAll(r.Body)
 			if err == nil {
 				r.Body = io.NopCloser(bytes.NewReader(body))

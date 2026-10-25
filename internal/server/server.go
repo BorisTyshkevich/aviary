@@ -21,6 +21,7 @@ import (
 	"github.com/lsegal/aviary/internal/browser"
 	"github.com/lsegal/aviary/internal/channels"
 	"github.com/lsegal/aviary/internal/clickhouseconn"
+	"github.com/lsegal/aviary/internal/clientauth"
 	"github.com/lsegal/aviary/internal/config"
 	"github.com/lsegal/aviary/internal/connections"
 	"github.com/lsegal/aviary/internal/domain"
@@ -40,6 +41,10 @@ var ErrRestartRequired = errors.New("server restart required")
 
 // Server wraps an HTTPS server with token auth, MCP routing, and agent management.
 type Server struct {
+	configPath            string
+	clients               *clientauth.Registry
+	clientMCP             *mcp.ClientHTTPHandler
+	configReloadMu        sync.Mutex
 	cfg                   *config.Config
 	token                 string
 	mux                   *http.ServeMux
@@ -69,7 +74,11 @@ type Server struct {
 }
 
 // New creates a new Server with the given config and auth token.
-func New(cfg *config.Config, token string) *Server {
+func New(cfg *config.Config, token string, configPaths ...string) *Server {
+	path := config.DefaultPath()
+	if len(configPaths) > 0 && configPaths[0] != "" {
+		path = configPaths[0]
+	}
 	s := &Server{
 		cfg:               cfg,
 		token:             token,
@@ -78,6 +87,11 @@ func New(cfg *config.Config, token string) *Server {
 		hardRestartCh:     make(chan struct{}, 1),
 		upgradeCh:         make(chan struct{}, 1),
 		routerReady:       make(chan struct{}),
+	}
+	s.configPath = path
+	s.clients = clientauth.New()
+	if err := s.clients.Install(cfg); err != nil {
+		s.startupErr = err
 	}
 	s.connectionPolicy.Store(cfg.Connections)
 	// Create auth store first — needed for both MCP deps and LLM token refresh.
@@ -198,10 +212,8 @@ func New(cfg *config.Config, token string) *Server {
 	}
 
 	// Set up config watcher.
-	s.watcher = config.NewWatcher("")
-	s.watcher.OnChange(func(newCfg *config.Config) {
-		s.applyConfigReload(newCfg)
-	})
+	s.watcher = config.NewWatcher(s.configPath)
+	s.watcher.OnChange(s.reloadConfigFromDisk)
 	s.skillsWatcher = skills.NewWatcher()
 	s.skillsWatcher.OnChange(func() {
 		mcp.SyncLiveServer(s.cfg)
@@ -211,7 +223,32 @@ func New(cfg *config.Config, token string) *Server {
 	return s
 }
 
+// reloadConfigFromDisk reads under the same lock as CLI acknowledgments. A
+// watcher callback may carry a snapshot read before a credential was revoked;
+// installing that stale snapshot could resurrect the old credential after ack.
+func (s *Server) reloadConfigFromDisk(_ *config.Config) {
+	s.configReloadMu.Lock()
+	defer s.configReloadMu.Unlock()
+	latest, err := config.Load(s.configPath)
+	if err != nil {
+		slog.Error("server: config reload rejected")
+		return
+	}
+	s.applyConfigReloadLocked(latest)
+}
+
 func (s *Server) applyConfigReload(newCfg *config.Config) {
+	s.configReloadMu.Lock()
+	defer s.configReloadMu.Unlock()
+	s.applyConfigReloadLocked(newCfg)
+}
+
+func (s *Server) applyConfigReloadLocked(newCfg *config.Config) {
+	if err := s.clients.Install(newCfg); err != nil {
+		slog.Error("server: client policy reload rejected")
+		return
+	}
+	s.clientMCP.Reconcile()
 	oldCfg := s.cfg
 	s.connectionPolicy.Store(newCfg.Connections)
 	if err := store.UpdateChannelMetadataState(oldCfg, newCfg, time.Now().UTC()); err != nil {
@@ -251,7 +288,18 @@ func (s *Server) applyConfigReload(newCfg *config.Config) {
 func (s *Server) registerRoutes() {
 	mcpSrv := mcp.NewServer()
 	mcp.SetLiveServer(mcpSrv)
-	mcpHandler := mcp.HTTPHandler(mcpSrv)
+	s.clientMCP = mcp.NewClientHTTPHandler(mcpSrv, s.clients)
+	adminMCP := BearerMiddleware(s.token, mcp.AdminPrincipalHandler(s.token, s.clientMCP))
+	clientMCP := mcp.PrincipalMiddleware(s.clients, s.clientMCP)
+	mcpHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if raw := r.Header.Get("Authorization"); strings.HasPrefix(raw, "Bearer ") {
+			if _, ok := s.clients.Authenticate(strings.TrimPrefix(raw, "Bearer ")); ok {
+				clientMCP.ServeHTTP(w, r)
+				return
+			}
+		}
+		adminMCP.ServeHTTP(w, r)
+	})
 
 	// Login does not require auth.
 	s.mux.HandleFunc("/api/login", LoginHandler(s.token))
@@ -261,8 +309,10 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/ws", wsHandler(s.token))
 
 	// MCP endpoint: wrapped in bearer middleware.
-	s.mux.Handle("/mcp", BearerMiddleware(s.token, mcpHandler))
-	s.mux.Handle("/mcp/", BearerMiddleware(s.token, mcpHandler))
+	s.mux.Handle("/mcp", mcpHandler)
+	s.mux.Handle("/mcp/", mcpHandler)
+
+	s.mux.Handle("/api/clients/reload", BearerMiddleware(s.token, http.HandlerFunc(s.reloadClientsHandler)))
 
 	// Log stream SSE endpoint + history REST endpoint.
 	s.mux.Handle("/api/logs", BearerMiddleware(s.token, http.HandlerFunc(logsHandler)))

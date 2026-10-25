@@ -26,7 +26,7 @@ type RemoteClient struct {
 // NewRemoteClient connects to the Aviary server at serverURL using the given token.
 // The URL should be the base server URL (e.g. "https://localhost:16677"); /mcp is appended.
 func NewRemoteClient(ctx context.Context, serverURL, token string) (*RemoteClient, error) {
-	httpTransport, err := newRemoteHTTPTransport(serverURL)
+	httpTransport, err := RemoteHTTPTransport(serverURL, "")
 	if err != nil {
 		return nil, err
 	}
@@ -65,13 +65,15 @@ func NewRemoteClient(ctx context.Context, serverURL, token string) (*RemoteClien
 	}, nil
 }
 
-func newRemoteHTTPTransport(serverURL string) (*http.Transport, error) {
+// RemoteHTTPTransport uses the selected Aviary config for local server TLS trust.
+// An empty configPath selects the default configuration.
+func RemoteHTTPTransport(serverURL, configPath string) (*http.Transport, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(serverURL)), "https://") {
 		return transport, nil
 	}
 
-	rootCAs, err := loadRemoteServerCAPool()
+	rootCAs, err := loadRemoteServerCAPool(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("loading TLS roots for %s: %w", serverURL, err)
 	}
@@ -84,13 +86,13 @@ func newRemoteHTTPTransport(serverURL string) (*http.Transport, error) {
 	return transport, nil
 }
 
-func loadRemoteServerCAPool() (*x509.CertPool, error) {
+func loadRemoteServerCAPool(configPath string) (*x509.CertPool, error) {
 	rootCAs, err := x509.SystemCertPool()
 	if err != nil || rootCAs == nil {
 		rootCAs = x509.NewCertPool()
 	}
 
-	certPath, err := remoteServerCertPath()
+	certPath, err := remoteServerCertPath(configPath)
 	if err != nil {
 		return nil, err
 	}
@@ -104,22 +106,26 @@ func loadRemoteServerCAPool() (*x509.CertPool, error) {
 	return rootCAs, nil
 }
 
-func remoteServerCertPath() (string, error) {
-	cfg, err := config.Load("")
+func remoteServerCertPath(configPath string) (string, error) {
+	if configPath == "" {
+		configPath = config.DefaultPath()
+	}
+	configPath, err := filepath.Abs(configPath)
+	if err != nil {
+		return "", fmt.Errorf("resolving config path: %w", err)
+	}
+	cfg, err := config.Load(configPath)
 	if err != nil {
 		return "", fmt.Errorf("loading config: %w", err)
 	}
 	if cfg != nil && cfg.Server.TLS != nil && strings.TrimSpace(cfg.Server.TLS.Cert) != "" {
-		return resolveConfigPath(cfg.Server.TLS.Cert), nil
+		certPath := cfg.Server.TLS.Cert
+		if !filepath.IsAbs(certPath) {
+			certPath = filepath.Join(filepath.Dir(configPath), certPath)
+		}
+		return certPath, nil
 	}
 	return filepath.Join(store.SubDir(store.DirCerts), "cert.pem"), nil
-}
-
-func resolveConfigPath(path string) string {
-	if filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Join(config.BaseDir(), path)
 }
 
 // CallTool invokes the named tool on the remote server.
